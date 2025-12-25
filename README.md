@@ -72,11 +72,10 @@ Examples:
   6. Bootstrap IP (skip system DNS for upstream resolution):
      ./dproxy -upstream "doh://dns.google/dns-query#8.8.4.4"
 
-See also [example-upstreams.list](https://github.com/cbuijs/dproxy/blob/main/example-upstreams.list),
-for more information on syntax and usage.
 
 Notes:
   - Default bind address is 0.0.0.0 (all interfaces).
   - Self-signed certificates are generated automatically if -cert/-key are missing 
     (clients may reject these).
+  - See also "example-upstreams.list" for more information on upstream syntax and usage.
 ```
