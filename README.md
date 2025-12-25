@@ -72,7 +72,7 @@ Examples:
   6. Bootstrap IP (skip system DNS for upstream resolution):
      ./dproxy -upstream "doh://dns.google/dns-query#8.8.4.4"
 
-See also [example-upstreams.list.(https://github.com/cbuijs/dproxy/blob/main/example-upstreams.list),
+See also [example-upstreams.list](https://github.com/cbuijs/dproxy/blob/main/example-upstreams.list),
 for more information on syntax and usage.
 
 Notes:
