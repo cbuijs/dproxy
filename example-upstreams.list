@@ -4,22 +4,22 @@
 #
 # <protocol>://<hostname|ip>[:<port>][/<path>}[#<bootstrap-ip>]
 #
-# <protocol>: The protocol to be uses, we have the following variants:
+# <protocol> : The protocol to be uses, we have the following variants:
 #
-#             udp  : classic DNS over UDP (default port UDP 53)
-#             tcp  : classic DNS over TCP (default port TCP 53)
-#             tls  : DNS over TLS, you can also use "dot" (default TCP port 853)
-#             doh  : DNS over HTTPS (http/1.1 and http/2), you can also use "https" (default TCP port 443)
-#             doq  : DNS over QUIC, you can also use "quic" (default UDP port 853)
-#             doh3 : DNS over HTTP/3, you can also use "h3" (default UDP port 443):
+#             udp  : classic DNS over UDP (default port UDP 53).
+#             tcp  : classic DNS over TCP (default port TCP 53).
+#             tls  : DNS over TLS, you can also use "dot" (default TCP port 853).
+#             doh  : DNS over HTTPS (http/1.1 and http/2), you can also use "https" (default TCP port 443).
+#             doq  : DNS over QUIC, you can also use "quic" (default UDP port 853).
+#             doh3 : DNS over HTTP/3, you can also use "h3" (default UDP port 443).
 #
-# <hostname|ip>: The hostname or IP of the upstream server.
+# <hostname|ip> : The hostname or IP of the upstream server.
 #
-# <port>: The port of the upstream server to use, when omitted, the default will be used.
+# <port> : The port of the upstream server to use, when omitted, the default will be used.
 #
-# <path>: The DOH/DOH3 path to be used, when omitted the default "/dns-query" will be used.
+# <path> : The DOH/DOH3 path to be used, when omitted the default "/dns-query" will be used.
 #
-# <bootstrap-ip>: The IP of the upstream server to use. This prevents (unencrypted) lookups of the <hostname>.
+# <bootstrap-ip> : The IP of the upstream server to use. This prevents (unencrypted) lookups of the <hostname>.
 
 
 # List of "Malware Protection" upstreams
