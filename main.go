@@ -286,12 +286,54 @@ var requestGroup RequestGroup
 
 func main() {
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "\nHigh-performance, multi-protocol DNS Proxy.\n")
-		fmt.Fprintf(os.Stderr, "Supports UDP, TCP, DoT, DoH, DoH3, and DoQ.\n\n")
+		const usage = `High-Performance Multi-Protocol DNS Proxy
+
+Usage: %s [options]
+
+Description:
+  A robust DNS proxy supporting modern encrypted DNS protocols (DoT, DoH, DoH3, DoQ)
+  alongside legacy UDP/TCP. It features smart upstream selection strategies,
+  in-memory caching, and connection pooling for optimal performance.
+
+Options:
+`
+		fmt.Fprintf(os.Stderr, usage, os.Args[0])
 		flag.PrintDefaults()
-		fmt.Fprintf(os.Stderr, "\nStrategies: failover, fastest, random, round-robin, race\n")
-		fmt.Fprintf(os.Stderr, "\nExample: %s -upstream doh://cloudflare-dns.com/dns-query -strategy fastest\n", os.Args[0])
+
+		const detailedInfo = `
+Strategies (-strategy):
+  failover     Use the first valid upstream; switch only if it fails (Default).
+  fastest      Measure latency (RTT) and prefer the fastest upstream. Includes 
+               epsilon-greedy exploration (10% chance) to re-check slower servers.
+  round-robin  Rotate through upstreams sequentially for load balancing.
+  random       Pick a random upstream for every request.
+  race         Send request to ALL upstreams simultaneously; return the first response.
+
+Examples:
+  1. Simple UDP/TCP Proxy (defaults to 127.0.0.1:5355 upstream):
+     %[1]s
+
+  2. Use Cloudflare DoH with "fastest" strategy:
+     %[1]s -upstream doh://cloudflare-dns.com/dns-query -strategy fastest
+
+  3. Mix Protocols (Google DoT + Quad9 DoQ) with specific listening ports:
+     %[1]s -upstream tls://8.8.8.8 -upstream quic://dns.quad9.net -udp 5300 -tls 8530
+
+  4. Load upstreams from a file (one URL per line) with caching disabled:
+     %[1]s -upstream ./resolvers.txt -no-cache
+
+  5. Secure DoH Server (requires certs) proxying to local BIND:
+     %[1]s -cert fullchain.pem -key privkey.pem -upstream udp://127.0.0.1:53
+
+  6. Bootstrap IP (skip system DNS for upstream resolution):
+     %[1]s -upstream "doh://dns.google/dns-query#8.8.4.4"
+
+Notes:
+  - Default bind address is 0.0.0.0 (all interfaces).
+  - Self-signed certificates are generated automatically if -cert/-key are missing 
+    (clients may reject these).
+`
+		fmt.Fprintf(os.Stderr, detailedInfo, os.Args[0])
 	}
 
 	flag.Var(&upstreamFlags, "upstream", "Upstream server URL or file path")
