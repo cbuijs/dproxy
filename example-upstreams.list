@@ -1,5 +1,37 @@
+# UPSTREAMS FILE
+#
+# Use one line per upstream using the following (URL) syntax:
+#
+# <protocol>://<hostname|ip>[:<port>][/<path>}[#<bootstrap-ip>]
+#
+# <protocol>: The protocol to be uses, we have the following variants:
+#
+#             udp  : classic DNS over UDP (default port UDP 53)
+#             tcp  : classic DNS over TCP (default port TCP 53)
+#             tls  : DNS over TLS, you can also use "dot" (default TCP port 853)
+#             doh  : DNS over HTTPS (http/1.1 and http/2), you can also use "https" (default TCP port 443)
+#             doq  : DNS over QUIC, you can also use "quic" (default UDP port 853)
+#             doh3 : DNS over HTTP/3, you can also use "h3" (default UDP port 443):
+#
+# <hostname|ip>: The hostname or IP of the upstream server.
+#
+# <port>: The port of the upstream server to use, when omitted, the default will be used.
+#
+# <path>: The DOH/DOH3 path to be used, when omitted the default "/dns-query" will be used.
+#
+# <bootstrap-ip>: The IP of the upstream server to use. This prevents (unencrypted) lookups of the <hostname>.
+
+
+# List of "Malware Protection" upstreams
 https://freedns.controld.com/p1#76.76.2.11
+h3://freedns.controld.com/p1#76.76.2.11
+doq://p1.freedns.controld.com#76.76.2.11
+
 https://dns.quad9.net/dns-query#9.9.9.9
-https://protective.joindns4.eu:443/dns-query#86.54.11.1
+https://dns.quad9.net/dns-query#149.112.112.112
+
+tls://protective.joindns4.eu:443#86.54.11.1
+
 https://security.cloudflare-dns.com:443/dns-query#1.1.1.2
+
 https://doh.cleanbrowsing.org:443/doh/security-filter/#185.228.168.10
