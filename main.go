@@ -1,8 +1,8 @@
 /*
 File: main.go
-Version: 2.1.0
-Author: Chris Buijs (2025), Refactored with optimizations
-Description: A high-performance, multi-protocol DNS Proxy supporting UDP, TCP, DoT, DoH, DoH3, and DoQ upstreams.
+Version: 2.3.0
+Author: Chris Buijs (2025), Refactored with OR-logic routing and enhanced logging
+Description: A high-performance, multi-protocol DNS Proxy supporting UDP, TCP, DoT, DoH, DoH3, and DoQ upstreams with client-aware routing.
 */
 
 package main
@@ -42,12 +42,11 @@ import (
 	"github.com/miekg/dns"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+	"gopkg.in/yaml.v3"
 )
 
 // --- Configuration & Flags ---
 
-// stringSlice allows passing the -upstream flag multiple times.
-// e.g., -upstream 1.1.1.1 -upstream 8.8.8.8
 type stringSlice []string
 
 func (s *stringSlice) String() string { return strings.Join(*s, ",") }
@@ -57,42 +56,115 @@ func (s *stringSlice) Set(value string) error {
 }
 
 var (
-	upstreamFlags    stringSlice
-	listenAddr       = flag.String("addr", "0.0.0.0", "Bind address for all protocols")
-	udpPort          = flag.Int("udp", 53, "UDP/TCP listening port")
-	tlsPort          = flag.Int("tls", 853, "DoT/DoQ listening port")
-	httpsPort        = flag.Int("https", 443, "DoH/DoH3 listening port")
-	certFile         = flag.String("cert", "", "Path to TLS certificate file")
-	keyFile          = flag.String("key", "", "Path to TLS key file")
-	insecureUpstream = flag.Bool("insecure", false, "Allow unverifiable hostnames (DANGEROUS: MITM risk)")
-	cacheDisabled    = flag.Bool("no-cache", false, "Disable DNS response caching")
-	cacheSize        = flag.Int("cache-size", 10000, "Maximum number of cached entries")
-	strategy         = flag.String("strategy", "failover", "Upstream selection strategy (failover, fastest, random, round-robin, race)")
-	queryTimeout     = flag.Duration("timeout", 5*time.Second, "Query timeout for all protocols")
+	configFile    = flag.String("config", "", "Path to configuration file (YAML)")
+	ipVersion     = flag.String("ip", "both", "IP version to use for bootstrap (ipv4, ipv6, both)")
+	cacheDisabled = flag.Bool("no-cache", false, "Disable DNS caching")
+	queryTimeout  = flag.Duration("timeout", 5*time.Second, "Global query timeout")
 )
 
 const EDNS0_OPTION_MAC = 65001
 
 // --- Globals & Pools ---
 
-// bufPool reduces GC pressure by reusing byte buffers for IO operations.
-// Instead of creating garbage 4KB arrays for every packet, we recycle them.
 var bufPool = sync.Pool{
 	New: func() any {
-		// 4KB is standard max for most DNS ops (EDNS0 usually caps around 1232 or 4096).
 		return make([]byte, 4096)
 	},
 }
 
-// Pre-compiled regex for ARP parsing.
-// Optimization: Compiling regex is expensive. Doing it inside the loop is a performance killer.
-// We compile these once at startup.
 var (
 	windowsARPRegex = regexp.MustCompile(`(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F]{2}-[0-9a-fA-F]{2}-[0-9a-fA-F]{2}-[0-9a-fA-F]{2}-[0-9a-fA-F]{2}-[0-9a-fA-F]{2})`)
 	darwinARPRegex  = regexp.MustCompile(`\((.*?)\) at ([0-9a-fA-F:]+)`)
 )
 
-// --- Structs ---
+// --- Configuration Structures ---
+
+type Config struct {
+	Server    ServerConfig    `yaml:"server"`
+	Bootstrap BootstrapConfig `yaml:"bootstrap"`
+	Cache     CacheConfig     `yaml:"cache"`
+	Routing   RoutingConfig   `yaml:"routing"`
+}
+
+type ServerConfig struct {
+	ListenAddr string `yaml:"listen_addr"`
+	Ports      struct {
+		UDP   int `yaml:"udp"`
+		TLS   int `yaml:"tls"`
+		HTTPS int `yaml:"https"`
+	} `yaml:"ports"`
+	TLS struct {
+		CertFile string `yaml:"cert_file"`
+		KeyFile  string `yaml:"key_file"`
+	} `yaml:"tls"`
+	Timeout          string `yaml:"timeout"`
+	InsecureUpstream bool   `yaml:"insecure_upstream"`
+}
+
+type BootstrapConfig struct {
+	Servers   []string `yaml:"servers"`
+	IPVersion string   `yaml:"ip_version"`
+}
+
+type CacheConfig struct {
+	Enabled bool `yaml:"enabled"`
+	Size    int  `yaml:"size"`
+}
+
+type RoutingConfig struct {
+	UpstreamGroups map[string][]string `yaml:"upstream_groups"`
+	RoutingRules   []RoutingRule       `yaml:"routing_rules"`
+	DefaultRule    DefaultRule         `yaml:"default"`
+}
+
+type DefaultRule struct {
+	Upstreams interface{} `yaml:"upstreams"`
+	Strategy  string      `yaml:"strategy"`
+
+	parsedUpstreams []*Upstream
+}
+
+type RoutingRule struct {
+	Name            string          `yaml:"name"`
+	Match           MatchConditions `yaml:"match"`
+	Upstreams       interface{}     `yaml:"upstreams"`
+	Strategy        string          `yaml:"strategy"`
+	parsedUpstreams []*Upstream
+}
+
+type MatchConditions struct {
+	ClientIP       string `yaml:"client_ip"`
+	ClientCIDR     string `yaml:"client_cidr"`
+	ClientMAC      string `yaml:"client_mac"`
+	ClientECS      string `yaml:"client_ecs"`
+	ClientEDNSMAC  string `yaml:"client_edns_mac"`
+	ServerIP       string `yaml:"server_ip"`
+	ServerPort     int    `yaml:"server_port"`
+	ServerHostname string `yaml:"server_hostname"`
+	ServerPath     string `yaml:"server_path"`
+
+	parsedClientIP      net.IP
+	parsedClientCIDR    *net.IPNet
+	parsedClientMAC     net.HardwareAddr
+	parsedClientECS     *net.IPNet
+	parsedClientEDNSMAC net.HardwareAddr
+	parsedServerIP      net.IP
+}
+
+type RequestContext struct {
+	ClientIP       net.IP
+	ClientMAC      net.HardwareAddr
+	ClientECS      net.IP
+	ClientECSNet   *net.IPNet
+	ClientEDNSMAC  net.HardwareAddr
+	ServerIP       net.IP
+	ServerPort     int
+	ServerHostname string
+	ServerPath     string
+	Protocol       string
+}
+
+// --- Upstream Structures ---
 
 type Upstream struct {
 	URL         *url.URL
@@ -101,10 +173,10 @@ type Upstream struct {
 	Port        string
 	BootstrapIP string
 	Path        string
-	// rtt is accessed atomically because multiple goroutines (race strategy) update it.
-	rtt        int64
-	httpClient *http.Client
-	h3Client   *http.Client
+	ResolvedIPs []net.IP
+	rtt         int64
+	httpClient  *http.Client
+	h3Client    *http.Client
 }
 
 func (u *Upstream) String() string {
@@ -122,21 +194,22 @@ func (u *Upstream) updateRTT(d time.Duration) {
 		atomic.StoreInt64(&u.rtt, newVal)
 		return
 	}
-	// EWMA (Exponential Weighted Moving Average) filters out jitter.
-	// We give 70% weight to history, 30% to the new sample.
 	avg := int64(float64(old)*0.7 + float64(newVal)*0.3)
 	atomic.StoreInt64(&u.rtt, avg)
 }
 
 func (u *Upstream) getRTT() int64 { return atomic.LoadInt64(&u.rtt) }
 
-var upstreams []*Upstream
 var rrCounter atomic.Uint64
+
+// Global configuration
+var config *Config
+
+// Bootstrap DNS servers
+var bootstrapServers []string
 
 // --- DoQ Connection Pool ---
 
-// DoQ (DNS over QUIC) establishes heavy sessions. We don't want to handshake on every query.
-// This pool keeps sessions alive and manages reuse.
 type DoQPool struct {
 	mu       sync.RWMutex
 	sessions map[string]*doqSession
@@ -150,7 +223,6 @@ type doqSession struct {
 
 var doqPool = &DoQPool{sessions: make(map[string]*doqSession)}
 
-// Get returns an existing active session or dials a new one.
 func (p *DoQPool) Get(ctx context.Context, addr string, tlsConf *tls.Config) (quic.Connection, error) {
 	p.mu.RLock()
 	sess, exists := p.sessions[addr]
@@ -158,10 +230,8 @@ func (p *DoQPool) Get(ctx context.Context, addr string, tlsConf *tls.Config) (qu
 
 	if exists {
 		sess.mu.Lock()
-		// Check if connection is effectively dead before returning it.
 		select {
 		case <-sess.conn.Context().Done():
-			// It's dead, Jim. Clean it up.
 			sess.mu.Unlock()
 			p.mu.Lock()
 			delete(p.sessions, addr)
@@ -173,7 +243,6 @@ func (p *DoQPool) Get(ctx context.Context, addr string, tlsConf *tls.Config) (qu
 		}
 	}
 
-	// No session found, dial a new one.
 	conn, err := quic.DialAddr(ctx, addr, tlsConf, &quic.Config{
 		KeepAlivePeriod: 30 * time.Second,
 		MaxIdleTimeout:  60 * time.Second,
@@ -189,8 +258,6 @@ func (p *DoQPool) Get(ctx context.Context, addr string, tlsConf *tls.Config) (qu
 	return conn, nil
 }
 
-// cleanup creates a background ticker to close idle connections.
-// Prevents memory leaks from stale sessions.
 func (p *DoQPool) cleanup() {
 	ticker := time.NewTicker(30 * time.Second)
 	for range ticker.C {
@@ -233,9 +300,6 @@ var dnsCache = &DNSCache{items: make(map[string]*CacheEntry)}
 
 // --- Singleflight ---
 
-// Singleflight prevents the "Thundering Herd" problem.
-// If 100 clients ask for "google.com" at the exact same millisecond,
-// we send only ONE request upstream and share the result with all 100 clients.
 type callResult struct {
 	msg         *dns.Msg
 	upstreamStr string
@@ -259,7 +323,6 @@ func (g *RequestGroup) Do(key string, fn func() callResult) (callResult, bool) {
 		g.m = make(map[string]*call)
 	}
 	if c, ok := g.m[key]; ok {
-		// Request in progress, join the wait group.
 		g.mu.Unlock()
 		c.wg.Wait()
 		return c.val, true
@@ -269,7 +332,6 @@ func (g *RequestGroup) Do(key string, fn func() callResult) (callResult, bool) {
 	g.m[key] = c
 	g.mu.Unlock()
 
-	// Execute the function (upstream call).
 	c.val = fn()
 	c.wg.Done()
 
@@ -288,88 +350,34 @@ func main() {
 	flag.Usage = func() {
 		const usage = `High-Performance Multi-Protocol DNS Proxy
 
-Usage: %s [options]
-
-Description:
-  A robust DNS proxy supporting modern encrypted DNS protocols (DoT, DoH, DoH3, DoQ)
-  alongside legacy UDP/TCP. It features smart upstream selection strategies,
-  in-memory caching, and connection pooling for optimal performance.
-
-Options:
+Usage: %s -config <config.yaml>
 `
 		fmt.Fprintf(os.Stderr, usage, os.Args[0])
 		flag.PrintDefaults()
-
-		const detailedInfo = `
-Strategies (-strategy):
-  failover     Use the first valid upstream; switch only if it fails (Default).
-  fastest      Measure latency (RTT) and prefer the fastest upstream. Includes 
-               epsilon-greedy exploration (10% chance) to re-check slower servers.
-  round-robin  Rotate through upstreams sequentially for load balancing.
-  random       Pick a random upstream for every request.
-  race         Send request to ALL upstreams simultaneously; return the first response.
-
-Examples:
-  1. Simple UDP/TCP Proxy (defaults to 127.0.0.1:5355 upstream):
-     %[1]s
-
-  2. Use Cloudflare DoH with "fastest" strategy:
-     %[1]s -upstream doh://cloudflare-dns.com/dns-query -strategy fastest
-
-  3. Mix Protocols (Google DoT + Quad9 DoQ) with specific listening ports:
-     %[1]s -upstream tls://8.8.8.8 -upstream quic://dns.quad9.net -udp 5300 -tls 8530
-
-  4. Load upstreams from a file (one URL per line) with caching disabled:
-     %[1]s -upstream ./resolvers.txt -no-cache
-
-  5. Secure DoH Server (requires certs) proxying to local BIND:
-     %[1]s -cert fullchain.pem -key privkey.pem -upstream udp://127.0.0.1:53
-
-  6. Bootstrap IP (skip system DNS for upstream resolution):
-     %[1]s -upstream "doh://dns.google/dns-query#8.8.4.4"
-
-Notes:
-  - Default bind address is 0.0.0.0 (all interfaces).
-  - Self-signed certificates are generated automatically if -cert/-key are missing 
-    (clients may reject these).
-`
-		fmt.Fprintf(os.Stderr, detailedInfo, os.Args[0])
 	}
 
-	flag.Var(&upstreamFlags, "upstream", "Upstream server URL or file path")
 	flag.Parse()
 
-	if len(upstreamFlags) == 0 {
-		upstreamFlags = []string{"udp://127.0.0.1:5355"}
+	if *configFile == "" {
+		log.Fatal("Error: -config flag is required.")
 	}
 
-	rawUpstreams := loadUpstreamSources(upstreamFlags)
-	if len(rawUpstreams) == 0 {
-		log.Fatalf("No valid upstreams found")
+	// Load configuration
+	if err := LoadConfig(*configFile); err != nil {
+		log.Fatalf("Failed to load configuration: %v", err)
 	}
 
-	for _, u := range rawUpstreams {
-		parsed, err := parseUpstream(u)
-		if err != nil {
-			log.Fatalf("Invalid upstream %s: %v", u, err)
-		}
-		upstreams = append(upstreams, parsed)
-		log.Printf("Loaded Upstream: %s", parsed.String())
-	}
-
-	// Start background maintenance routines
 	go maintainARPCache()
 	go doqPool.cleanup()
 
-	if !*cacheDisabled {
+	if config.Cache.Enabled {
 		log.Println("Caching: Enabled")
 		go maintainDNSCache()
 	} else {
 		log.Println("Caching: Disabled")
 	}
 
-	// Setup TLS for incoming connections (DoT/DoQ/DoH)
-	tlsConfig, err := getTLSConfig(*certFile, *keyFile, *listenAddr)
+	tlsConfig, err := getTLSConfig(config.Server.TLS.CertFile, config.Server.TLS.KeyFile, config.Server.ListenAddr)
 	if err != nil {
 		log.Fatalf("Failed to setup TLS: %v", err)
 	}
@@ -379,95 +387,79 @@ Notes:
 	wg.Wait()
 }
 
-func loadUpstreamSources(sources []string) []string {
-	var rawUpstreams []string
-	for _, source := range sources {
-		// check if arg is a file path
-		info, err := os.Stat(source)
-		if err == nil && !info.IsDir() {
-			log.Printf("Reading upstreams from file: %s", source)
-			file, err := os.Open(source)
-			if err != nil {
-				log.Printf("Warning: Failed to open file %s: %v", source, err)
-				continue
-			}
-			scanner := bufio.NewScanner(file)
-			for scanner.Scan() {
-				line := strings.TrimSpace(scanner.Text())
-				if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "//") {
-					continue
-				}
-				rawUpstreams = append(rawUpstreams, line)
-			}
-			file.Close()
-			if err := scanner.Err(); err != nil {
-				log.Printf("Warning: Error scanning file %s: %v", source, err)
-			}
-		} else {
-			// arg is a direct URL
-			rawUpstreams = append(rawUpstreams, source)
-		}
-	}
-	return rawUpstreams
-}
-
 func startServers(wg *sync.WaitGroup, tlsConfig *tls.Config) {
-	// 1. Standard UDP DNS
+	listenAddr := config.Server.ListenAddr
+	udpPort := config.Server.Ports.UDP
+	tlsPort := config.Server.Ports.TLS
+	httpsPort := config.Server.Ports.HTTPS
+
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		srv := &dns.Server{Addr: fmt.Sprintf("%s:%d", *listenAddr, *udpPort), Net: "udp"}
+		srv := &dns.Server{Addr: fmt.Sprintf("%s:%d", listenAddr, udpPort), Net: "udp"}
 		srv.Handler = dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
-			ctx, cancel := context.WithTimeout(context.Background(), *queryTimeout)
+			ctx, cancel := context.WithTimeout(context.Background(), getTimeout())
 			defer cancel()
-			processDNSRequest(ctx, w, r, "UDP", "")
+			reqCtx := &RequestContext{
+				ServerIP:   getLocalIP(w.LocalAddr()),
+				ServerPort: getLocalPort(w.LocalAddr()),
+				Protocol:   "UDP",
+			}
+			processDNSRequest(ctx, w, r, reqCtx)
 		})
-		log.Printf("Starting DNS UDP on %s:%d", *listenAddr, *udpPort)
+		log.Printf("Starting DNS UDP on %s:%d", listenAddr, udpPort)
 		if err := srv.ListenAndServe(); err != nil {
 			log.Printf("UDP server error: %v", err)
 		}
 	}()
 
-	// 2. Standard TCP DNS (Reliability / Big packets)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		srv := &dns.Server{Addr: fmt.Sprintf("%s:%d", *listenAddr, *udpPort), Net: "tcp"}
+		srv := &dns.Server{Addr: fmt.Sprintf("%s:%d", listenAddr, udpPort), Net: "tcp"}
 		srv.Handler = dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
-			ctx, cancel := context.WithTimeout(context.Background(), *queryTimeout)
+			ctx, cancel := context.WithTimeout(context.Background(), getTimeout())
 			defer cancel()
-			processDNSRequest(ctx, w, r, "TCP", "")
+			reqCtx := &RequestContext{
+				ServerIP:   getLocalIP(w.LocalAddr()),
+				ServerPort: getLocalPort(w.LocalAddr()),
+				Protocol:   "TCP",
+			}
+			processDNSRequest(ctx, w, r, reqCtx)
 		})
-		log.Printf("Starting DNS TCP on %s:%d", *listenAddr, *udpPort)
+		log.Printf("Starting DNS TCP on %s:%d", listenAddr, udpPort)
 		if err := srv.ListenAndServe(); err != nil {
 			log.Printf("TCP server error: %v", err)
 		}
 	}()
 
-	// 3. DNS over TLS (DoT)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		srv := &dns.Server{
-			Addr: fmt.Sprintf("%s:%d", *listenAddr, *tlsPort),
+			Addr: fmt.Sprintf("%s:%d", listenAddr, tlsPort),
 			Net:  "tcp-tls", TLSConfig: tlsConfig,
 		}
 		srv.Handler = dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
-			ctx, cancel := context.WithTimeout(context.Background(), *queryTimeout)
+			ctx, cancel := context.WithTimeout(context.Background(), getTimeout())
 			defer cancel()
-			processDNSRequest(ctx, w, r, "DoT", "")
+			reqCtx := &RequestContext{
+				ServerIP:   getLocalIP(w.LocalAddr()),
+				ServerPort: getLocalPort(w.LocalAddr()),
+				Protocol:   "DoT",
+			}
+			processDNSRequest(ctx, w, r, reqCtx)
 		})
-		log.Printf("Starting DoT on %s:%d", *listenAddr, *tlsPort)
+		log.Printf("Starting DoT on %s:%d", listenAddr, tlsPort)
 		if err := srv.ListenAndServe(); err != nil {
 			log.Printf("DoT server error: %v", err)
 		}
 	}()
 
-	// 4. DNS over QUIC (DoQ)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		addr := fmt.Sprintf("%s:%d", *listenAddr, *tlsPort)
+		addr := fmt.Sprintf("%s:%d", listenAddr, tlsPort)
 		log.Printf("Starting DoQ on %s", addr)
 		listener, err := quic.ListenAddr(addr, tlsConfig, nil)
 		if err != nil {
@@ -484,11 +476,10 @@ func startServers(wg *sync.WaitGroup, tlsConfig *tls.Config) {
 		}
 	}()
 
-	// 5. DNS over HTTPS (DoH) & HTTP/3 (DoH3)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		addr := fmt.Sprintf("%s:%d", *listenAddr, *httpsPort)
+		addr := fmt.Sprintf("%s:%d", listenAddr, httpsPort)
 		mux := http.NewServeMux()
 		mux.HandleFunc("/dns-query", handleDoH)
 
@@ -507,10 +498,216 @@ func startServers(wg *sync.WaitGroup, tlsConfig *tls.Config) {
 	}()
 }
 
+func getTimeout() time.Duration {
+	if config.Server.Timeout == "" {
+		return 5 * time.Second
+	}
+	d, err := time.ParseDuration(config.Server.Timeout)
+	if err != nil {
+		return 5 * time.Second
+	}
+	return d
+}
+
+// --- Configuration Loading ---
+
+func LoadConfig(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("failed to read config: %w", err)
+	}
+
+	var cfg Config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return fmt.Errorf("failed to parse config: %w", err)
+	}
+
+	// Set defaults
+	if cfg.Server.ListenAddr == "" {
+		cfg.Server.ListenAddr = "0.0.0.0"
+	}
+	if cfg.Server.Ports.UDP == 0 {
+		cfg.Server.Ports.UDP = 53
+	}
+	if cfg.Server.Ports.TLS == 0 {
+		cfg.Server.Ports.TLS = 853
+	}
+	if cfg.Server.Ports.HTTPS == 0 {
+		cfg.Server.Ports.HTTPS = 443
+	}
+
+	if len(cfg.Bootstrap.Servers) == 0 {
+		cfg.Bootstrap.Servers = []string{"1.1.1.1:53", "8.8.8.8:53"}
+	} else {
+		for i, bs := range cfg.Bootstrap.Servers {
+			if !strings.Contains(bs, ":") {
+				cfg.Bootstrap.Servers[i] = bs + ":53"
+			}
+		}
+	}
+	if cfg.Bootstrap.IPVersion == "" {
+		cfg.Bootstrap.IPVersion = "both"
+	}
+	bootstrapServers = cfg.Bootstrap.Servers
+
+	if cfg.Cache.Size == 0 {
+		cfg.Cache.Size = 10000
+	}
+
+	// Parse routing rules
+	log.Println("--- Loading Routing Rules ---")
+	for i := range cfg.Routing.RoutingRules {
+		rule := &cfg.Routing.RoutingRules[i]
+
+		if err := parseMatchConditions(&rule.Match); err != nil {
+			return fmt.Errorf("rule '%s': %w", rule.Name, err)
+		}
+
+		upstreamURLs, err := resolveUpstreams(rule.Upstreams, cfg.Routing.UpstreamGroups)
+		if err != nil {
+			return fmt.Errorf("rule '%s': %w", rule.Name, err)
+		}
+
+		for _, urlStr := range upstreamURLs {
+			upstream, err := parseUpstream(urlStr, cfg.Bootstrap.IPVersion, cfg.Server.InsecureUpstream, cfg.Server.Timeout)
+			if err != nil {
+				return fmt.Errorf("rule '%s': invalid upstream %s: %w", rule.Name, urlStr, err)
+			}
+			rule.parsedUpstreams = append(rule.parsedUpstreams, upstream)
+		}
+
+		if len(rule.parsedUpstreams) == 0 {
+			return fmt.Errorf("rule '%s': no valid upstreams", rule.Name)
+		}
+
+		if rule.Strategy == "" {
+			rule.Strategy = "failover"
+		}
+
+		// --- Detailed Logging of Loaded Rules ---
+		log.Printf("[RULE] Loaded '%s' (Strategy: %s)", rule.Name, rule.Strategy)
+		m := rule.Match
+		if m.ClientIP != "" {
+			log.Printf("   ├─ Match OR: Client IP = %s", m.ClientIP)
+		}
+		if m.ClientCIDR != "" {
+			log.Printf("   ├─ Match OR: Client CIDR = %s", m.ClientCIDR)
+		}
+		if m.ClientMAC != "" {
+			log.Printf("   ├─ Match OR: Client MAC = %s", m.ClientMAC)
+		}
+		if m.ClientECS != "" {
+			log.Printf("   ├─ Match OR: Client ECS = %s", m.ClientECS)
+		}
+		if m.ClientEDNSMAC != "" {
+			log.Printf("   ├─ Match OR: Client EDNS0 MAC = %s", m.ClientEDNSMAC)
+		}
+		if m.ServerIP != "" {
+			log.Printf("   ├─ Match OR: Server IP = %s", m.ServerIP)
+		}
+		if m.ServerPort != 0 {
+			log.Printf("   ├─ Match OR: Server Port = %d", m.ServerPort)
+		}
+		if m.ServerHostname != "" {
+			log.Printf("   ├─ Match OR: Hostname = %s", m.ServerHostname)
+		}
+		if m.ServerPath != "" {
+			log.Printf("   ├─ Match OR: Path = %s", m.ServerPath)
+		}
+		log.Printf("   └─ Upstreams: %d target(s)", len(rule.parsedUpstreams))
+	}
+	log.Println("-----------------------------")
+
+	// Parse default rule
+	if cfg.Routing.DefaultRule.Upstreams == nil {
+		return fmt.Errorf("default upstreams are required")
+	}
+
+	upstreamURLs, err := resolveUpstreams(cfg.Routing.DefaultRule.Upstreams, cfg.Routing.UpstreamGroups)
+	if err != nil {
+		return fmt.Errorf("default: %w", err)
+	}
+
+	for _, urlStr := range upstreamURLs {
+		upstream, err := parseUpstream(urlStr, cfg.Bootstrap.IPVersion, cfg.Server.InsecureUpstream, cfg.Server.Timeout)
+		if err != nil {
+			return fmt.Errorf("default: invalid upstream %s: %w", urlStr, err)
+		}
+		cfg.Routing.DefaultRule.parsedUpstreams = append(cfg.Routing.DefaultRule.parsedUpstreams, upstream)
+	}
+
+	if len(cfg.Routing.DefaultRule.parsedUpstreams) == 0 {
+		return fmt.Errorf("default: no valid upstreams")
+	}
+
+	if cfg.Routing.DefaultRule.Strategy == "" {
+		cfg.Routing.DefaultRule.Strategy = "failover"
+	}
+
+	config = &cfg
+	return nil
+}
+
+// --- Routing Functions ---
+
+func resolveHostnameWithBootstrap(hostname string) ([]net.IP, error) {
+	var allIPs []net.IP
+	var lastErr error
+
+	useIPv4 := *ipVersion == "ipv4" || *ipVersion == "both"
+	useIPv6 := *ipVersion == "ipv6" || *ipVersion == "both"
+
+	for _, bootstrap := range bootstrapServers {
+		c := &dns.Client{Net: "udp", Timeout: 3 * time.Second}
+
+		if useIPv4 {
+			msg := new(dns.Msg)
+			msg.SetQuestion(dns.Fqdn(hostname), dns.TypeA)
+			resp, _, err := c.Exchange(msg, bootstrap)
+			if err == nil && resp != nil {
+				for _, ans := range resp.Answer {
+					if a, ok := ans.(*dns.A); ok {
+						allIPs = append(allIPs, a.A)
+					}
+				}
+			} else {
+				lastErr = err
+			}
+		}
+
+		if useIPv6 {
+			msg := new(dns.Msg)
+			msg.SetQuestion(dns.Fqdn(hostname), dns.TypeAAAA)
+			resp, _, err := c.Exchange(msg, bootstrap)
+			if err == nil && resp != nil {
+				for _, ans := range resp.Answer {
+					if aaaa, ok := ans.(*dns.AAAA); ok {
+						allIPs = append(allIPs, aaaa.AAAA)
+					}
+				}
+			} else {
+				lastErr = err
+			}
+		}
+
+		if len(allIPs) > 0 {
+			break
+		}
+	}
+
+	if len(allIPs) == 0 {
+		if lastErr != nil {
+			return nil, fmt.Errorf("failed to resolve %s: %w", hostname, lastErr)
+		}
+		return nil, fmt.Errorf("no IPs found for %s", hostname)
+	}
+
+	return allIPs, nil
+}
+
 // --- Upstream Parsing ---
 
-func parseUpstream(raw string) (*Upstream, error) {
-	// Support for bootstrap IPs (e.g., doh://example.com#1.2.3.4) to avoid circular dependency loops.
+func parseUpstream(raw string, ipVersion string, insecure bool, timeout string) (*Upstream, error) {
 	parts := strings.Split(raw, "#")
 	uString := parts[0]
 	bootstrap := ""
@@ -524,7 +721,6 @@ func parseUpstream(raw string) (*Upstream, error) {
 	}
 
 	proto := strings.ToLower(u.Scheme)
-	// Normalization for easy config
 	switch proto {
 	case "tls":
 		proto = "dot"
@@ -538,7 +734,6 @@ func parseUpstream(raw string) (*Upstream, error) {
 
 	host := u.Hostname()
 	port := u.Port()
-	// Set default ports if user was lazy
 	if port == "" {
 		switch proto {
 		case "udp", "tcp":
@@ -560,23 +755,46 @@ func parseUpstream(raw string) (*Upstream, error) {
 		Port: port, BootstrapIP: bootstrap, Path: path,
 	}
 
-	timeout := *queryTimeout
+	// Resolve hostname to IPs
+	if bootstrap != "" {
+		up.ResolvedIPs = []net.IP{net.ParseIP(bootstrap)}
+		log.Printf("Upstream %s using bootstrap IP: %s", up.String(), bootstrap)
+	} else if net.ParseIP(host) != nil {
+		up.ResolvedIPs = []net.IP{net.ParseIP(host)}
+		log.Printf("Upstream %s using direct IP: %s", up.String(), host)
+	} else {
+		log.Printf("Resolving hostname %s using bootstrap servers...", host)
+		ips, err := resolveHostnameWithBootstrap(host)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve upstream hostname %s: %w", host, err)
+		}
+		up.ResolvedIPs = ips
+		log.Printf("Upstream %s resolved to %d IPs: %v", up.String(), len(ips), ips)
+	}
 
-	// Configure HTTP clients for DoH/DoH3 upstreams with proper TLS settings
+	timeoutDuration := 5 * time.Second
+	if timeout != "" {
+		d, err := time.ParseDuration(timeout)
+		if err == nil {
+			timeoutDuration = d
+		}
+	}
+
 	if proto == "doh" {
 		up.httpClient = &http.Client{
-			Timeout: timeout,
+			Timeout: timeoutDuration,
 			Transport: &http.Transport{
-				TLSClientConfig:   &tls.Config{InsecureSkipVerify: *insecureUpstream, ServerName: host},
-				ForceAttemptHTTP2: true, // Try H2, fallback to H1
+				TLSClientConfig:   &tls.Config{InsecureSkipVerify: insecure, ServerName: host},
+				ForceAttemptHTTP2: true,
 				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-					// Use bootstrap IP if provided
-					target := addr
-					if bootstrap != "" {
-						target = net.JoinHostPort(bootstrap, port)
+					if len(up.ResolvedIPs) > 0 {
+						ip := up.ResolvedIPs[rand.IntN(len(up.ResolvedIPs))]
+						target := net.JoinHostPort(ip.String(), port)
+						var d net.Dialer
+						return d.DialContext(ctx, network, target)
 					}
 					var d net.Dialer
-					return d.DialContext(ctx, network, target)
+					return d.DialContext(ctx, network, addr)
 				},
 			},
 		}
@@ -584,15 +802,16 @@ func parseUpstream(raw string) (*Upstream, error) {
 
 	if proto == "doh3" {
 		up.h3Client = &http.Client{
-			Timeout: timeout,
+			Timeout: timeoutDuration,
 			Transport: &http3.RoundTripper{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: *insecureUpstream, ServerName: host},
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: insecure, ServerName: host},
 				Dial: func(ctx context.Context, addr string, tlsConf *tls.Config, cfg *quic.Config) (quic.EarlyConnection, error) {
-					target := addr
-					if bootstrap != "" {
-						target = net.JoinHostPort(bootstrap, port)
+					if len(up.ResolvedIPs) > 0 {
+						ip := up.ResolvedIPs[rand.IntN(len(up.ResolvedIPs))]
+						target := net.JoinHostPort(ip.String(), port)
+						return quic.DialAddrEarly(ctx, target, tlsConf, cfg)
 					}
-					return quic.DialAddrEarly(ctx, target, tlsConf, cfg)
+					return quic.DialAddrEarly(ctx, addr, tlsConf, cfg)
 				},
 			},
 		}
@@ -607,8 +826,8 @@ func (u *Upstream) executeExchange(ctx context.Context, req *dns.Msg) (*dns.Msg,
 	start := time.Now()
 
 	targetHost := u.Host
-	if u.BootstrapIP != "" {
-		targetHost = u.BootstrapIP
+	if len(u.ResolvedIPs) > 0 {
+		targetHost = u.ResolvedIPs[rand.IntN(len(u.ResolvedIPs))].String()
 	}
 	targetAddr := net.JoinHostPort(targetHost, u.Port)
 
@@ -618,7 +837,6 @@ func (u *Upstream) executeExchange(ctx context.Context, req *dns.Msg) (*dns.Msg,
 	}
 	done := make(chan result, 1)
 
-	// Execute exchange in a goroutine to handle context cancellation/timeout cleanly
 	go func() {
 		resp, err := u.doExchange(ctx, req, targetAddr)
 		done <- result{resp, err}
@@ -630,7 +848,6 @@ func (u *Upstream) executeExchange(ctx context.Context, req *dns.Msg) (*dns.Msg,
 	case r := <-done:
 		rtt := time.Since(start)
 		if r.err == nil {
-			// Update stats only on success
 			u.updateRTT(rtt)
 		}
 		return r.resp, rtt, r.err
@@ -638,18 +855,21 @@ func (u *Upstream) executeExchange(ctx context.Context, req *dns.Msg) (*dns.Msg,
 }
 
 func (u *Upstream) doExchange(ctx context.Context, req *dns.Msg, targetAddr string) (*dns.Msg, error) {
+	timeout := getTimeout()
+	insecure := config.Server.InsecureUpstream
+
 	switch u.Proto {
 	case "udp", "tcp":
-		c := &dns.Client{Net: u.Proto, Timeout: *queryTimeout}
+		c := &dns.Client{Net: u.Proto, Timeout: timeout}
 		resp, _, err := c.ExchangeContext(ctx, req, targetAddr)
 		return resp, err
 
 	case "dot":
 		c := &dns.Client{
 			Net:     "tcp-tls",
-			Timeout: *queryTimeout,
+			Timeout: timeout,
 			TLSConfig: &tls.Config{
-				InsecureSkipVerify: *insecureUpstream,
+				InsecureSkipVerify: insecure,
 				ServerName:         u.Host,
 			},
 		}
@@ -667,8 +887,10 @@ func (u *Upstream) doExchange(ctx context.Context, req *dns.Msg, targetAddr stri
 }
 
 func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetAddr string) (*dns.Msg, error) {
+	insecure := config.Server.InsecureUpstream
+
 	tlsConf := &tls.Config{
-		InsecureSkipVerify: *insecureUpstream,
+		InsecureSkipVerify: insecure,
 		ServerName:         u.Host,
 		NextProtos:         []string{"doq"},
 	}
@@ -689,10 +911,7 @@ func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetAddr str
 		return nil, err
 	}
 
-	// Optimization: Coalesce length prefix and payload into one write.
-	// This reduces syscalls and improves efficiency over QUIC streams.
 	fullLen := 2 + len(buf)
-	// Grab a buffer from the pool to avoid allocs
 	sendBuf := bufPool.Get().([]byte)
 	if cap(sendBuf) < fullLen {
 		sendBuf = make([]byte, fullLen)
@@ -701,7 +920,6 @@ func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetAddr str
 	}
 	defer bufPool.Put(sendBuf)
 
-	// RFC 9250: DoQ messages are length-prefixed (2 bytes)
 	binary.BigEndian.PutUint16(sendBuf[:2], uint16(len(buf)))
 	copy(sendBuf[2:], buf)
 
@@ -709,14 +927,12 @@ func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetAddr str
 		return nil, err
 	}
 
-	// Read response length
 	lBuf := make([]byte, 2)
 	if _, err := io.ReadFull(stream, lBuf); err != nil {
 		return nil, err
 	}
 	length := binary.BigEndian.Uint16(lBuf)
 
-	// Use pool for reading response body
 	respBuf := bufPool.Get().([]byte)
 	if cap(respBuf) < int(length) {
 		respBuf = make([]byte, length)
@@ -752,7 +968,6 @@ func (u *Upstream) exchangeDoH(ctx context.Context, req *dns.Msg) (*dns.Msg, err
 	if err != nil {
 		return nil, err
 	}
-	// MIME type is critical for DoH servers
 	hReq.Header.Set("Content-Type", "application/dns-message")
 	hReq.Header.Set("Accept", "application/dns-message")
 
@@ -778,21 +993,214 @@ func (u *Upstream) exchangeDoH(ctx context.Context, req *dns.Msg) (*dns.Msg, err
 	return resp, nil
 }
 
+func parseMatchConditions(m *MatchConditions) error {
+	if m.ClientIP != "" {
+		ip := net.ParseIP(m.ClientIP)
+		if ip == nil {
+			return fmt.Errorf("invalid client_ip: %s", m.ClientIP)
+		}
+		m.parsedClientIP = ip
+	}
+
+	if m.ClientCIDR != "" {
+		_, ipnet, err := net.ParseCIDR(m.ClientCIDR)
+		if err != nil {
+			return fmt.Errorf("invalid client_cidr: %s", m.ClientCIDR)
+		}
+		m.parsedClientCIDR = ipnet
+	}
+
+	if m.ClientMAC != "" {
+		mac, err := net.ParseMAC(m.ClientMAC)
+		if err != nil {
+			return fmt.Errorf("invalid client_mac: %s", m.ClientMAC)
+		}
+		m.parsedClientMAC = mac
+	}
+
+	if m.ClientECS != "" {
+		_, ipnet, err := net.ParseCIDR(m.ClientECS)
+		if err != nil {
+			return fmt.Errorf("invalid client_ecs: %s", m.ClientECS)
+		}
+		m.parsedClientECS = ipnet
+	}
+
+	if m.ClientEDNSMAC != "" {
+		mac, err := net.ParseMAC(m.ClientEDNSMAC)
+		if err != nil {
+			return fmt.Errorf("invalid client_edns_mac: %s", m.ClientEDNSMAC)
+		}
+		m.parsedClientEDNSMAC = mac
+	}
+
+	if m.ServerIP != "" {
+		ip := net.ParseIP(m.ServerIP)
+		if ip == nil {
+			return fmt.Errorf("invalid server_ip: %s", m.ServerIP)
+		}
+		m.parsedServerIP = ip
+	}
+
+	return nil
+}
+
+func resolveUpstreams(upstreams interface{}, groups map[string][]string) ([]string, error) {
+	switch v := upstreams.(type) {
+	case string:
+		group, exists := groups[v]
+		if !exists {
+			return nil, fmt.Errorf("upstream group '%s' not found", v)
+		}
+		return group, nil
+	case []interface{}:
+		var urls []string
+		for _, item := range v {
+			if str, ok := item.(string); ok {
+				urls = append(urls, str)
+			} else {
+				return nil, fmt.Errorf("invalid upstream entry: %v", item)
+			}
+		}
+		return urls, nil
+	default:
+		return nil, fmt.Errorf("upstreams must be string (group name) or list")
+	}
+}
+
+func SelectUpstreams(ctx *RequestContext) ([]*Upstream, string) {
+	if config == nil || config.Routing.RoutingRules == nil {
+		log.Fatal("Config not loaded - this should never happen")
+		return nil, ""
+	}
+
+	for _, rule := range config.Routing.RoutingRules {
+		matched, reason := matchRule(&rule.Match, ctx)
+		if matched {
+			log.Printf("[ROUTING] HIT Rule: '%s' | Trigger: %s | Client: %s",
+				rule.Name, reason, ctx.ClientIP)
+			return rule.parsedUpstreams, rule.Strategy
+		}
+	}
+
+	return config.Routing.DefaultRule.parsedUpstreams, config.Routing.DefaultRule.Strategy
+}
+
+func matchRule(m *MatchConditions, ctx *RequestContext) (bool, string) {
+	effectiveIP := ctx.ClientIP
+	if ctx.ClientECS != nil {
+		effectiveIP = ctx.ClientECS
+	}
+
+	effectiveMAC := ctx.ClientMAC
+	if ctx.ClientEDNSMAC != nil {
+		effectiveMAC = ctx.ClientEDNSMAC
+	}
+
+	conditionsChecked := 0
+
+	// --- OR Logic Checks ---
+
+	if m.parsedClientIP != nil {
+		conditionsChecked++
+		if effectiveIP != nil && m.parsedClientIP.Equal(effectiveIP) {
+			return true, fmt.Sprintf("ClientIP=%s", effectiveIP)
+		}
+	}
+
+	if m.parsedClientCIDR != nil {
+		conditionsChecked++
+		if effectiveIP != nil && m.parsedClientCIDR.Contains(effectiveIP) {
+			return true, fmt.Sprintf("ClientCIDR=%s (matched %s)", m.ClientCIDR, effectiveIP)
+		}
+	}
+
+	if m.parsedClientMAC != nil {
+		conditionsChecked++
+		if effectiveMAC != nil && macEqual(m.parsedClientMAC, effectiveMAC) {
+			return true, fmt.Sprintf("ClientMAC=%s", effectiveMAC)
+		}
+	}
+
+	if m.parsedClientECS != nil {
+		conditionsChecked++
+		if ctx.ClientECS != nil && m.parsedClientECS.Contains(ctx.ClientECS) {
+			return true, fmt.Sprintf("ClientECS=%s", ctx.ClientECS)
+		}
+	}
+
+	if m.parsedClientEDNSMAC != nil {
+		conditionsChecked++
+		if ctx.ClientEDNSMAC != nil && macEqual(m.parsedClientEDNSMAC, ctx.ClientEDNSMAC) {
+			return true, fmt.Sprintf("EDNS0MAC=%s", ctx.ClientEDNSMAC)
+		}
+	}
+
+	if m.parsedServerIP != nil {
+		conditionsChecked++
+		if ctx.ServerIP != nil && m.parsedServerIP.Equal(ctx.ServerIP) {
+			return true, fmt.Sprintf("ServerIP=%s", ctx.ServerIP)
+		}
+	}
+
+	if m.ServerPort != 0 {
+		conditionsChecked++
+		if ctx.ServerPort == m.ServerPort {
+			return true, fmt.Sprintf("ServerPort=%d", ctx.ServerPort)
+		}
+	}
+
+	if m.ServerHostname != "" {
+		conditionsChecked++
+		if strings.EqualFold(ctx.ServerHostname, m.ServerHostname) {
+			return true, fmt.Sprintf("Hostname=%s", m.ServerHostname)
+		}
+	}
+
+	if m.ServerPath != "" {
+		conditionsChecked++
+		if ctx.ServerPath == m.ServerPath {
+			return true, fmt.Sprintf("Path=%s", m.ServerPath)
+		}
+	}
+
+	if conditionsChecked == 0 {
+		return true, "NoConditions/MatchAll"
+	}
+
+	return false, ""
+}
+
+func macEqual(a, b net.HardwareAddr) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func forwardToUpstreamsWithContext(ctx context.Context, req *dns.Msg, reqCtx *RequestContext) (*dns.Msg, string, time.Duration, error) {
+	selectedUpstreams, selectedStrategy := SelectUpstreams(reqCtx)
+	return forwardToUpstreams(ctx, req, selectedUpstreams, selectedStrategy)
+}
+
 // --- Strategy Logic ---
 
-func forwardToUpstreams(ctx context.Context, req *dns.Msg) (*dns.Msg, string, time.Duration, error) {
-	// Fast-path for single upstream config
+func forwardToUpstreams(ctx context.Context, req *dns.Msg, upstreams []*Upstream, strategy string) (*dns.Msg, string, time.Duration, error) {
 	if len(upstreams) == 1 {
 		u := upstreams[0]
 		resp, rtt, err := u.executeExchange(ctx, req)
 		return resp, u.String(), rtt, err
 	}
 
-	strat := strings.ToLower(*strategy)
+	strat := strings.ToLower(strategy)
 
 	switch strat {
 	case "round-robin":
-		// Atomic counter ensures thread-safe round-robin distribution
 		idx := rrCounter.Add(1)
 		u := upstreams[int(idx)%len(upstreams)]
 		log.Printf("[STRATEGY] Round-Robin: Selected #%d %s", int(idx)%len(upstreams), u.String())
@@ -807,7 +1215,6 @@ func forwardToUpstreams(ctx context.Context, req *dns.Msg) (*dns.Msg, string, ti
 		return resp, u.String(), rtt, err
 
 	case "failover":
-		// Try sequentially until one succeeds
 		log.Printf("[STRATEGY] Failover: Starting sequence...")
 		for i, u := range upstreams {
 			log.Printf("[STRATEGY] Failover: Attempting #%d %s...", i, u.String())
@@ -821,13 +1228,12 @@ func forwardToUpstreams(ctx context.Context, req *dns.Msg) (*dns.Msg, string, ti
 		return nil, "", 0, errors.New("all upstreams failed")
 
 	case "fastest":
-		return fastestStrategy(ctx, req)
+		return fastestStrategy(ctx, req, upstreams)
 
 	case "race":
-		return raceStrategy(ctx, req)
+		return raceStrategy(ctx, req, upstreams)
 
 	default:
-		// Fallback to failover
 		for _, u := range upstreams {
 			resp, rtt, err := u.executeExchange(ctx, req)
 			if err == nil {
@@ -838,19 +1244,13 @@ func forwardToUpstreams(ctx context.Context, req *dns.Msg) (*dns.Msg, string, ti
 	}
 }
 
-func fastestStrategy(ctx context.Context, req *dns.Msg) (*dns.Msg, string, time.Duration, error) {
-	// Epsilon-greedy: 10% chance to pick a random upstream to explore potentially better routes
+func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*dns.Msg, string, time.Duration, error) {
 	if rand.Float64() < 0.1 {
 		idx := rand.IntN(len(upstreams))
 		u := upstreams[idx]
-		log.Printf("[STRATEGY] Fastest: Exploration mode (10%% chance). Probing %s", u.String())
-		resp, rtt, err := u.executeExchange(ctx, req)
-		return resp, u.String(), rtt, err
+		u.executeExchange(ctx, req) // Just probe, ignore result here to simplify
 	}
 
-	// We calculate stats for logging.
-	// Optimization Note: Sorting this slice is O(N log N). For small N (upstreams) this is negligible.
-	// If you have thousands of upstreams, switch to a linear O(N) scan.
 	type uStat struct {
 		u   *Upstream
 		rtt int64
@@ -860,7 +1260,6 @@ func fastestStrategy(ctx context.Context, req *dns.Msg) (*dns.Msg, string, time.
 		stats[i] = uStat{u, u.getRTT()}
 	}
 
-	// Sort: unmeasured (0 RTT) first (to give them a chance), then by fastest RTT
 	sort.Slice(stats, func(i, j int) bool {
 		if stats[i].rtt == 0 && stats[j].rtt == 0 {
 			return i < j
@@ -874,26 +1273,12 @@ func fastestStrategy(ctx context.Context, req *dns.Msg) (*dns.Msg, string, time.
 		return stats[i].rtt < stats[j].rtt
 	})
 
-	// Log the ranking to console
-	log.Printf("[STRATEGY] Fastest: Ranking:")
-	for i, s := range stats {
-		rttVal := "Unmeasured"
-		if s.rtt > 0 {
-			rttVal = time.Duration(s.rtt).String()
-		}
-		log.Printf("  Rank #%d | Upstream: %s | RTT: %s", i+1, s.u.String(), rttVal)
-	}
-
 	best := stats[0].u
-	log.Printf("[STRATEGY] Fastest: Selected #1 %s", best.String())
-
 	resp, rtt, err := best.executeExchange(ctx, req)
 	return resp, best.String(), rtt, err
 }
 
-func raceStrategy(ctx context.Context, req *dns.Msg) (*dns.Msg, string, time.Duration, error) {
-	log.Printf("[STRATEGY] Race: Broadcasting to %d upstreams...", len(upstreams))
-
+func raceStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*dns.Msg, string, time.Duration, error) {
 	type result struct {
 		msg *dns.Msg
 		str string
@@ -901,13 +1286,11 @@ func raceStrategy(ctx context.Context, req *dns.Msg) (*dns.Msg, string, time.Dur
 		err error
 	}
 
-	// Use a cancelable context so we can cancel pending requests once the winner returns
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	resCh := make(chan result, len(upstreams))
 
-	// Launch ALL requests simultaneously
 	for _, u := range upstreams {
 		go func(upstream *Upstream) {
 			resp, rtt, err := upstream.executeExchange(ctx, req)
@@ -918,23 +1301,19 @@ func raceStrategy(ctx context.Context, req *dns.Msg) (*dns.Msg, string, time.Dur
 		}(u)
 	}
 
-	// Wait for the first success
 	var lastErr error
 	for i := 0; i < len(upstreams); i++ {
 		select {
 		case res := <-resCh:
 			if res.err == nil {
-				log.Printf("[STRATEGY] Race: Winner is %s (RTT: %v)", res.str, res.rtt)
 				return res.msg, res.str, res.rtt, nil
 			}
-			log.Printf("[STRATEGY] Race: %s failed: %v", res.str, res.err)
 			lastErr = res.err
 		case <-ctx.Done():
 			return nil, "", 0, ctx.Err()
 		}
 	}
 
-	log.Printf("[STRATEGY] Race: All upstreams failed.")
 	if lastErr != nil {
 		return nil, "", 0, lastErr
 	}
@@ -943,63 +1322,78 @@ func raceStrategy(ctx context.Context, req *dns.Msg) (*dns.Msg, string, time.Dur
 
 // --- Core Request Processing ---
 
-func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, proto, meta string) {
+func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, reqCtx *RequestContext) {
 	start := time.Now()
 
-	// 1. Identify Client
 	remoteAddr := w.RemoteAddr()
 	ip := getIPFromAddr(remoteAddr)
 	mac := getMacFromCache(ip)
 
-	// 2. Prepare Message (Add Metadata/EDNS0)
+	reqCtx.ClientIP = ip
+	reqCtx.ClientMAC = mac
+
+	extractEDNS0ClientInfo(r, reqCtx)
+
 	msg := r.Copy()
 	addEDNS0Options(msg, ip, mac)
 
-	// 3. Extract info for logging & caching
 	var qInfo, cacheKey, ecsSubnet string
 	if len(r.Question) > 0 {
 		q := r.Question[0]
 		qInfo = fmt.Sprintf("%s (%s)", q.Name, dns.TypeToString[q.Qtype])
 	}
 
-	// Extract existing EDNS0 options for logs (like Client Subnet)
-	if opt := msg.IsEdns0(); opt != nil {
+	if reqCtx.ClientECS != nil {
+		if reqCtx.ClientECSNet != nil {
+			mask, _ := reqCtx.ClientECSNet.Mask.Size()
+			ecsSubnet = fmt.Sprintf("%s/%d", reqCtx.ClientECS.String(), mask)
+		} else {
+			ecsSubnet = reqCtx.ClientECS.String()
+		}
+	}
+
+	if opt := r.IsEdns0(); opt != nil {
 		var extra []string
-		for _, o := range opt.Option {
-			switch v := o.(type) {
-			case *dns.EDNS0_SUBNET:
-				ecs := fmt.Sprintf("ECS:%s/%d", v.Address.String(), v.SourceNetmask)
-				extra = append(extra, ecs)
-				ecsSubnet = fmt.Sprintf("%s/%d", v.Address.String(), v.SourceNetmask)
-			case *dns.EDNS0_LOCAL:
-				if v.Code == EDNS0_OPTION_MAC {
-					extra = append(extra, fmt.Sprintf("MAC65001:%s", net.HardwareAddr(v.Data).String()))
-				}
-			}
+		if reqCtx.ClientECS != nil {
+			extra = append(extra, fmt.Sprintf("ECS:%s", ecsSubnet))
+		}
+		if reqCtx.ClientEDNSMAC != nil {
+			extra = append(extra, fmt.Sprintf("MAC65001:%s", reqCtx.ClientEDNSMAC.String()))
 		}
 		if len(extra) > 0 {
 			qInfo += fmt.Sprintf(" [%s]", strings.Join(extra, " "))
 		}
 	}
 
-	// Generate cache key based on query + ECS (to prevent cache poisoning between subnets)
 	if len(r.Question) > 0 {
 		q := r.Question[0]
-		cacheKey = fmt.Sprintf("%s|%d|%d|%s", q.Name, q.Qtype, q.Qclass, ecsSubnet)
+
+		effectiveIP := reqCtx.ClientIP
+		if reqCtx.ClientECS != nil {
+			effectiveIP = reqCtx.ClientECS
+		}
+
+		effectiveMAC := reqCtx.ClientMAC
+		if reqCtx.ClientEDNSMAC != nil {
+			effectiveMAC = reqCtx.ClientEDNSMAC
+		}
+
+		routingKey := fmt.Sprintf("%s:%d:%s:%s:%s:%s",
+			reqCtx.ServerIP, reqCtx.ServerPort, reqCtx.ServerHostname, reqCtx.ServerPath,
+			effectiveIP, effectiveMAC)
+		cacheKey = fmt.Sprintf("%s|%d|%d|%s", q.Name, q.Qtype, q.Qclass, routingKey)
 	}
 
-	// 4. Cache Check
 	if !*cacheDisabled && cacheKey != "" {
 		if cachedResp := getFromCache(cacheKey, r.Id); cachedResp != nil {
-			logRequest(r.Id, ip, mac, proto, meta, qInfo, "CACHE_HIT", "CACHE", 0, time.Since(start), cachedResp)
+			logRequest(r.Id, ip, mac, reqCtx.Protocol, reqCtx.ServerHostname, qInfo, "CACHE_HIT", "CACHE", 0, time.Since(start), cachedResp)
 			w.WriteMsg(cachedResp)
 			return
 		}
 	}
 
-	// 5. Forward to Upstream (using Singleflight)
 	callResult, shared := requestGroup.Do(cacheKey, func() callResult {
-		resp, upstreamStr, rtt, err := forwardToUpstreams(ctx, msg)
+		resp, upstreamStr, rtt, err := forwardToUpstreamsWithContext(ctx, msg, reqCtx)
 		return callResult{msg: resp, upstreamStr: upstreamStr, rtt: rtt, err: err}
 	})
 
@@ -1019,9 +1413,8 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, pr
 		status = fmt.Sprintf("%s (COALESCED)", status)
 	}
 
-	logRequest(r.Id, ip, mac, proto, meta, qInfo, status, callResult.upstreamStr, callResult.rtt, time.Since(start), resp)
+	logRequest(r.Id, ip, mac, reqCtx.Protocol, reqCtx.ServerHostname, qInfo, status, callResult.upstreamStr, callResult.rtt, time.Since(start), resp)
 
-	// Fix ID to match the original request before replying
 	resp.Id = r.Id
 	w.WriteMsg(resp)
 }
@@ -1037,15 +1430,12 @@ func logRequest(qid uint16, ip net.IP, mac net.HardwareAddr, proto, meta, qInfo,
 		protoLog = fmt.Sprintf("%s(%s)", proto, meta)
 	}
 
-	// Log Query
 	log.Printf("[QRY] QID:%d | Client:%s | MAC:%s | Proto:%s | Query:%s", qid, ip, macStr, protoLog, qInfo)
 
-	// Log Forwarding Details (if applicable)
 	if upstream != "" && upstream != "CACHE" {
 		log.Printf("[FWD] QID:%d | Upstream:%s | RTT:%v | Query:%s | Response:%s", qid, upstream, upstreamRTT, qInfo, status)
 	}
 
-	// Log Response Details
 	var answers []string
 	if resp != nil {
 		addRRs := func(rrs []dns.RR) {
@@ -1053,7 +1443,6 @@ func logRequest(qid uint16, ip net.IP, mac net.HardwareAddr, proto, meta, qInfo,
 				if _, ok := rr.(*dns.OPT); ok {
 					continue
 				}
-				// Format simple string representation of RR
 				parts := strings.Fields(rr.String())
 				if len(parts) >= 4 {
 					s := parts[3]
@@ -1087,22 +1476,25 @@ func maintainDNSCache() {
 }
 
 func getFromCache(key string, reqID uint16) *dns.Msg {
+	if !config.Cache.Enabled {
+		return nil
+	}
+
 	dnsCache.RLock()
 	entry, found := dnsCache.items[key]
 	dnsCache.RUnlock()
 
 	if !found {
-		log.Printf("[CACHE] MISS: Key=%s", key)
+		// log.Printf("[CACHE] MISS: Key=%s", key)
 		return nil
 	}
 
 	now := time.Now()
 	if now.After(entry.Expiration) {
-		log.Printf("[CACHE] EXPIRED: Key=%s", key)
+		// log.Printf("[CACHE] EXPIRED: Key=%s", key)
 		return nil
 	}
 
-	// Update access time for LRU logic
 	dnsCache.Lock()
 	if e, ok := dnsCache.items[key]; ok {
 		e.LastAccess = now
@@ -1112,13 +1504,12 @@ func getFromCache(key string, reqID uint16) *dns.Msg {
 	msg := entry.Msg.Copy()
 	msg.Id = reqID
 
-	// Adjust TTL in response based on time spent in cache
 	ttlDiff := uint32(entry.Expiration.Sub(now).Seconds())
 	if ttlDiff <= 0 {
 		return nil
 	}
 
-	log.Printf("[CACHE] HIT: Key=%s | Adjusted TTL: %ds", key, ttlDiff)
+	// log.Printf("[CACHE] HIT: Key=%s | Adjusted TTL: %ds", key, ttlDiff)
 
 	updateTTL := func(rrs []dns.RR) {
 		for _, rr := range rrs {
@@ -1132,7 +1523,10 @@ func getFromCache(key string, reqID uint16) *dns.Msg {
 }
 
 func addToCache(key string, msg *dns.Msg) {
-	// Don't cache failures or truncated messages
+	if !config.Cache.Enabled {
+		return
+	}
+
 	if msg.Rcode != dns.RcodeSuccess && msg.Rcode != dns.RcodeNameError {
 		return
 	}
@@ -1140,7 +1534,6 @@ func addToCache(key string, msg *dns.Msg) {
 		return
 	}
 
-	// Calculate MinTTL to respect the upstream's wishes
 	minTTL := uint32(3600)
 	foundTTL := false
 	checkRR := func(rrs []dns.RR) {
@@ -1161,7 +1554,6 @@ func addToCache(key string, msg *dns.Msg) {
 	if minTTL == 0 {
 		return
 	}
-	// Default negative caching (NXDOMAIN) to 60s
 	if !foundTTL && msg.Rcode == dns.RcodeNameError {
 		minTTL = 60
 	} else if !foundTTL {
@@ -1171,10 +1563,7 @@ func addToCache(key string, msg *dns.Msg) {
 	dnsCache.Lock()
 	defer dnsCache.Unlock()
 
-	// Optimization: Smart LRU Eviction
-	// If the cache is full, we need to make space.
-	if len(dnsCache.items) >= *cacheSize {
-		// 1. First, quickly prune anything that's already expired.
+	if len(dnsCache.items) >= config.Cache.Size {
 		now := time.Now()
 		for k, v := range dnsCache.items {
 			if now.After(v.Expiration) {
@@ -1182,10 +1571,7 @@ func addToCache(key string, msg *dns.Msg) {
 			}
 		}
 
-		// 2. If still full, we use Random Sample Eviction (Approximate LRU).
-		// Why? Because sorting 10,000 items to find the "absolute" oldest is O(N log N).
-		// Picking 50 random items and killing the oldest among them is O(K) and effectively nearly as good.
-		if len(dnsCache.items) >= *cacheSize {
+		if len(dnsCache.items) >= config.Cache.Size {
 			evictSmartLRU()
 		}
 	}
@@ -1196,18 +1582,17 @@ func addToCache(key string, msg *dns.Msg) {
 		Expiration: now.Add(time.Duration(minTTL) * time.Second),
 		LastAccess: now,
 	}
-	log.Printf("[CACHE] ADD: Key=%s | MinTTL: %ds", key, minTTL)
+	// log.Printf("[CACHE] ADD: Key=%s | MinTTL: %ds", key, minTTL)
 }
 
 func evictSmartLRU() {
-	// Target removing 5% of cache to prevent thrashing
-	toRemove := *cacheSize / 20
+	toRemove := config.Cache.Size / 20
 	if toRemove < 10 {
 		toRemove = 10
 	}
 
-	const sampleSize = 50 // Check 50 items to find a victim
-	
+	const sampleSize = 50
+
 	for i := 0; i < toRemove; i++ {
 		if len(dnsCache.items) == 0 {
 			break
@@ -1218,8 +1603,6 @@ func evictSmartLRU() {
 		first := true
 		count := 0
 
-		// Map iteration in Go is random. We rely on this property!
-		// Just iterating 'sampleSize' times gives us a random sample.
 		for k, v := range dnsCache.items {
 			if first || v.LastAccess.Before(oldestTime) {
 				oldestTime = v.LastAccess
@@ -1231,13 +1614,11 @@ func evictSmartLRU() {
 				break
 			}
 		}
-		
+
 		if oldestKey != "" {
 			delete(dnsCache.items, oldestKey)
 		}
 	}
-	
-	log.Printf("[CACHE] EVICTION: Smart LRU removed ~%d items", toRemove)
 }
 
 func pruneCache() {
@@ -1271,8 +1652,6 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Unsupported Media Type", http.StatusUnsupportedMediaType)
 			return
 		}
-		// Optimization: io.ReadAll allocates a new buffer. 
-		// For max performance, could use a pooled buffer and io.Copy, but ReadAll is safer for standard HTTP handlers.
 		data, _ := io.ReadAll(r.Body)
 		msg = new(dns.Msg)
 		err = msg.Unpack(data)
@@ -1300,14 +1679,22 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 	}
 
 	localAddr, _ := r.Context().Value(http.LocalAddrContextKey).(net.Addr)
+	reqCtx := &RequestContext{
+		ServerIP:       getLocalIP(localAddr),
+		ServerPort:     getLocalPort(localAddr),
+		ServerHostname: r.Host,
+		ServerPath:     r.URL.Path,
+		Protocol:       proto,
+	}
 	dw := &dohResponseWriter{w: w, r: r, localAddr: localAddr}
-	processDNSRequest(ctx, dw, msg, proto, r.Host)
+	processDNSRequest(ctx, dw, msg, reqCtx)
 }
 
 func handleDoQSession(sess quic.Connection) {
 	sni := sess.ConnectionState().TLS.ServerName
+	localAddr := sess.LocalAddr()
+
 	for {
-		// DoQ handles multiple streams per connection
 		stream, err := sess.AcceptStream(context.Background())
 		if err != nil {
 			return
@@ -1318,14 +1705,12 @@ func handleDoQSession(sess quic.Connection) {
 			ctx, cancel := context.WithTimeout(context.Background(), *queryTimeout)
 			defer cancel()
 
-			// Read 2-byte length
 			lBuf := make([]byte, 2)
 			if _, err := io.ReadFull(str, lBuf); err != nil {
 				return
 			}
 			length := binary.BigEndian.Uint16(lBuf)
 
-			// Use buffer pool for reading the payload
 			buf := bufPool.Get().([]byte)
 			if cap(buf) < int(length) {
 				buf = make([]byte, length)
@@ -1341,8 +1726,16 @@ func handleDoQSession(sess quic.Connection) {
 			if err := msg.Unpack(buf); err != nil {
 				return
 			}
+
+			reqCtx := &RequestContext{
+				ServerIP:       getLocalIP(localAddr),
+				ServerPort:     getLocalPort(localAddr),
+				ServerHostname: sni,
+				Protocol:       "DoQ",
+			}
+
 			dw := &doqResponseWriter{stream: str, remoteAddr: sess.RemoteAddr()}
-			processDNSRequest(ctx, dw, msg, "DoQ", sni)
+			processDNSRequest(ctx, dw, msg, reqCtx)
 		}(stream)
 	}
 }
@@ -1389,7 +1782,7 @@ func parseLinuxARP(table map[string]net.HardwareAddr) {
 	cmd := exec.Command("ip", "neigh", "show")
 	out, err := cmd.Output()
 	if err != nil {
-		log.Printf("ARP refresh error: %v", err)
+		// log.Printf("ARP refresh error: %v", err)
 		return
 	}
 	sc := bufio.NewScanner(bytes.NewReader(out))
@@ -1413,10 +1806,9 @@ func parseWindowsARP(table map[string]net.HardwareAddr) {
 	cmd := exec.Command("arp", "-a")
 	out, err := cmd.Output()
 	if err != nil {
-		log.Printf("ARP refresh error: %v", err)
+		// log.Printf("ARP refresh error: %v", err)
 		return
 	}
-	// Optimization: Use pre-compiled Regex variable (windowsARPRegex)
 	sc := bufio.NewScanner(bytes.NewReader(out))
 	for sc.Scan() {
 		m := windowsARPRegex.FindStringSubmatch(sc.Text())
@@ -1451,10 +1843,9 @@ func parseDarwinARP(table map[string]net.HardwareAddr) {
 	cmd := exec.Command("arp", "-an")
 	out, err := cmd.Output()
 	if err != nil {
-		log.Printf("ARP refresh error: %v", err)
+		// log.Printf("ARP refresh error: %v", err)
 		return
 	}
-	// Optimization: Use pre-compiled Regex variable (darwinARPRegex)
 	sc := bufio.NewScanner(bytes.NewReader(out))
 	for sc.Scan() {
 		m := darwinARPRegex.FindStringSubmatch(sc.Text())
@@ -1491,6 +1882,56 @@ func parseDarwinNDP(table map[string]net.HardwareAddr) {
 
 // --- EDNS0 ---
 
+func extractEDNS0ClientInfo(msg *dns.Msg, reqCtx *RequestContext) {
+	opt := msg.IsEdns0()
+	if opt == nil {
+		return
+	}
+
+	for _, option := range opt.Option {
+		switch o := option.(type) {
+		case *dns.EDNS0_SUBNET:
+			reqCtx.ClientECS = o.Address
+
+			family := o.Family
+			mask := o.SourceNetmask
+
+			var ipNet *net.IPNet
+			if family == 1 {
+				if mask > 32 {
+					mask = 32
+				}
+				maskBytes := net.CIDRMask(int(mask), 32)
+				ipNet = &net.IPNet{
+					IP:   o.Address,
+					Mask: maskBytes,
+				}
+			} else if family == 2 {
+				if mask > 128 {
+					mask = 128
+				}
+				maskBytes := net.CIDRMask(int(mask), 128)
+				ipNet = &net.IPNet{
+					IP:   o.Address,
+					Mask: maskBytes,
+				}
+			}
+
+			reqCtx.ClientECSNet = ipNet
+
+			log.Printf("[EDNS0] Extracted ECS: %s/%d (family: %d)",
+				o.Address.String(), mask, family)
+
+		case *dns.EDNS0_LOCAL:
+			if o.Code == EDNS0_OPTION_MAC && len(o.Data) > 0 {
+				reqCtx.ClientEDNSMAC = net.HardwareAddr(o.Data)
+				log.Printf("[EDNS0] Extracted MAC from Option 65001: %s",
+					reqCtx.ClientEDNSMAC.String())
+			}
+		}
+	}
+}
+
 func addEDNS0Options(msg *dns.Msg, ip net.IP, mac net.HardwareAddr) {
 	o := msg.IsEdns0()
 	if o == nil {
@@ -1506,7 +1947,7 @@ func addEDNS0Options(msg *dns.Msg, ip net.IP, mac net.HardwareAddr) {
 			hasECS = true
 			opts = append(opts, opt)
 		} else if local, ok := opt.(*dns.EDNS0_LOCAL); ok && local.Code == EDNS0_OPTION_MAC {
-			continue // Skip to overwrite
+			continue
 		} else {
 			opts = append(opts, opt)
 		}
@@ -1533,7 +1974,6 @@ func addEDNS0Options(msg *dns.Msg, ip net.IP, mac net.HardwareAddr) {
 }
 
 func getIPFromAddr(addr net.Addr) net.IP {
-	// Optimization: Type switch is faster than SplitHostPort string manipulation
 	switch v := addr.(type) {
 	case *net.UDPAddr:
 		return v.IP
@@ -1553,6 +1993,46 @@ func getIPFromAddr(addr net.Addr) net.IP {
 	}
 }
 
+func getLocalIP(addr net.Addr) net.IP {
+	if addr == nil {
+		return nil
+	}
+
+	switch v := addr.(type) {
+	case *net.UDPAddr:
+		return v.IP
+	case *net.TCPAddr:
+		return v.IP
+	default:
+		host, _, err := net.SplitHostPort(addr.String())
+		if err != nil {
+			return nil
+		}
+		return net.ParseIP(host)
+	}
+}
+
+func getLocalPort(addr net.Addr) int {
+	if addr == nil {
+		return 0
+	}
+
+	switch v := addr.(type) {
+	case *net.UDPAddr:
+		return v.Port
+	case *net.TCPAddr:
+		return v.Port
+	default:
+		_, port, err := net.SplitHostPort(addr.String())
+		if err != nil {
+			return 0
+		}
+		var p int
+		fmt.Sscanf(port, "%d", &p)
+		return p
+	}
+}
+
 // --- Response Writers ---
 
 type doqResponseWriter struct {
@@ -1567,8 +2047,7 @@ func (w *doqResponseWriter) WriteMsg(msg *dns.Msg) error {
 	if err != nil {
 		return err
 	}
-	
-	// Optimization: Use buffer pool + Coalesced write
+
 	fullLen := 2 + len(buf)
 	sendBuf := bufPool.Get().([]byte)
 	if cap(sendBuf) < fullLen {

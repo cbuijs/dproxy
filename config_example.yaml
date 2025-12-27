@@ -1,0 +1,82 @@
+# dproxy Complete Configuration
+
+# Server configuration
+server:
+  listen_addr: "0.0.0.0"  # Bind to all interfaces
+  ports:
+    udp: 53      # DNS UDP/TCP port
+    tls: 853     # DoT/DoQ port  
+    https: 443   # DoH/DoH3 port
+  
+  tls:
+    cert_file: ""  # Path to TLS certificate (leave empty for self-signed)
+    key_file: ""   # Path to TLS key (leave empty for self-signed)
+  
+  timeout: "5s"  # Query timeout
+  insecure_upstream: false  # Allow insecure upstream TLS connections
+
+# Bootstrap DNS configuration
+bootstrap:
+  servers:
+    - "1.1.1.1:53"
+    - "8.8.8.8:53"
+  ip_version: "both"  # Options: ipv4, ipv6, both
+
+# Cache configuration  
+cache:
+  enabled: true
+  size: 10000  # Maximum number of cached entries
+
+# Routing configuration
+routing:
+  # Upstream groups for easy reference
+  upstream_groups:
+    corporate:
+      - udp://10.0.0.53
+      - udp://10.0.1.53
+    
+    public_secure:
+      - doh://cloudflare-dns.com/dns-query
+      - doh3://dns.google/dns-query
+    
+    family_safe:
+      - doh://security.cloudflare-dns.com/dns-query#1.1.1.2
+      - https://dns.quad9.net/dns-query#9.9.9.9
+
+  # Routing rules (evaluated top-to-bottom, first match wins)
+  routing_rules:
+    - name: "CEO Laptop"
+      match:
+        client_ip: "192.168.1.100"
+      upstreams: corporate
+      strategy: failover
+    
+    - name: "Management VLAN"
+      match:
+        client_cidr: "10.10.0.0/24"
+      upstreams: corporate
+      strategy: round-robin
+    
+    - name: "Kids iPad"
+      match:
+        client_mac: "aa:bb:cc:dd:ee:ff"
+      upstreams: family_safe
+      strategy: fastest
+    
+    - name: "European Clients via ECS"
+      match:
+        client_ecs: "2.16.0.0/13"
+      upstreams: public_secure
+      strategy: fastest
+    
+    - name: "Guest Network Interface"
+      match:
+        server_ip: "192.168.2.1"
+      upstreams: public_secure
+      strategy: race
+
+  # Default configuration (REQUIRED - used when no rule matches)
+  default:
+    upstreams: public_secure
+    strategy: failover
+
