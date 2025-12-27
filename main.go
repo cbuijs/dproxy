@@ -1,6 +1,6 @@
 /*
 File: main.go
-Version: 2.3.0
+Version: 2.3.1
 Author: Chris Buijs (2025), Refactored with OR-logic routing and enhanced logging
 Description: A high-performance, multi-protocol DNS Proxy supporting UDP, TCP, DoT, DoH, DoH3, and DoQ upstreams with client-aware routing.
 */
@@ -1248,7 +1248,12 @@ func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (
 	if rand.Float64() < 0.1 {
 		idx := rand.IntN(len(upstreams))
 		u := upstreams[idx]
-		u.executeExchange(ctx, req) // Just probe, ignore result here to simplify
+		// Probe in background to update RTT without blocking the current request
+		log.Printf("[STRATEGY] Fastest: Probing background upstream %s", u.String())
+		go func() {
+			// Use a background context for the probe so it doesn't get cancelled by the main request returning
+			u.executeExchange(context.Background(), req.Copy())
+		}()
 	}
 
 	type uStat struct {
@@ -1274,11 +1279,15 @@ func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (
 	})
 
 	best := stats[0].u
+	log.Printf("[STRATEGY] Fastest: Selected %s (Current RTT: %v)", best.String(), time.Duration(best.getRTT()))
+
 	resp, rtt, err := best.executeExchange(ctx, req)
 	return resp, best.String(), rtt, err
 }
 
 func raceStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*dns.Msg, string, time.Duration, error) {
+	log.Printf("[STRATEGY] Race: Starting race among %d upstreams", len(upstreams))
+
 	type result struct {
 		msg *dns.Msg
 		str string
@@ -1306,6 +1315,7 @@ func raceStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*dn
 		select {
 		case res := <-resCh:
 			if res.err == nil {
+				log.Printf("[STRATEGY] Race: Winner %s (RTT: %v)", res.str, res.rtt)
 				return res.msg, res.str, res.rtt, nil
 			}
 			lastErr = res.err
