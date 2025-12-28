@@ -1,8 +1,9 @@
 /*
 File: main.go
-Version: 2.3.1
-Author: Chris Buijs (2025), Refactored with OR-logic routing and enhanced logging
-Description: A high-performance, multi-protocol DNS Proxy supporting UDP, TCP, DoT, DoH, DoH3, and DoQ upstreams with client-aware routing.
+Version: 2.6.0
+Author: Chris Buijs (2025), Refactored with OR-logic routing, enhanced logging, Stub-Resolver Optimization, and Configurable DoH Paths
+Description: A high-performance, multi-protocol DNS Proxy supporting UDP, TCP, DoT, DoH, DoH3, and DoQ upstreams.
+             Features client-aware routing, domain-based routing, response stripping for stub-resolvers, and flexible DoH path validation.
 */
 
 package main
@@ -97,6 +98,10 @@ type ServerConfig struct {
 		CertFile string `yaml:"cert_file"`
 		KeyFile  string `yaml:"key_file"`
 	} `yaml:"tls"`
+	DOH struct {
+		AllowedPaths []string `yaml:"allowed_paths"`
+		StrictPath   bool     `yaml:"strict_path"`
+	} `yaml:"doh"`
 	Timeout          string `yaml:"timeout"`
 	InsecureUpstream bool   `yaml:"insecure_upstream"`
 }
@@ -142,6 +147,7 @@ type MatchConditions struct {
 	ServerPort     int    `yaml:"server_port"`
 	ServerHostname string `yaml:"server_hostname"`
 	ServerPath     string `yaml:"server_path"`
+	QueryDomain    string `yaml:"query_domain"`
 
 	parsedClientIP      net.IP
 	parsedClientCIDR    *net.IPNet
@@ -161,6 +167,7 @@ type RequestContext struct {
 	ServerPort     int
 	ServerHostname string
 	ServerPath     string
+	QueryName      string
 	Protocol       string
 }
 
@@ -480,8 +487,10 @@ func startServers(wg *sync.WaitGroup, tlsConfig *tls.Config) {
 	go func() {
 		defer wg.Done()
 		addr := fmt.Sprintf("%s:%d", listenAddr, httpsPort)
+		
+		// Catch-all handler for path validation inside handleDoH
 		mux := http.NewServeMux()
-		mux.HandleFunc("/dns-query", handleDoH)
+		mux.HandleFunc("/", handleDoH)
 
 		h3Server := &http3.Server{Addr: addr, Handler: mux, TLSConfig: tlsConfig}
 		h1Server := &http.Server{Addr: addr, Handler: mux, TLSConfig: tlsConfig}
@@ -535,6 +544,12 @@ func LoadConfig(path string) error {
 	if cfg.Server.Ports.HTTPS == 0 {
 		cfg.Server.Ports.HTTPS = 443
 	}
+
+	// DoH Defaults
+	if len(cfg.Server.DOH.AllowedPaths) == 0 {
+		cfg.Server.DOH.AllowedPaths = []string{"/dns-query"}
+	}
+	// cfg.Server.DOH.StrictPath defaults to false (bool default)
 
 	if len(cfg.Bootstrap.Servers) == 0 {
 		cfg.Bootstrap.Servers = []string{"1.1.1.1:53", "8.8.8.8:53"}
@@ -614,7 +629,14 @@ func LoadConfig(path string) error {
 		if m.ServerPath != "" {
 			log.Printf("   ├─ Match OR: Path = %s", m.ServerPath)
 		}
-		log.Printf("   └─ Upstreams: %d target(s)", len(rule.parsedUpstreams))
+		if m.QueryDomain != "" {
+			log.Printf("   ├─ Match OR: Query Domain = %s", m.QueryDomain)
+		}
+		
+		log.Printf("   └─ Upstreams (%d):", len(rule.parsedUpstreams))
+		for _, u := range rule.parsedUpstreams {
+			log.Printf("      - %s", u.String())
+		}
 	}
 	log.Println("-----------------------------")
 
@@ -1164,6 +1186,36 @@ func matchRule(m *MatchConditions, ctx *RequestContext) (bool, string) {
 		}
 	}
 
+	if m.QueryDomain != "" {
+		conditionsChecked++
+		ruleDom := strings.ToLower(m.QueryDomain)
+		qDom := ctx.QueryName
+
+		match := false
+		if strings.HasPrefix(ruleDom, "*.") {
+			// Syntax: *.domain.name.com -> Just the sub-domains.
+			base := ruleDom[2:]
+			if strings.HasSuffix(qDom, "."+base) {
+				match = true
+			}
+		} else if strings.HasPrefix(ruleDom, ".") {
+			// Syntax: .domain.name.com -> The domain-name and sub-domains.
+			base := ruleDom[1:]
+			if qDom == base || strings.HasSuffix(qDom, "."+base) {
+				match = true
+			}
+		} else {
+			// Syntax: domain.name.com -> Just the domain-name.
+			if qDom == ruleDom {
+				match = true
+			}
+		}
+
+		if match {
+			return true, fmt.Sprintf("QueryDomain=%s", m.QueryDomain)
+		}
+	}
+
 	if conditionsChecked == 0 {
 		return true, "NoConditions/MatchAll"
 	}
@@ -1332,6 +1384,32 @@ func raceStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*dn
 
 // --- Core Request Processing ---
 
+func cleanResponse(msg *dns.Msg) {
+	if msg == nil {
+		return
+	}
+
+	// 1. Remove Authority Section
+	msg.Ns = nil
+
+	// 2. Remove Additional Section (includes OPT/EDNS0)
+	msg.Extra = nil
+
+	// 3. Filter Answer Section for DNSSEC records
+	if len(msg.Answer) > 0 {
+		newAnswer := make([]dns.RR, 0, len(msg.Answer))
+		for _, rr := range msg.Answer {
+			switch rr.Header().Rrtype {
+			case dns.TypeRRSIG, dns.TypeNSEC, dns.TypeNSEC3, dns.TypeNSEC3PARAM, dns.TypeDS, dns.TypeDNSKEY, dns.TypeDLV:
+				continue
+			default:
+				newAnswer = append(newAnswer, rr)
+			}
+		}
+		msg.Answer = newAnswer
+	}
+}
+
 func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, reqCtx *RequestContext) {
 	start := time.Now()
 
@@ -1350,6 +1428,7 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	var qInfo, cacheKey, ecsSubnet string
 	if len(r.Question) > 0 {
 		q := r.Question[0]
+		reqCtx.QueryName = strings.TrimSuffix(strings.ToLower(q.Name), ".")
 		qInfo = fmt.Sprintf("%s (%s)", q.Name, dns.TypeToString[q.Qtype])
 	}
 
@@ -1396,6 +1475,7 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 
 	if !*cacheDisabled && cacheKey != "" {
 		if cachedResp := getFromCache(cacheKey, r.Id); cachedResp != nil {
+			cleanResponse(cachedResp) // Ensure cached response is minimal
 			logRequest(r.Id, ip, mac, reqCtx.Protocol, reqCtx.ServerHostname, qInfo, "CACHE_HIT", "CACHE", 0, time.Since(start), cachedResp)
 			w.WriteMsg(cachedResp)
 			return
@@ -1414,6 +1494,17 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	}
 
 	resp := callResult.msg
+
+	// Fix shared pointer race condition and allow safe modification
+	if shared && resp != nil {
+		resp = resp.Copy()
+	}
+
+	// Clean the response (Strip Authority, Additional, DNSSEC)
+	if resp != nil {
+		cleanResponse(resp)
+	}
+
 	if !*cacheDisabled && resp != nil {
 		addToCache(cacheKey, resp)
 	}
@@ -1647,6 +1738,23 @@ func pruneCache() {
 func handleDoH(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), *queryTimeout)
 	defer cancel()
+
+	// --- PATH VALIDATION LOGIC ---
+	// If strict checking is enabled, verify request path matches one of the allowed paths.
+	if config.Server.DOH.StrictPath {
+		allowed := false
+		for _, path := range config.Server.DOH.AllowedPaths {
+			if r.URL.Path == path {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			http.Error(w, "Not Found", http.StatusNotFound)
+			return
+		}
+	}
+	// -----------------------------
 
 	var msg *dns.Msg
 	var err error

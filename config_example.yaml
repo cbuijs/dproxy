@@ -1,81 +1,215 @@
-# dproxy Complete Configuration
+# ------------------------------------------------------------------------------
+# dproxy Configuration File (v2.6.0)
+# ------------------------------------------------------------------------------
+# This configuration file controls all aspects of the dproxy server, including
+# network listeners, DoH path validation, TLS settings, caching behavior, and
+# advanced routing logic.
+# ------------------------------------------------------------------------------
 
-# Server configuration
+# --- Server Configuration ---
 server:
-  listen_addr: "0.0.0.0"  # Bind to all interfaces
-  ports:
-    udp: 53      # DNS UDP/TCP port
-    tls: 853     # DoT/DoQ port  
-    https: 443   # DoH/DoH3 port
-  
-  tls:
-    cert_file: ""  # Path to TLS certificate (leave empty for self-signed)
-    key_file: ""   # Path to TLS key (leave empty for self-signed)
-  
-  timeout: "5s"  # Query timeout
-  insecure_upstream: false  # Allow insecure upstream TLS connections
+  # The IP address to bind to. "0.0.0.0" binds to all available interfaces.
+  # Default: "0.0.0.0"
+  listen_addr: "0.0.0.0"
 
-# Bootstrap DNS configuration
+  # Ports to listen on for different protocols.
+  ports:
+    # Standard DNS over UDP and TCP.
+    # Default: 53
+    udp: 53
+    
+    # DNS over TLS (DoT) and DNS over QUIC (DoQ).
+    # Default: 853
+    tls: 853
+    
+    # DNS over HTTPS (DoH) and HTTP/3 (DoH3).
+    # Default: 443
+    https: 443
+  
+  # TLS Certificate settings.
+  # Required for DoT, DoQ, DoH, and DoH3.
+  # If left empty, a self-signed certificate will be generated automatically at startup.
+  tls:
+    cert_file: ""  # Path to your .crt or .pem file
+    key_file: ""   # Path to your .key file
+  
+  # DoH (DNS over HTTPS) Configuration
+  doh:
+    # List of URL paths to accept for DoH queries.
+    # Default: ["/dns-query"]
+    allowed_paths:
+      - "/dns-query"
+      - "/family"
+      - "/secure"
+    
+    # Strict Path Checking:
+    # - true:  Reject requests that do not match one of the 'allowed_paths' (returns 404).
+    # - false: Accept DoH queries on ANY path (useful if you want to capture the path
+    #          for client identification via 'server_path' routing rules).
+    # Default: false
+    strict_path: true
+  
+  # Global timeout for upstream queries.
+  # Formats: "500ms", "1s", "5s".
+  # Default: "5s"
+  timeout: "5s"
+  
+  # Skip TLS verification for upstreams (e.g., self-signed upstream certs).
+  # SECURITY WARNING: Setting this to true disables certificate validation.
+  # Default: false
+  insecure_upstream: false
+
+# --- Bootstrap DNS Configuration ---
+# These servers are used ONLY to resolve the hostnames of your configured upstreams.
 bootstrap:
+  # List of DNS servers to use for bootstrapping.
+  # Default: ["1.1.1.1:53", "8.8.8.8:53"]
   servers:
     - "1.1.1.1:53"
     - "8.8.8.8:53"
-  ip_version: "both"  # Options: ipv4, ipv6, both
+  
+  # IP version preference for resolving upstream hostnames.
+  # Options: "ipv4", "ipv6", "both"
+  # Default: "both"
+  ip_version: "both"
 
-# Cache configuration  
+# --- Cache Configuration ---
 cache:
+  # Enable or disable the internal DNS cache.
+  # Default: false (but recommended: true)
   enabled: true
-  size: 10000  # Maximum number of cached entries
+  
+  # Maximum number of entries to store in the cache.
+  # When full, SmartLRU eviction is used.
+  # Default: 10000
+  size: 10000
 
-# Routing configuration
+# --- Routing Configuration ---
 routing:
-  # Upstream groups for easy reference
+  # 1. Upstream Groups
+  # Define reusable lists of upstream DNS servers here.
+  # Supported schemes:
+  #   - udp:// (Standard DNS)
+  #   - tcp:// (Standard DNS over TCP)
+  #   - dot:// or tls:// (DNS over TLS)
+  #   - doh:// or https:// (DNS over HTTPS)
+  #   - doh3:// or h3:// (DNS over HTTP/3)
+  #   - doq:// or quic:// (DNS over QUIC)
+  #
+  # You can pin a specific IP for a hostname using the # fragment:
+  #   e.g., doh://example.com/dns-query#1.2.3.4
   upstream_groups:
-    corporate:
-      - udp://10.0.0.53
-      - udp://10.0.1.53
-    
     public_secure:
       - doh://cloudflare-dns.com/dns-query
-      - doh3://dns.google/dns-query
+      - dot://dns.google:853
+      - doq://dns.adguard-dns.com:853
     
     family_safe:
-      - doh://security.cloudflare-dns.com/dns-query#1.1.1.2
-      - https://dns.quad9.net/dns-query#9.9.9.9
+      - https://family.cloudflare-dns.com/dns-query
+      - tls://family.adguard-dns.com
+    
+    local_internal:
+      - udp://192.168.1.1:53
 
-  # Routing rules (evaluated top-to-bottom, first match wins)
+  # 2. Routing Rules
+  # Rules are evaluated from top to bottom. The first matching rule wins.
+  # Strategies available:
+  #   - failover:    Try 1st, if fails try 2nd, etc. (Reliability)
+  #   - round-robin: Rotate through upstreams sequentially. (Load balancing)
+  #   - random:      Pick a random upstream. (Simple distribution)
+  #   - fastest:     Track RTT and prefer the fastest server. (Performance)
+  #   - race:        Query all upstreams simultaneously, return first response. (Aggressive speed)
   routing_rules:
-    - name: "CEO Laptop"
+    
+    # --------------------------------------------------------------------------
+    # REFERENCE: ALL AVAILABLE MATCH TYPES
+    # --------------------------------------------------------------------------
+    
+    # 1. Query Domain (Domain Name Matching)
+    # Syntax:
+    #   "domain.com"   -> Exact match only
+    #   ".domain.com"  -> Matches "domain.com" AND "sub.domain.com"
+    #   "*.domain.com" -> Matches "sub.domain.com" but NOT "domain.com"
+    - name: "Local Domains"
       match:
-        client_ip: "192.168.1.100"
-      upstreams: corporate
+        query_domain: ".home.arpa"
+      upstreams: local_internal
       strategy: failover
-    
-    - name: "Management VLAN"
+
+    # 2. Client IP (Exact Match)
+    - name: "Specific Client"
       match:
-        client_cidr: "10.10.0.0/24"
-      upstreams: corporate
+        client_ip: "192.168.1.50"
+      upstreams: public_secure
+      strategy: fastest
+
+    # 3. Client CIDR (Subnet Match)
+    - name: "Guest VLAN"
+      match:
+        client_cidr: "192.168.20.0/24"
+      upstreams: public_secure
       strategy: round-robin
-    
-    - name: "Kids iPad"
+
+    # 4. Client MAC Address (Hardware Address)
+    # Note: Only works if the client is on the same local network segment.
+    - name: "Kids Tablet"
       match:
         client_mac: "aa:bb:cc:dd:ee:ff"
       upstreams: family_safe
-      strategy: fastest
-    
-    - name: "European Clients via ECS"
+      strategy: failover
+
+    # 5. ECS (EDNS Client Subnet)
+    # Matches the subnet provided in the EDNS0 Client Subnet option.
+    - name: "Remote Office ECS"
       match:
-        client_ecs: "2.16.0.0/13"
-      upstreams: public_secure
-      strategy: fastest
+        client_ecs: "10.5.0.0/16"
+      upstreams: local_internal
+      strategy: failover
     
-    - name: "Guest Network Interface"
+    # 6. EDNS0 MAC (Option Code 65001)
+    # Matches a custom MAC address embedded in EDNS0 option 65001.
+    # Often used by routers (like MikroTik) forwarding DNS.
+    - name: "Device via EDNS MAC"
       match:
-        server_ip: "192.168.2.1"
-      upstreams: public_secure
+        client_edns_mac: "11:22:33:44:55:66"
+      upstreams: family_safe
       strategy: race
 
-  # Default configuration (REQUIRED - used when no rule matches)
+    # 7. Server IP (Inbound Listener IP)
+    # Matches the IP address of the interface receiving the request.
+    - name: "Inbound Interface VIP"
+      match:
+        server_ip: "10.0.0.5"
+      upstreams: public_secure
+      strategy: random
+
+    # 8. Server Port (Inbound Listener Port)
+    # Matches the port the request was received on.
+    - name: "Standard DNS Port"
+      match:
+        server_port: 53
+      upstreams: local_internal
+      strategy: round-robin
+
+    # 9. Server Hostname (DoT/DoH/DoQ SNI or Host Header)
+    # Matches the server name requested by the client (SNI or HTTP Host).
+    - name: "DoH Hostname"
+      match:
+        server_hostname: "dns.mycompany.com"
+      upstreams: public_secure
+      strategy: failover
+
+    # 10. Server Path (DoH Path)
+    # Matches the URL path of a DoH request (e.g., /family, /dns-query).
+    # Useful for assigning different policies to different URL endpoints.
+    - name: "Family Filter Path"
+      match:
+        server_path: "/family"
+      upstreams: family_safe
+      strategy: failover
+
+  # 3. Default Rule (REQUIRED)
+  # This rule is applied if no other rules match.
   default:
     upstreams: public_secure
     strategy: failover
