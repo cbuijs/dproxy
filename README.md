@@ -10,3 +10,5 @@ chmod +x dproxy
 ./dproxy -h
 ```
 
+NOTE: Better documentation is in the making :-). Check the `config_example.yaml` file for more info.
+
