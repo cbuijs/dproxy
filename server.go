@@ -154,7 +154,8 @@ func getTimeout() time.Duration {
 // --- Handlers ---
 
 func handleDoH(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), *queryTimeout)
+	// Use getTimeout() which reads from config
+	ctx, cancel := context.WithTimeout(r.Context(), getTimeout())
 	defer cancel()
 
 	// --- PATH VALIDATION LOGIC ---
@@ -190,12 +191,12 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 		msg = new(dns.Msg)
 		err = msg.Unpack(data)
 	case http.MethodGet:
-		b64 := r.URL.Query().Get("dns")
-		if b64 == "" {
+		b64str := r.URL.Query().Get("dns")
+		if b64str == "" {
 			http.Error(w, "Missing dns parameter", http.StatusBadRequest)
 			return
 		}
-		data, e := base64.RawURLEncoding.DecodeString(b64)
+		data, e := base64.RawURLEncoding.DecodeString(b64str)
 		if e != nil {
 			http.Error(w, "Invalid base64", http.StatusBadRequest)
 			return
@@ -236,7 +237,8 @@ func handleDoQSession(sess quic.Connection) {
 		go func(str quic.Stream) {
 			defer str.Close()
 
-			ctx, cancel := context.WithTimeout(context.Background(), *queryTimeout)
+			// Use getTimeout() which reads from config
+			ctx, cancel := context.WithTimeout(context.Background(), getTimeout())
 			defer cancel()
 
 			lBuf := make([]byte, 2)

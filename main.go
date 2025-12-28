@@ -12,7 +12,6 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 // --- Globals & Pools ---
@@ -38,10 +37,7 @@ var requestGroup RequestGroup
 // --- Flags ---
 
 var (
-	configFile    = flag.String("config", "", "Path to configuration file (YAML)")
-	ipVersionFlag = flag.String("ip", "both", "Default IP version preference (ipv4, ipv6, both)")
-	cacheDisabled = flag.Bool("no-cache", false, "Disable DNS caching")
-	queryTimeout  = flag.Duration("timeout", 5*time.Second, "Global query timeout")
+	configFile = flag.String("config", "", "Path to configuration file (YAML)")
 )
 
 // --- Main ---

@@ -248,9 +248,10 @@ func resolveHostnameWithBootstrap(hostname string, preferredVersion string) ([]n
 	var allIPs []net.IP
 	var lastErr error
 
+	// Determine IP version preference using config
 	version := preferredVersion
 	if version == "" {
-		version = *ipVersionFlag
+		version = config.Bootstrap.IPVersion
 	}
 
 	useIPv4 := version == "ipv4" || version == "both"

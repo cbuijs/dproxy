@@ -146,7 +146,8 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		cacheKey = fmt.Sprintf("%s|%d|%d|%s", q.Name, q.Qtype, q.Qclass, routingKey)
 	}
 
-	if !*cacheDisabled && cacheKey != "" {
+	// Updated to use config struct instead of flag
+	if config.Cache.Enabled && cacheKey != "" {
 		if cachedResp := getFromCache(cacheKey, r.Id); cachedResp != nil {
 			cleanResponse(cachedResp)
 			logRequest(r.Id, reqCtx, qInfo, "CACHE_HIT", "CACHE", 0, time.Since(start), cachedResp)
@@ -176,7 +177,8 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		cleanResponse(resp)
 	}
 
-	if !*cacheDisabled && resp != nil {
+	// Updated to use config struct instead of flag
+	if config.Cache.Enabled && resp != nil {
 		addToCache(cacheKey, resp)
 	}
 
