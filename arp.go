@@ -9,6 +9,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"net"
 	"os/exec"
 	"regexp"
@@ -30,11 +31,18 @@ type ARPCache struct {
 
 var arpCache = &ARPCache{table: make(map[string]net.HardwareAddr)}
 
-func maintainARPCache() {
+func maintainARPCache(ctx context.Context) {
 	refreshARP()
 	ticker := time.NewTicker(30 * time.Second)
-	for range ticker.C {
-		refreshARP()
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			refreshARP()
+		}
 	}
 }
 

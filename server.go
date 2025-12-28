@@ -23,82 +23,146 @@ import (
 	"github.com/quic-go/quic-go/http3"
 )
 
-func startServers(wg *sync.WaitGroup, tlsConfig *tls.Config) {
+// ServerShutdowner interface for graceful shutdown
+type ServerShutdowner interface {
+	Shutdown(ctx context.Context) error
+}
+
+// DNSServerWrapper wraps dns.Server to implement ServerShutdowner
+type DNSServerWrapper struct {
+	*dns.Server
+}
+
+func (w *DNSServerWrapper) Shutdown(ctx context.Context) error {
+	return w.Server.ShutdownContext(ctx)
+}
+
+// HTTPServerWrapper wraps http.Server to implement ServerShutdowner
+type HTTPServerWrapper struct {
+	*http.Server
+}
+
+func (w *HTTPServerWrapper) Shutdown(ctx context.Context) error {
+	return w.Server.Shutdown(ctx)
+}
+
+// HTTP3ServerWrapper wraps http3.Server to implement ServerShutdowner
+type HTTP3ServerWrapper struct {
+	*http3.Server
+}
+
+func (w *HTTP3ServerWrapper) Shutdown(ctx context.Context) error {
+	return w.Server.Close()
+}
+
+// DoQServerWrapper wraps QUIC listener for DoQ
+type DoQServerWrapper struct {
+	listener *quic.Listener
+	cancel   context.CancelFunc
+	done     chan struct{}
+}
+
+func (w *DoQServerWrapper) Shutdown(ctx context.Context) error {
+	w.cancel()
+	if w.listener != nil {
+		w.listener.Close()
+	}
+	
+	select {
+	case <-w.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func startServers(wg *sync.WaitGroup, tlsConfig *tls.Config) []ServerShutdowner {
 	listenAddr := config.Server.ListenAddr
 	udpPort := config.Server.Ports.UDP
 	tlsPort := config.Server.Ports.TLS
 	httpsPort := config.Server.Ports.HTTPS
 
+	var servers []ServerShutdowner
+
 	// UDP Listener
 	wg.Add(1)
+	udpServer := &dns.Server{Addr: fmt.Sprintf("%s:%d", listenAddr, udpPort), Net: "udp"}
+	udpServer.Handler = dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+		ctx, cancel := context.WithTimeout(context.Background(), getTimeout())
+		defer cancel()
+		reqCtx := &RequestContext{
+			ServerIP:   getLocalIP(w.LocalAddr()),
+			ServerPort: getLocalPort(w.LocalAddr()),
+			Protocol:   "UDP",
+		}
+		processDNSRequest(ctx, w, r, reqCtx)
+	})
 	go func() {
 		defer wg.Done()
-		srv := &dns.Server{Addr: fmt.Sprintf("%s:%d", listenAddr, udpPort), Net: "udp"}
-		srv.Handler = dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
-			ctx, cancel := context.WithTimeout(context.Background(), getTimeout())
-			defer cancel()
-			reqCtx := &RequestContext{
-				ServerIP:   getLocalIP(w.LocalAddr()),
-				ServerPort: getLocalPort(w.LocalAddr()),
-				Protocol:   "UDP",
-			}
-			processDNSRequest(ctx, w, r, reqCtx)
-		})
 		log.Printf("Starting DNS UDP on %s:%d", listenAddr, udpPort)
-		if err := srv.ListenAndServe(); err != nil {
-			log.Printf("UDP server error: %v", err)
+		if err := udpServer.ListenAndServe(); err != nil {
+			log.Printf("UDP server stopped: %v", err)
 		}
 	}()
+	servers = append(servers, &DNSServerWrapper{udpServer})
 
 	// TCP Listener
 	wg.Add(1)
+	tcpServer := &dns.Server{Addr: fmt.Sprintf("%s:%d", listenAddr, udpPort), Net: "tcp"}
+	tcpServer.Handler = dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+		ctx, cancel := context.WithTimeout(context.Background(), getTimeout())
+		defer cancel()
+		reqCtx := &RequestContext{
+			ServerIP:   getLocalIP(w.LocalAddr()),
+			ServerPort: getLocalPort(w.LocalAddr()),
+			Protocol:   "TCP",
+		}
+		processDNSRequest(ctx, w, r, reqCtx)
+	})
 	go func() {
 		defer wg.Done()
-		srv := &dns.Server{Addr: fmt.Sprintf("%s:%d", listenAddr, udpPort), Net: "tcp"}
-		srv.Handler = dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
-			ctx, cancel := context.WithTimeout(context.Background(), getTimeout())
-			defer cancel()
-			reqCtx := &RequestContext{
-				ServerIP:   getLocalIP(w.LocalAddr()),
-				ServerPort: getLocalPort(w.LocalAddr()),
-				Protocol:   "TCP",
-			}
-			processDNSRequest(ctx, w, r, reqCtx)
-		})
 		log.Printf("Starting DNS TCP on %s:%d", listenAddr, udpPort)
-		if err := srv.ListenAndServe(); err != nil {
-			log.Printf("TCP server error: %v", err)
+		if err := tcpServer.ListenAndServe(); err != nil {
+			log.Printf("TCP server stopped: %v", err)
 		}
 	}()
+	servers = append(servers, &DNSServerWrapper{tcpServer})
 
 	// DoT (DNS over TLS) Listener
 	wg.Add(1)
+	dotServer := &dns.Server{
+		Addr: fmt.Sprintf("%s:%d", listenAddr, tlsPort),
+		Net:  "tcp-tls", TLSConfig: tlsConfig,
+	}
+	dotServer.Handler = dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+		ctx, cancel := context.WithTimeout(context.Background(), getTimeout())
+		defer cancel()
+		reqCtx := &RequestContext{
+			ServerIP:   getLocalIP(w.LocalAddr()),
+			ServerPort: getLocalPort(w.LocalAddr()),
+			Protocol:   "DoT",
+		}
+		processDNSRequest(ctx, w, r, reqCtx)
+	})
 	go func() {
 		defer wg.Done()
-		srv := &dns.Server{
-			Addr: fmt.Sprintf("%s:%d", listenAddr, tlsPort),
-			Net:  "tcp-tls", TLSConfig: tlsConfig,
-		}
-		srv.Handler = dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
-			ctx, cancel := context.WithTimeout(context.Background(), getTimeout())
-			defer cancel()
-			reqCtx := &RequestContext{
-				ServerIP:   getLocalIP(w.LocalAddr()),
-				ServerPort: getLocalPort(w.LocalAddr()),
-				Protocol:   "DoT",
-			}
-			processDNSRequest(ctx, w, r, reqCtx)
-		})
 		log.Printf("Starting DoT on %s:%d", listenAddr, tlsPort)
-		if err := srv.ListenAndServe(); err != nil {
-			log.Printf("DoT server error: %v", err)
+		if err := dotServer.ListenAndServe(); err != nil {
+			log.Printf("DoT server stopped: %v", err)
 		}
 	}()
+	servers = append(servers, &DNSServerWrapper{dotServer})
 
 	// DoQ (DNS over QUIC) Listener
 	wg.Add(1)
+	doqCtx, doqCancel := context.WithCancel(context.Background())
+	doqDone := make(chan struct{})
+	doqWrapper := &DoQServerWrapper{cancel: doqCancel, done: doqDone}
+	
 	go func() {
 		defer wg.Done()
+		defer close(doqDone)
+		
 		addr := fmt.Sprintf("%s:%d", listenAddr, tlsPort)
 		log.Printf("Starting DoQ on %s", addr)
 		listener, err := quic.ListenAddr(addr, tlsConfig, nil)
@@ -106,38 +170,60 @@ func startServers(wg *sync.WaitGroup, tlsConfig *tls.Config) {
 			log.Printf("DoQ listen error: %v", err)
 			return
 		}
+		doqWrapper.listener = listener
+		
 		for {
-			sess, err := listener.Accept(context.Background())
-			if err != nil {
-				log.Printf("DoQ accept error: %v", err)
-				continue
+			select {
+			case <-doqCtx.Done():
+				log.Println("DoQ server stopped")
+				return
+			default:
+				sess, err := listener.Accept(doqCtx)
+				if err != nil {
+					select {
+					case <-doqCtx.Done():
+						return
+					default:
+						log.Printf("DoQ accept error: %v", err)
+						continue
+					}
+				}
+				go handleDoQSession(sess)
 			}
-			go handleDoQSession(sess)
 		}
 	}()
+	servers = append(servers, doqWrapper)
 
 	// DoH / DoH3 (HTTP/HTTPS) Listener
 	wg.Add(1)
+	addr := fmt.Sprintf("%s:%d", listenAddr, httpsPort)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", handleDoH)
+
+	h3Server := &http3.Server{Addr: addr, Handler: mux, TLSConfig: tlsConfig}
+	h1Server := &http.Server{Addr: addr, Handler: mux, TLSConfig: tlsConfig}
+
 	go func() {
 		defer wg.Done()
-		addr := fmt.Sprintf("%s:%d", listenAddr, httpsPort)
-
-		mux := http.NewServeMux()
-		mux.HandleFunc("/", handleDoH)
-
-		h3Server := &http3.Server{Addr: addr, Handler: mux, TLSConfig: tlsConfig}
-		h1Server := &http.Server{Addr: addr, Handler: mux, TLSConfig: tlsConfig}
-
 		log.Printf("Starting DoH/DoH3 on %s", addr)
+		
+		// Start HTTP/3 in a goroutine
 		go func() {
-			if err := h3Server.ListenAndServe(); err != nil {
-				log.Printf("DoH3 server error: %v", err)
+			if err := h3Server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Printf("DoH3 server stopped: %v", err)
 			}
 		}()
-		if err := h1Server.ListenAndServeTLS("", ""); err != nil {
-			log.Printf("DoH server error: %v", err)
+		
+		// Start HTTP/1.1 & HTTP/2
+		if err := h1Server.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+			log.Printf("DoH server stopped: %v", err)
 		}
 	}()
+	servers = append(servers, &HTTPServerWrapper{h1Server})
+	servers = append(servers, &HTTP3ServerWrapper{h3Server})
+
+	return servers
 }
 
 func getTimeout() time.Duration {
@@ -154,7 +240,6 @@ func getTimeout() time.Duration {
 // --- Handlers ---
 
 func handleDoH(w http.ResponseWriter, r *http.Request) {
-	// Use getTimeout() which reads from config
 	ctx, cancel := context.WithTimeout(r.Context(), getTimeout())
 	defer cancel()
 
@@ -237,7 +322,6 @@ func handleDoQSession(sess quic.Connection) {
 		go func(str quic.Stream) {
 			defer str.Close()
 
-			// Use getTimeout() which reads from config
 			ctx, cancel := context.WithTimeout(context.Background(), getTimeout())
 			defer cancel()
 

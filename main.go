@@ -6,12 +6,18 @@ Description: Entry point for the dproxy application. Initializes globals, parses
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"sync"
 	"sync/atomic"
+	"syscall"
+	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 // --- Globals & Pools ---
@@ -31,8 +37,15 @@ var bootstrapServers []string
 // Round-robin counter for load balancing
 var rrCounter atomic.Uint64
 
-// Request Group for singleflight (coalescing identical requests)
-var requestGroup RequestGroup
+// Singleflight group for coalescing identical requests
+var requestGroup singleflight.Group
+
+// Shutdown coordination
+var (
+	shutdownContext context.Context
+	shutdownCancel  context.CancelFunc
+	shutdownWg      sync.WaitGroup
+)
 
 // --- Flags ---
 
@@ -63,16 +76,15 @@ Usage: %s -config <config.yaml>
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
 
-	// Start background maintenance routines
-	go maintainARPCache()
-	go doqPool.cleanup()
+	// Initialize shutdown context
+	shutdownContext, shutdownCancel = context.WithCancel(context.Background())
 
-	if config.Cache.Enabled {
-		log.Println("Caching: Enabled")
-		go maintainDNSCache()
-	} else {
-		log.Println("Caching: Disabled")
-	}
+	// Setup signal handling for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Start background maintenance routines
+	startBackgroundTasks()
 
 	// Setup TLS
 	tlsConfig, err := getTLSConfig(config.Server.TLS.CertFile, config.Server.TLS.KeyFile, config.Server.ListenAddr)
@@ -81,8 +93,96 @@ Usage: %s -config <config.yaml>
 	}
 
 	// Start Servers
+	serverWg := &sync.WaitGroup{}
+	servers := startServers(serverWg, tlsConfig)
+
+	// Wait for shutdown signal
+	sig := <-sigChan
+	log.Printf("Received signal: %v - initiating graceful shutdown...", sig)
+
+	// Trigger graceful shutdown
+	gracefulShutdown(servers)
+
+	// Wait for all servers to stop
+	serverWg.Wait()
+	log.Println("All servers stopped")
+
+	// Cancel background tasks
+	shutdownCancel()
+
+	// Wait for background tasks to finish
+	shutdownWg.Wait()
+	log.Println("All background tasks stopped")
+
+	log.Println("Shutdown complete")
+}
+
+// startBackgroundTasks starts all background maintenance routines
+func startBackgroundTasks() {
+	// ARP cache maintenance
+	shutdownWg.Add(1)
+	go func() {
+		defer shutdownWg.Done()
+		maintainARPCache(shutdownContext)
+	}()
+
+	// DoQ connection pool cleanup
+	shutdownWg.Add(1)
+	go func() {
+		defer shutdownWg.Done()
+		doqPool.cleanup(shutdownContext)
+	}()
+
+	// DNS cache maintenance
+	if config.Cache.Enabled {
+		log.Println("Caching: Enabled")
+		shutdownWg.Add(1)
+		go func() {
+			defer shutdownWg.Done()
+			maintainDNSCache(shutdownContext)
+		}()
+	} else {
+		log.Println("Caching: Disabled")
+	}
+}
+
+// gracefulShutdown performs graceful shutdown of all servers
+func gracefulShutdown(servers []ServerShutdowner) {
+	log.Println("Stopping all listeners...")
+
+	// Create a context with timeout for shutdown
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	var wg sync.WaitGroup
-	startServers(&wg, tlsConfig)
-	wg.Wait()
+
+	// Shutdown all servers concurrently
+	for i, srv := range servers {
+		if srv != nil {
+			wg.Add(1)
+			go func(index int, server ServerShutdowner) {
+				defer wg.Done()
+				if err := server.Shutdown(ctx); err != nil {
+					log.Printf("Error shutting down server %d: %v", index, err)
+				} else {
+					log.Printf("Server %d shut down successfully", index)
+				}
+			}(i, srv)
+		}
+	}
+
+	// Wait for all servers to shutdown or timeout
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		log.Println("All servers shut down gracefully")
+	case <-ctx.Done():
+		log.Println("Shutdown timeout reached - forcing exit")
+	}
 }
 

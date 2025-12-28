@@ -6,6 +6,7 @@ Description: Thread-safe in-memory DNS cache with TTL enforcement and SmartLRU e
 package main
 
 import (
+	"context"
 	"sync"
 	"time"
 
@@ -25,10 +26,17 @@ type DNSCache struct {
 
 var dnsCache = &DNSCache{items: make(map[string]*CacheEntry)}
 
-func maintainDNSCache() {
+func maintainDNSCache(ctx context.Context) {
 	ticker := time.NewTicker(1 * time.Minute)
-	for range ticker.C {
-		pruneCache()
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			pruneCache()
+		}
 	}
 }
 
