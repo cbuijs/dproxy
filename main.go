@@ -1,9 +1,9 @@
 /*
 File: main.go
-Version: 2.6.0
-Author: Chris Buijs (2025), Refactored with OR-logic routing, enhanced logging, Stub-Resolver Optimization, and Configurable DoH Paths
-Description: A high-performance, multi-protocol DNS Proxy supporting UDP, TCP, DoT, DoH, DoH3, and DoQ upstreams.
-             Features client-aware routing, domain-based routing, response stripping for stub-resolvers, and flexible DoH path validation.
+Version: 2.7.2
+Author: Chris Buijs (2025), Refactored with OR-logic routing, enhanced logging, Stub-Resolver Optimization, Configurable DoH Paths, and IP Version Fix
+Description: A high-performance, multi-protocol DNS Proxy.
+             Fixes: 'ip_version' config now correctly applies to upstream hostname resolution (not just the CLI flag).
 */
 
 package main
@@ -58,7 +58,7 @@ func (s *stringSlice) Set(value string) error {
 
 var (
 	configFile    = flag.String("config", "", "Path to configuration file (YAML)")
-	ipVersion     = flag.String("ip", "both", "IP version to use for bootstrap (ipv4, ipv6, both)")
+	ipVersionFlag = flag.String("ip", "both", "Default IP version preference (ipv4, ipv6, both)")
 	cacheDisabled = flag.Bool("no-cache", false, "Disable DNS caching")
 	queryTimeout  = flag.Duration("timeout", 5*time.Second, "Global query timeout")
 )
@@ -488,7 +488,6 @@ func startServers(wg *sync.WaitGroup, tlsConfig *tls.Config) {
 		defer wg.Done()
 		addr := fmt.Sprintf("%s:%d", listenAddr, httpsPort)
 		
-		// Catch-all handler for path validation inside handleDoH
 		mux := http.NewServeMux()
 		mux.HandleFunc("/", handleDoH)
 
@@ -638,7 +637,7 @@ func LoadConfig(path string) error {
 			log.Printf("      - %s", u.String())
 		}
 	}
-	log.Println("-----------------------------")
+	
 
 	// Parse default rule
 	if cfg.Routing.DefaultRule.Upstreams == nil {
@@ -666,18 +665,38 @@ func LoadConfig(path string) error {
 		cfg.Routing.DefaultRule.Strategy = "failover"
 	}
 
+	// --- Log Default Rule ---
+	log.Printf("[RULE] Loaded 'DEFAULT' (Strategy: %s)", cfg.Routing.DefaultRule.Strategy)
+	log.Printf("   ├─ Match: * (Catch-All)")
+	log.Printf("   └─ Upstreams (%d):", len(cfg.Routing.DefaultRule.parsedUpstreams))
+	for _, u := range cfg.Routing.DefaultRule.parsedUpstreams {
+		log.Printf("      - %s", u.String())
+	}
+	log.Println("-----------------------------")
+
 	config = &cfg
 	return nil
 }
 
 // --- Routing Functions ---
 
-func resolveHostnameWithBootstrap(hostname string) ([]net.IP, error) {
+func resolveHostnameWithBootstrap(hostname string, preferredVersion string) ([]net.IP, error) {
 	var allIPs []net.IP
 	var lastErr error
 
-	useIPv4 := *ipVersion == "ipv4" || *ipVersion == "both"
-	useIPv6 := *ipVersion == "ipv6" || *ipVersion == "both"
+	// Determine IP version preference
+	// 1. Config value
+	// 2. Global flag (if config is missing or logic implies override)
+	// In this case, LoadConfig ensures cfg.Bootstrap.IPVersion has a value,
+	// so we primarily use preferredVersion passed from there.
+	
+	version := preferredVersion
+	if version == "" {
+		version = *ipVersionFlag
+	}
+
+	useIPv4 := version == "ipv4" || version == "both"
+	useIPv6 := version == "ipv6" || version == "both"
 
 	for _, bootstrap := range bootstrapServers {
 		c := &dns.Client{Net: "udp", Timeout: 3 * time.Second}
@@ -786,7 +805,8 @@ func parseUpstream(raw string, ipVersion string, insecure bool, timeout string) 
 		log.Printf("Upstream %s using direct IP: %s", up.String(), host)
 	} else {
 		log.Printf("Resolving hostname %s using bootstrap servers...", host)
-		ips, err := resolveHostnameWithBootstrap(host)
+		// FIXED: Pass ipVersion preference to resolution function
+		ips, err := resolveHostnameWithBootstrap(host, ipVersion)
 		if err != nil {
 			return nil, fmt.Errorf("failed to resolve upstream hostname %s: %w", host, err)
 		}
@@ -1476,7 +1496,7 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	if !*cacheDisabled && cacheKey != "" {
 		if cachedResp := getFromCache(cacheKey, r.Id); cachedResp != nil {
 			cleanResponse(cachedResp) // Ensure cached response is minimal
-			logRequest(r.Id, ip, mac, reqCtx.Protocol, reqCtx.ServerHostname, qInfo, "CACHE_HIT", "CACHE", 0, time.Since(start), cachedResp)
+			logRequest(r.Id, reqCtx, qInfo, "CACHE_HIT", "CACHE", 0, time.Since(start), cachedResp)
 			w.WriteMsg(cachedResp)
 			return
 		}
@@ -1514,24 +1534,29 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		status = fmt.Sprintf("%s (COALESCED)", status)
 	}
 
-	logRequest(r.Id, ip, mac, reqCtx.Protocol, reqCtx.ServerHostname, qInfo, status, callResult.upstreamStr, callResult.rtt, time.Since(start), resp)
+	logRequest(r.Id, reqCtx, qInfo, status, callResult.upstreamStr, callResult.rtt, time.Since(start), resp)
 
 	resp.Id = r.Id
 	w.WriteMsg(resp)
 }
 
-func logRequest(qid uint16, ip net.IP, mac net.HardwareAddr, proto, meta, qInfo, status, upstream string, upstreamRTT, duration time.Duration, resp *dns.Msg) {
+func logRequest(qid uint16, reqCtx *RequestContext, qInfo, status, upstream string, upstreamRTT, duration time.Duration, resp *dns.Msg) {
 	macStr := "N/A"
-	if mac != nil {
-		macStr = mac.String()
+	if reqCtx.ClientMAC != nil {
+		macStr = reqCtx.ClientMAC.String()
 	}
 
-	protoLog := proto
-	if meta != "" {
-		protoLog = fmt.Sprintf("%s(%s)", proto, meta)
+	// Build Ingress Info string
+	ingress := fmt.Sprintf("%s:%d", reqCtx.ServerIP, reqCtx.ServerPort)
+	if reqCtx.ServerHostname != "" {
+		ingress += fmt.Sprintf(" | Host:%s", reqCtx.ServerHostname)
+	}
+	if reqCtx.ServerPath != "" {
+		ingress += fmt.Sprintf(" | Path:%s", reqCtx.ServerPath)
 	}
 
-	log.Printf("[QRY] QID:%d | Client:%s | MAC:%s | Proto:%s | Query:%s", qid, ip, macStr, protoLog, qInfo)
+	log.Printf("[QRY] QID:%d | Client:%s | MAC:%s | Proto:%s | Ingress:%s | Query:%s",
+		qid, reqCtx.ClientIP, macStr, reqCtx.Protocol, ingress, qInfo)
 
 	if upstream != "" && upstream != "CACHE" {
 		log.Printf("[FWD] QID:%d | Upstream:%s | RTT:%v | Query:%s | Response:%s", qid, upstream, upstreamRTT, qInfo, status)

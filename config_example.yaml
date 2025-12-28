@@ -1,5 +1,5 @@
 # ------------------------------------------------------------------------------
-# dproxy Configuration File (v2.6.0)
+# dproxy Configuration File (v2.7.2)
 # ------------------------------------------------------------------------------
 # This configuration file controls all aspects of the dproxy server, including
 # network listeners, DoH path validation, TLS settings, caching behavior, and
@@ -60,7 +60,9 @@ server:
   insecure_upstream: false
 
 # --- Bootstrap DNS Configuration ---
-# These servers are used ONLY to resolve the hostnames of your configured upstreams.
+# These servers are used to resolve hostnames for both:
+# 1. The upstream servers defined in your configuration.
+# 2. Any internal hostname resolution needed.
 bootstrap:
   # List of DNS servers to use for bootstrapping.
   # Default: ["1.1.1.1:53", "8.8.8.8:53"]
@@ -68,7 +70,9 @@ bootstrap:
     - "1.1.1.1:53"
     - "8.8.8.8:53"
   
-  # IP version preference for resolving upstream hostnames.
+  # IP version preference for resolving ALL hostnames (bootstrap & upstreams).
+  # If "ipv4", only A records will be used for upstream hostnames.
+  # If "ipv6", only AAAA records will be used.
   # Options: "ipv4", "ipv6", "both"
   # Default: "both"
   ip_version: "both"
