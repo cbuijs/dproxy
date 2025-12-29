@@ -39,6 +39,18 @@ type ServerConfig struct {
 		AllowedPaths []string `yaml:"allowed_paths"`
 		StrictPath   bool     `yaml:"strict_path"`
 	} `yaml:"doh"`
+	EDNS0 struct {
+		ECS struct {
+			Mode       string `yaml:"mode"`         // "preserve", "add", "replace", "remove"
+			SourceMask int    `yaml:"source_mask"`  // Override mask bits for both IPv4/IPv6 (0 = auto)
+			IPv4Mask   int    `yaml:"ipv4_mask"`    // Override mask for IPv4 only (0 = use source_mask)
+			IPv6Mask   int    `yaml:"ipv6_mask"`    // Override mask for IPv6 only (0 = use source_mask)
+		} `yaml:"ecs"`
+		MAC struct {
+			Mode   string `yaml:"mode"`   // "preserve", "add", "replace", "remove", "prefer-edns0", "prefer-arp"
+			Source string `yaml:"source"` // "arp", "edns0", "both"
+		} `yaml:"mac"`
+	} `yaml:"edns0"`
 	Timeout          string `yaml:"timeout"`
 	InsecureUpstream bool   `yaml:"insecure_upstream"`
 }
@@ -125,6 +137,62 @@ func LoadConfig(path string) error {
 	if len(cfg.Server.DOH.AllowedPaths) == 0 {
 		cfg.Server.DOH.AllowedPaths = []string{"/dns-query"}
 	}
+
+	// EDNS0 Defaults
+	if cfg.Server.EDNS0.ECS.Mode == "" {
+		cfg.Server.EDNS0.ECS.Mode = "add"
+	}
+	if cfg.Server.EDNS0.MAC.Mode == "" {
+		cfg.Server.EDNS0.MAC.Mode = "prefer-arp"
+	}
+	if cfg.Server.EDNS0.MAC.Source == "" {
+		cfg.Server.EDNS0.MAC.Source = "arp"
+	}
+
+	// Validate EDNS0 ECS mode
+	validECSModes := map[string]bool{"preserve": true, "add": true, "replace": true, "remove": true}
+	if !validECSModes[cfg.Server.EDNS0.ECS.Mode] {
+		return fmt.Errorf("invalid edns0.ecs.mode: %s (must be: preserve, add, replace, or remove)", cfg.Server.EDNS0.ECS.Mode)
+	}
+
+	// Validate EDNS0 MAC mode
+	validMACModes := map[string]bool{"preserve": true, "add": true, "replace": true, "remove": true, "prefer-edns0": true, "prefer-arp": true}
+	if !validMACModes[cfg.Server.EDNS0.MAC.Mode] {
+		return fmt.Errorf("invalid edns0.mac.mode: %s (must be: preserve, add, replace, remove, prefer-edns0, or prefer-arp)", cfg.Server.EDNS0.MAC.Mode)
+	}
+
+	// Validate EDNS0 MAC source
+	validMACSources := map[string]bool{"arp": true, "edns0": true, "both": true}
+	if !validMACSources[cfg.Server.EDNS0.MAC.Source] {
+		return fmt.Errorf("invalid edns0.mac.source: %s (must be: arp, edns0, or both)", cfg.Server.EDNS0.MAC.Source)
+	}
+
+	// Validate ECS mask values
+	if cfg.Server.EDNS0.ECS.SourceMask < 0 || cfg.Server.EDNS0.ECS.SourceMask > 128 {
+		return fmt.Errorf("invalid edns0.ecs.source_mask: %d (must be 0-128)", cfg.Server.EDNS0.ECS.SourceMask)
+	}
+	if cfg.Server.EDNS0.ECS.IPv4Mask < 0 || cfg.Server.EDNS0.ECS.IPv4Mask > 32 {
+		return fmt.Errorf("invalid edns0.ecs.ipv4_mask: %d (must be 0-32)", cfg.Server.EDNS0.ECS.IPv4Mask)
+	}
+	if cfg.Server.EDNS0.ECS.IPv6Mask < 0 || cfg.Server.EDNS0.ECS.IPv6Mask > 128 {
+		return fmt.Errorf("invalid edns0.ecs.ipv6_mask: %d (must be 0-128)", cfg.Server.EDNS0.ECS.IPv6Mask)
+	}
+
+	// Log EDNS0 configuration
+	log.Println("=== EDNS0 Configuration ===")
+	log.Printf("ECS Mode: %s", cfg.Server.EDNS0.ECS.Mode)
+	if cfg.Server.EDNS0.ECS.SourceMask > 0 {
+		log.Printf("ECS Source Mask (both): /%d", cfg.Server.EDNS0.ECS.SourceMask)
+	}
+	if cfg.Server.EDNS0.ECS.IPv4Mask > 0 {
+		log.Printf("ECS IPv4 Mask: /%d", cfg.Server.EDNS0.ECS.IPv4Mask)
+	}
+	if cfg.Server.EDNS0.ECS.IPv6Mask > 0 {
+		log.Printf("ECS IPv6 Mask: /%d", cfg.Server.EDNS0.ECS.IPv6Mask)
+	}
+	log.Printf("MAC Mode: %s", cfg.Server.EDNS0.MAC.Mode)
+	log.Printf("MAC Source: %s", cfg.Server.EDNS0.MAC.Source)
+	log.Println("===========================")
 
 	// Bootstrap Defaults
 	if len(cfg.Bootstrap.Servers) == 0 {

@@ -711,35 +711,233 @@ func addEDNS0Options(msg *dns.Msg, ip net.IP, mac net.HardwareAddr) {
 
 	var opts []dns.EDNS0
 	var hasECS bool
+	var hasMAC bool
+	var existingMAC net.HardwareAddr
 
+	ecsMode := config.Server.EDNS0.ECS.Mode
+	macMode := config.Server.EDNS0.MAC.Mode
+	macSource := config.Server.EDNS0.MAC.Source
+
+	log.Printf("[EDNS0] Processing options for upstream (ECS mode: %s, MAC mode: %s)", ecsMode, macMode)
+	log.Printf("[EDNS0] Client IP: %v, ARP MAC: %v", ip, mac)
+
+	// First pass: identify existing options
 	for _, opt := range o.Option {
-		if _, ok := opt.(*dns.EDNS0_SUBNET); ok {
+		if ecs, ok := opt.(*dns.EDNS0_SUBNET); ok {
 			hasECS = true
-			opts = append(opts, opt)
+			log.Printf("[EDNS0] Found existing ECS from client: %s/%d (family: %d)", 
+				ecs.Address, ecs.SourceNetmask, ecs.Family)
 		} else if local, ok := opt.(*dns.EDNS0_LOCAL); ok && local.Code == EDNS0_OPTION_MAC {
-			continue
-		} else {
+			hasMAC = true
+			existingMAC = net.HardwareAddr(local.Data)
+			log.Printf("[EDNS0] Found existing MAC from client: %s", existingMAC)
+		}
+	}
+
+	// Second pass: build new option list based on mode
+	for _, opt := range o.Option {
+		switch v := opt.(type) {
+		case *dns.EDNS0_SUBNET:
+			// Handle ECS based on mode
+			switch ecsMode {
+			case "preserve":
+				opts = append(opts, opt) // Keep original
+				log.Printf("[EDNS0] ECS: Preserving client's ECS: %s/%d", v.Address, v.SourceNetmask)
+			case "add":
+				if !hasECS {
+					// Will be added later
+					log.Printf("[EDNS0] ECS: Client has no ECS, will add client IP")
+				} else {
+					opts = append(opts, opt) // Keep original if exists
+					log.Printf("[EDNS0] ECS: Client already has ECS, preserving: %s/%d", v.Address, v.SourceNetmask)
+				}
+			case "replace":
+				// Will be replaced later, skip original
+				log.Printf("[EDNS0] ECS: Replacing client's ECS %s/%d with client IP", v.Address, v.SourceNetmask)
+			case "remove":
+				// Skip - removes ECS entirely
+				log.Printf("[EDNS0] ECS: Removing client's ECS: %s/%d", v.Address, v.SourceNetmask)
+			}
+		case *dns.EDNS0_LOCAL:
+			if v.Code == EDNS0_OPTION_MAC {
+				// Handle MAC based on mode
+				switch macMode {
+				case "preserve":
+					opts = append(opts, opt) // Keep original
+					log.Printf("[EDNS0] MAC: Preserving client's MAC: %s", net.HardwareAddr(v.Data))
+				case "add":
+					if !hasMAC {
+						// Will be added later
+						log.Printf("[EDNS0] MAC: Client has no MAC, will add from source")
+					} else {
+						opts = append(opts, opt) // Keep original if exists
+						log.Printf("[EDNS0] MAC: Client already has MAC, preserving: %s", net.HardwareAddr(v.Data))
+					}
+				case "replace":
+					// Will be replaced later, skip original
+					log.Printf("[EDNS0] MAC: Replacing client's MAC %s with source MAC", net.HardwareAddr(v.Data))
+				case "remove":
+					// Skip - removes MAC entirely
+					log.Printf("[EDNS0] MAC: Removing client's MAC: %s", net.HardwareAddr(v.Data))
+				case "prefer-edns0":
+					opts = append(opts, opt) // Keep EDNS0 MAC, will not add ARP MAC
+					log.Printf("[EDNS0] MAC: Preferring client's EDNS0 MAC: %s", net.HardwareAddr(v.Data))
+				case "prefer-arp":
+					// Skip EDNS0 MAC, will add ARP MAC later
+					log.Printf("[EDNS0] MAC: Preferring ARP MAC over client's EDNS0 MAC: %s", net.HardwareAddr(v.Data))
+				}
+			} else {
+				// Keep other EDNS0_LOCAL options
+				opts = append(opts, opt)
+			}
+		default:
+			// Keep all other EDNS0 options
 			opts = append(opts, opt)
 		}
 	}
 
-	if !hasECS && ip != nil {
+	// Add ECS if needed based on mode
+	shouldAddECS := false
+	switch ecsMode {
+	case "preserve":
+		shouldAddECS = false // Only keep what was there
+	case "add":
+		shouldAddECS = !hasECS // Add only if not present
+	case "replace":
+		shouldAddECS = true // Always add (replacing any existing)
+	case "remove":
+		shouldAddECS = false // Never add
+	}
+
+	if shouldAddECS && ip != nil {
 		family := uint16(1)
 		mask := uint8(32)
+		isIPv6 := false
+		
 		if ip.To4() == nil {
 			family = 2
 			mask = 128
+			isIPv6 = true
 		}
+
+		// Determine which mask to use (priority: IPv4/IPv6-specific > general > default)
+		if isIPv6 {
+			// IPv6
+			if config.Server.EDNS0.ECS.IPv6Mask > 0 {
+				mask = uint8(config.Server.EDNS0.ECS.IPv6Mask)
+				log.Printf("[EDNS0] ECS: Using configured IPv6 mask: /%d", mask)
+			} else if config.Server.EDNS0.ECS.SourceMask > 0 {
+				mask = uint8(config.Server.EDNS0.ECS.SourceMask)
+				log.Printf("[EDNS0] ECS: Using configured source mask for IPv6: /%d", mask)
+			} else {
+				log.Printf("[EDNS0] ECS: Using default IPv6 mask: /%d", mask)
+			}
+			// Validate
+			if mask > 128 {
+				log.Printf("[EDNS0] WARNING: ECS mask %d exceeds IPv6 maximum (128), using /128", mask)
+				mask = 128
+			}
+		} else {
+			// IPv4
+			if config.Server.EDNS0.ECS.IPv4Mask > 0 {
+				mask = uint8(config.Server.EDNS0.ECS.IPv4Mask)
+				log.Printf("[EDNS0] ECS: Using configured IPv4 mask: /%d", mask)
+			} else if config.Server.EDNS0.ECS.SourceMask > 0 {
+				mask = uint8(config.Server.EDNS0.ECS.SourceMask)
+				log.Printf("[EDNS0] ECS: Using configured source mask for IPv4: /%d", mask)
+			} else {
+				log.Printf("[EDNS0] ECS: Using default IPv4 mask: /%d", mask)
+			}
+			// Validate
+			if mask > 32 {
+				log.Printf("[EDNS0] WARNING: ECS mask %d exceeds IPv4 maximum (32), using /32", mask)
+				mask = 32
+			}
+		}
+
 		opts = append(opts, &dns.EDNS0_SUBNET{
-			Code: dns.EDNS0SUBNET, Family: family,
-			SourceNetmask: mask, Address: ip,
+			Code:          dns.EDNS0SUBNET,
+			Family:        family,
+			SourceNetmask: mask,
+			Address:       ip,
 		})
+		log.Printf("[EDNS0] ECS: Added to upstream: %s/%d (family: %d)", ip, mask, family)
+	} else if !shouldAddECS && ip != nil {
+		log.Printf("[EDNS0] ECS: Not adding to upstream (mode: %s, hasECS: %v)", ecsMode, hasECS)
 	}
 
-	if mac != nil {
-		opts = append(opts, &dns.EDNS0_LOCAL{Code: EDNS0_OPTION_MAC, Data: mac})
+	// Add MAC if needed based on mode and source
+	shouldAddMAC := false
+	var macToAdd net.HardwareAddr
+
+	switch macMode {
+	case "preserve":
+		shouldAddMAC = false // Only keep what was there
+		log.Printf("[EDNS0] MAC: Preserve mode - not adding new MAC")
+	case "add":
+		shouldAddMAC = !hasMAC // Add only if not present
+		macToAdd = determineMAC(mac, existingMAC, macSource)
+		if shouldAddMAC {
+			log.Printf("[EDNS0] MAC: Add mode - will add MAC from source: %s", macSource)
+		} else {
+			log.Printf("[EDNS0] MAC: Add mode - client already has MAC, not adding")
+		}
+	case "replace":
+		shouldAddMAC = true // Always add (replacing any existing)
+		macToAdd = determineMAC(mac, existingMAC, macSource)
+		log.Printf("[EDNS0] MAC: Replace mode - will add MAC from source: %s", macSource)
+	case "remove":
+		shouldAddMAC = false // Never add
+		log.Printf("[EDNS0] MAC: Remove mode - not adding MAC")
+	case "prefer-edns0":
+		if hasMAC {
+			shouldAddMAC = false // Already kept in second pass
+			log.Printf("[EDNS0] MAC: Prefer-EDNS0 mode - already kept client's MAC")
+		} else if mac != nil && (macSource == "arp" || macSource == "both") {
+			shouldAddMAC = true // Add ARP MAC if no EDNS0 MAC
+			macToAdd = mac
+			log.Printf("[EDNS0] MAC: Prefer-EDNS0 mode - no client MAC, adding ARP MAC")
+		} else {
+			log.Printf("[EDNS0] MAC: Prefer-EDNS0 mode - no MAC available")
+		}
+	case "prefer-arp":
+		if mac != nil && (macSource == "arp" || macSource == "both") {
+			shouldAddMAC = true
+			macToAdd = mac
+			log.Printf("[EDNS0] MAC: Prefer-ARP mode - using ARP MAC: %s", mac)
+		} else if hasMAC && (macSource == "edns0" || macSource == "both") {
+			shouldAddMAC = true
+			macToAdd = existingMAC
+			log.Printf("[EDNS0] MAC: Prefer-ARP mode - no ARP MAC, using client's EDNS0 MAC")
+		} else {
+			log.Printf("[EDNS0] MAC: Prefer-ARP mode - no MAC available")
+		}
+	}
+
+	if shouldAddMAC && macToAdd != nil {
+		opts = append(opts, &dns.EDNS0_LOCAL{Code: EDNS0_OPTION_MAC, Data: macToAdd})
+		log.Printf("[EDNS0] MAC: Added to upstream: %s", macToAdd)
 	}
 
 	o.Option = opts
+	log.Printf("[EDNS0] Final upstream EDNS0 options count: %d", len(opts))
+}
+
+// determineMAC selects which MAC to use based on source configuration
+func determineMAC(arpMAC, edns0MAC net.HardwareAddr, source string) net.HardwareAddr {
+	switch source {
+	case "arp":
+		return arpMAC
+	case "edns0":
+		return edns0MAC
+	case "both":
+		// Prefer ARP if available, otherwise EDNS0
+		if arpMAC != nil {
+			return arpMAC
+		}
+		return edns0MAC
+	default:
+		return arpMAC
+	}
 }
 

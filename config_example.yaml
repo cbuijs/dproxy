@@ -48,7 +48,57 @@ server:
     #          for client identification via 'server_path' routing rules).
     # Default: false
     strict_path: true
-  
+
+  # EDNS0 Options Configuration
+  # Controls how ECS (EDNS Client Subnet) and MAC addresses are handled
+  # when forwarding queries to upstream servers
+  edns0:
+    # ECS (EDNS Client Subnet) - Option 8
+    ecs:
+      # Mode determines how ECS is handled:
+      # - "preserve": Keep client's ECS if present, don't add if missing
+      # - "add":      Add client IP as ECS if not present (default)
+      # - "replace":  Always replace with client IP, even if client sent ECS
+      # - "remove":   Strip ECS entirely from upstream queries
+      # Default: "add"
+      mode: "add"
+      
+      # source_mask: Override the subnet mask bits for BOTH IPv4 and IPv6
+      # 0 = automatic (32 for IPv4, 128 for IPv6)
+      # Example: 24 = send /24 for IPv4 clients
+      # Default: 0 (full IP)
+      source_mask: 0
+      
+      # ipv4_mask: Override mask specifically for IPv4 clients (takes precedence over source_mask)
+      # Example: 24 = send /24 instead of /32 for privacy
+      # Default: 0 (use source_mask or /32)
+      ipv4_mask: 0
+      
+      # ipv6_mask: Override mask specifically for IPv6 clients (takes precedence over source_mask)
+      # Example: 56 = send /56 subnet instead of /128 for privacy
+      # Common values: 48 (site), 56 (subnet), 64 (prefix)
+      # Default: 0 (use source_mask or /128)
+      ipv6_mask: 0
+    
+    # MAC Address - EDNS0 Option 65001 (custom)
+    mac:
+      # Mode determines how MAC addresses are handled:
+      # - "preserve":    Keep client's MAC if present, don't add if missing
+      # - "add":         Add MAC if not present (default behavior)
+      # - "replace":     Always replace with resolved MAC
+      # - "remove":      Strip MAC option entirely from upstream queries
+      # - "prefer-edns0": Use client-provided MAC, fall back to ARP if missing
+      # - "prefer-arp":  Use ARP-resolved MAC, fall back to client's if ARP fails
+      # Default: "prefer-arp"
+      mode: "prefer-arp"
+      
+      # Source determines where to get MAC addresses:
+      # - "arp":   Only use ARP table lookups (local network clients)
+      # - "edns0": Only use EDNS0 option 65001 from client (forwarded from routers)
+      # - "both":  Try ARP first, fall back to EDNS0
+      # Default: "arp"
+      source: "arp"
+
   # Global timeout for upstream queries.
   # Formats: "500ms", "1s", "5s".
   # Default: "5s"

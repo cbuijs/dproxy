@@ -1,0 +1,83 @@
+# dproxy Complete Configuration
+
+# Server configuration
+server:
+  listen_addr: "127.0.0.1"  # Bind to all interfaces
+  ports:
+    udp: 53053      # DNS UDP/TCP port
+    tls: 8853     # DoT/DoQ port  
+    https: 8443   # DoH/DoH3 port
+  
+  tls:
+    cert_file: "certs/fullchain.pem"  # Path to TLS certificate (leave empty for self-signed)
+    key_file: "certs/privkey.pem"   # Path to TLS key (leave empty for self-signed)
+
+  # EDNS0 Options Configuration
+  # Controls how ECS (EDNS Client Subnet) and MAC addresses are handled
+  # when forwarding queries to upstream servers
+  edns0:
+    ecs:
+      mode: "remove"
+
+    mac:
+      mode: "remove"
+  
+  timeout: "5s"  # Query timeout
+  insecure_upstream: false  # Allow insecure upstream TLS connections
+
+# Bootstrap DNS configuration
+bootstrap:
+  servers:
+    - "86.54.11.1:53"
+    - "86.54.11.201:53"
+    - "9.9.9.9:53"
+    - "149.112.112.112:53"
+    - "1.1.1.2:53"
+    - "1.0.0.2:53"
+  ip_version: "ipv4"  # Options: ipv4, ipv6, both
+
+# Cache configuration  
+cache:
+  enabled: true
+  size: 10000  # Maximum number of cached entries
+
+# Routing configuration
+routing:
+  default:
+    upstreams: public_secure
+    strategy: fastest
+
+  upstream_groups:
+    public_secure:
+        - h3://freedns.controld.com:443/p1
+        - https://protective.joindns4.eu:443/dns-query
+        - https://doh.cleanbrowsing.org:443/doh/security-filter/
+        - https://security.cloudflare-dns.com:443/dns-query
+        - https://dns.quad9.net:443/dns-query
+    
+    family_safe:
+        - h3://freedns.controld.com:443/family
+        - https://child-noads.joindns4.eu/dns-query
+        - https://doh.cleanbrowsing.org:443/doh/family-filter/
+        - https://family.cloudflare-dns.com:443/dns-query
+
+    local_server:
+        - udp://192.168.1.1:53
+
+  # Routing rules (evaluated top-to-bottom, first match wins)
+  routing_rules:
+    - name: "LOCAL"
+      match:
+        query_domain: ".home"
+      upstreams: local_server
+      strategy: fastest
+
+    - name: "KIDS"
+      match:
+        client_ip: "1.2.3.4"
+        client_cidr: "10.1.1.0/24"
+        client_mac: "11:22:33:44:55:66"
+      upstreams: family_safe
+      strategy: fastest
+
+
