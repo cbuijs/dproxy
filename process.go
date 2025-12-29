@@ -61,6 +61,21 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	msg := r.Copy()
 	addEDNS0Options(msg, ip, mac)
 
+        // Add detailed logging of what we're actually forwarding
+        if opt := msg.IsEdns0(); opt != nil {
+            var ednsInfo []string
+            for _, option := range opt.Option {
+                if ecs, ok := option.(*dns.EDNS0_SUBNET); ok {
+                    ednsInfo = append(ednsInfo, fmt.Sprintf("ECS=%s/%d", ecs.Address, ecs.SourceNetmask))
+                } else if local, ok := option.(*dns.EDNS0_LOCAL); ok && local.Code == EDNS0_OPTION_MAC {
+                    ednsInfo = append(ednsInfo, fmt.Sprintf("MAC65001=%s", net.HardwareAddr(local.Data)))
+                }
+            }
+            if len(ednsInfo) > 0 {
+                log.Printf("[UPSTREAM_EDNS0] QID:%d | Forwarding with: %s", r.Id, strings.Join(ednsInfo, ", "))
+            }
+        }
+
 	var qInfo, cacheKey, ecsSubnet string
 	if len(r.Question) > 0 {
 		q := r.Question[0]
