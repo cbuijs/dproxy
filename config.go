@@ -7,7 +7,6 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"net"
 	"os"
 	"strings"
@@ -35,6 +34,10 @@ type ServerConfig struct {
 		CertFile string `yaml:"cert_file"`
 		KeyFile  string `yaml:"key_file"`
 	} `yaml:"tls"`
+	
+	// New field for log level
+	LogLevel string `yaml:"log_level"`
+
 	DOH struct {
 		AllowedPaths []string `yaml:"allowed_paths"`
 		StrictPath   bool     `yaml:"strict_path"`
@@ -132,6 +135,11 @@ func LoadConfig(path string) error {
 	if cfg.Server.Ports.HTTPS == 0 {
 		cfg.Server.Ports.HTTPS = 443
 	}
+	
+	// Default Log Level
+	if cfg.Server.LogLevel == "" {
+		cfg.Server.LogLevel = "INFO"
+	}
 
 	// DoH Defaults
 	if len(cfg.Server.DOH.AllowedPaths) == 0 {
@@ -178,21 +186,21 @@ func LoadConfig(path string) error {
 		return fmt.Errorf("invalid edns0.ecs.ipv6_mask: %d (must be 0-128)", cfg.Server.EDNS0.ECS.IPv6Mask)
 	}
 
-	// Log EDNS0 configuration
-	log.Println("=== EDNS0 Configuration ===")
-	log.Printf("ECS Mode: %s", cfg.Server.EDNS0.ECS.Mode)
+	// Log EDNS0 configuration (Use LogInfo so it shows up at startup default level)
+	LogInfo("=== EDNS0 Configuration ===")
+	LogInfo("ECS Mode: %s", cfg.Server.EDNS0.ECS.Mode)
 	if cfg.Server.EDNS0.ECS.SourceMask > 0 {
-		log.Printf("ECS Source Mask (both): /%d", cfg.Server.EDNS0.ECS.SourceMask)
+		LogInfo("ECS Source Mask (both): /%d", cfg.Server.EDNS0.ECS.SourceMask)
 	}
 	if cfg.Server.EDNS0.ECS.IPv4Mask > 0 {
-		log.Printf("ECS IPv4 Mask: /%d", cfg.Server.EDNS0.ECS.IPv4Mask)
+		LogInfo("ECS IPv4 Mask: /%d", cfg.Server.EDNS0.ECS.IPv4Mask)
 	}
 	if cfg.Server.EDNS0.ECS.IPv6Mask > 0 {
-		log.Printf("ECS IPv6 Mask: /%d", cfg.Server.EDNS0.ECS.IPv6Mask)
+		LogInfo("ECS IPv6 Mask: /%d", cfg.Server.EDNS0.ECS.IPv6Mask)
 	}
-	log.Printf("MAC Mode: %s", cfg.Server.EDNS0.MAC.Mode)
-	log.Printf("MAC Source: %s", cfg.Server.EDNS0.MAC.Source)
-	log.Println("===========================")
+	LogInfo("MAC Mode: %s", cfg.Server.EDNS0.MAC.Mode)
+	LogInfo("MAC Source: %s", cfg.Server.EDNS0.MAC.Source)
+	LogInfo("===========================")
 
 	// Bootstrap Defaults
 	if len(cfg.Bootstrap.Servers) == 0 {
@@ -208,13 +216,15 @@ func LoadConfig(path string) error {
 		cfg.Bootstrap.IPVersion = "both"
 	}
 	bootstrapServers = cfg.Bootstrap.Servers
+	
+	LogInfo("Bootstrap Configuration: Servers=%v, IPVersion=%s", bootstrapServers, cfg.Bootstrap.IPVersion)
 
 	if cfg.Cache.Size == 0 {
 		cfg.Cache.Size = 10000
 	}
 
 	// Parse routing rules
-	log.Println("--- Loading Routing Rules ---")
+	LogInfo("--- Loading Routing Rules ---")
 	for i := range cfg.Routing.RoutingRules {
 		rule := &cfg.Routing.RoutingRules[i]
 
@@ -243,43 +253,43 @@ func LoadConfig(path string) error {
 			rule.Strategy = "failover"
 		}
 
-		// --- Detailed Logging of Loaded Rules ---
-		log.Printf("[RULE] Loaded '%s' (Strategy: %s)", rule.Name, rule.Strategy)
+		// --- Detailed Logging of Loaded Rules (Using LogInfo to ensure visibility at startup) ---
+		LogInfo("[RULE] Loaded '%s' (Strategy: %s)", rule.Name, rule.Strategy)
 		m := rule.Match
 		if m.ClientIP != "" {
-			log.Printf("   ├─ Match OR: Client IP = %s", m.ClientIP)
+			LogInfo("   ├─ Match OR: Client IP = %s", m.ClientIP)
 		}
 		if m.ClientCIDR != "" {
-			log.Printf("   ├─ Match OR: Client CIDR = %s", m.ClientCIDR)
+			LogInfo("   ├─ Match OR: Client CIDR = %s", m.ClientCIDR)
 		}
 		if m.ClientMAC != "" {
-			log.Printf("   ├─ Match OR: Client MAC = %s", m.ClientMAC)
+			LogInfo("   ├─ Match OR: Client MAC = %s", m.ClientMAC)
 		}
 		if m.ClientECS != "" {
-			log.Printf("   ├─ Match OR: Client ECS = %s", m.ClientECS)
+			LogInfo("   ├─ Match OR: Client ECS = %s", m.ClientECS)
 		}
 		if m.ClientEDNSMAC != "" {
-			log.Printf("   ├─ Match OR: Client EDNS0 MAC = %s", m.ClientEDNSMAC)
+			LogInfo("   ├─ Match OR: Client EDNS0 MAC = %s", m.ClientEDNSMAC)
 		}
 		if m.ServerIP != "" {
-			log.Printf("   ├─ Match OR: Server IP = %s", m.ServerIP)
+			LogInfo("   ├─ Match OR: Server IP = %s", m.ServerIP)
 		}
 		if m.ServerPort != 0 {
-			log.Printf("   ├─ Match OR: Server Port = %d", m.ServerPort)
+			LogInfo("   ├─ Match OR: Server Port = %d", m.ServerPort)
 		}
 		if m.ServerHostname != "" {
-			log.Printf("   ├─ Match OR: Hostname = %s", m.ServerHostname)
+			LogInfo("   ├─ Match OR: Hostname = %s", m.ServerHostname)
 		}
 		if m.ServerPath != "" {
-			log.Printf("   ├─ Match OR: Path = %s", m.ServerPath)
+			LogInfo("   ├─ Match OR: Path = %s", m.ServerPath)
 		}
 		if m.QueryDomain != "" {
-			log.Printf("   ├─ Match OR: Query Domain = %s", m.QueryDomain)
+			LogInfo("   ├─ Match OR: Query Domain = %s", m.QueryDomain)
 		}
 
-		log.Printf("   └─ Upstreams (%d):", len(rule.parsedUpstreams))
+		LogInfo("   └─ Upstreams (%d):", len(rule.parsedUpstreams))
 		for _, u := range rule.parsedUpstreams {
-			log.Printf("      - %s", u.String())
+			LogInfo("      - %s", u.String())
 		}
 	}
 
@@ -310,13 +320,13 @@ func LoadConfig(path string) error {
 	}
 
 	// --- Log Default Rule ---
-	log.Printf("[RULE] Loaded 'DEFAULT' (Strategy: %s)", cfg.Routing.DefaultRule.Strategy)
-	log.Printf("   ├─ Match: * (Catch-All)")
-	log.Printf("   └─ Upstreams (%d):", len(cfg.Routing.DefaultRule.parsedUpstreams))
+	LogInfo("[RULE] Loaded 'DEFAULT' (Strategy: %s)", cfg.Routing.DefaultRule.Strategy)
+	LogInfo("   ├─ Match: * (Catch-All)")
+	LogInfo("   └─ Upstreams (%d):", len(cfg.Routing.DefaultRule.parsedUpstreams))
 	for _, u := range cfg.Routing.DefaultRule.parsedUpstreams {
-		log.Printf("      - %s", u.String())
+		LogInfo("      - %s", u.String())
 	}
-	log.Println("-----------------------------")
+	LogInfo("-----------------------------")
 
 	config = &cfg
 	return nil

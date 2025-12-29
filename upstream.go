@@ -13,7 +13,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"math/rand/v2"
 	"net"
 	"net/http"
@@ -258,18 +257,18 @@ func parseUpstream(raw string, ipVersion string, insecure bool, timeout string) 
 	// Resolve hostname to IPs
 	if bootstrap != "" {
 		up.ResolvedIPs = []net.IP{net.ParseIP(bootstrap)}
-		log.Printf("Upstream %s using bootstrap IP: %s", up.String(), bootstrap)
+		LogDebug("Upstream %s using bootstrap IP: %s", up.String(), bootstrap)
 	} else if net.ParseIP(host) != nil {
 		up.ResolvedIPs = []net.IP{net.ParseIP(host)}
-		log.Printf("Upstream %s using direct IP: %s", up.String(), host)
+		LogDebug("Upstream %s using direct IP: %s", up.String(), host)
 	} else {
-		log.Printf("Resolving hostname %s using bootstrap servers...", host)
+		LogDebug("Resolving hostname %s using bootstrap servers...", host)
 		ips, err := resolveHostnameWithBootstrap(host, ipVersion)
 		if err != nil {
 			return nil, fmt.Errorf("failed to resolve upstream hostname %s: %w", host, err)
 		}
 		up.ResolvedIPs = ips
-		log.Printf("Upstream %s resolved to %d IPs: %v", up.String(), len(ips), ips)
+		LogDebug("Upstream %s resolved to %d IPs: %v", up.String(), len(ips), ips)
 	}
 
 	timeoutDuration := 5 * time.Second
@@ -323,7 +322,7 @@ func parseUpstream(raw string, ipVersion string, insecure bool, timeout string) 
 func resolveHostnameWithBootstrap(hostname string, preferredVersion string) ([]net.IP, error) {
 	// Check cache first
 	if cachedIPs, found := getBootstrapCache(hostname); found {
-		log.Printf("[BOOTSTRAP] Using cached resolution for %s: %v (age: %v)", 
+		LogDebug("[BOOTSTRAP] Using cached resolution for %s: %v (age: %v)", 
 			hostname, cachedIPs, time.Since(bootstrapCache[hostname].timestamp).Round(time.Second))
 		return cachedIPs, nil
 	}
@@ -339,10 +338,10 @@ func resolveHostnameWithBootstrap(hostname string, preferredVersion string) ([]n
 	useIPv4 := version == "ipv4" || version == "both"
 	useIPv6 := version == "ipv6" || version == "both"
 
-	log.Printf("[BOOTSTRAP] Resolving hostname: %s (IP version: %s)", hostname, version)
+	LogDebug("[BOOTSTRAP] Resolving hostname: %s (IP version: %s)", hostname, version)
 
 	for i, bootstrap := range bootstrapServers {
-		log.Printf("[BOOTSTRAP] Attempting resolution via bootstrap server [%d/%d]: %s", 
+		LogDebug("[BOOTSTRAP] Attempting resolution via bootstrap server [%d/%d]: %s", 
 			i+1, len(bootstrapServers), bootstrap)
 
 		c := &dns.Client{Net: "udp", Timeout: 3 * time.Second}
@@ -352,23 +351,23 @@ func resolveHostnameWithBootstrap(hostname string, preferredVersion string) ([]n
 			msg := getMsg()
 			msg.SetQuestion(dns.Fqdn(hostname), dns.TypeA)
 			
-			log.Printf("[BOOTSTRAP] Querying %s for %s (A record)", bootstrap, hostname)
+			LogDebug("[BOOTSTRAP] Querying %s for %s (A record)", bootstrap, hostname)
 			resp, rtt, err := c.Exchange(msg, bootstrap)
 			putMsg(msg) // Release request message
 			
 			if err == nil && resp != nil {
-				log.Printf("[BOOTSTRAP] Response from %s for %s: %d answers (RTT: %v)", 
+				LogDebug("[BOOTSTRAP] Response from %s for %s: %d answers (RTT: %v)", 
 					bootstrap, hostname, len(resp.Answer), rtt)
 				
 				for _, ans := range resp.Answer {
 					if a, ok := ans.(*dns.A); ok {
 						allIPs = append(allIPs, a.A)
-						log.Printf("[BOOTSTRAP]   Found A record: %s → %s", hostname, a.A.String())
+						LogDebug("[BOOTSTRAP]   Found A record: %s → %s", hostname, a.A.String())
 					}
 				}
 			} else {
 				lastErr = err
-				log.Printf("[BOOTSTRAP] Failed to resolve %s (A) via %s: %v", hostname, bootstrap, err)
+				LogDebug("[BOOTSTRAP] Failed to resolve %s (A) via %s: %v", hostname, bootstrap, err)
 			}
 		}
 
@@ -377,28 +376,28 @@ func resolveHostnameWithBootstrap(hostname string, preferredVersion string) ([]n
 			msg := getMsg()
 			msg.SetQuestion(dns.Fqdn(hostname), dns.TypeAAAA)
 			
-			log.Printf("[BOOTSTRAP] Querying %s for %s (AAAA record)", bootstrap, hostname)
+			LogDebug("[BOOTSTRAP] Querying %s for %s (AAAA record)", bootstrap, hostname)
 			resp, rtt, err := c.Exchange(msg, bootstrap)
 			putMsg(msg) // Release request message
 			
 			if err == nil && resp != nil {
-				log.Printf("[BOOTSTRAP] Response from %s for %s: %d answers (RTT: %v)", 
+				LogDebug("[BOOTSTRAP] Response from %s for %s: %d answers (RTT: %v)", 
 					bootstrap, hostname, len(resp.Answer), rtt)
 				
 				for _, ans := range resp.Answer {
 					if aaaa, ok := ans.(*dns.AAAA); ok {
 						allIPs = append(allIPs, aaaa.AAAA)
-						log.Printf("[BOOTSTRAP]   Found AAAA record: %s → %s", hostname, aaaa.AAAA.String())
+						LogDebug("[BOOTSTRAP]   Found AAAA record: %s → %s", hostname, aaaa.AAAA.String())
 					}
 				}
 			} else {
 				lastErr = err
-				log.Printf("[BOOTSTRAP] Failed to resolve %s (AAAA) via %s: %v", hostname, bootstrap, err)
+				LogDebug("[BOOTSTRAP] Failed to resolve %s (AAAA) via %s: %v", hostname, bootstrap, err)
 			}
 		}
 
 		if len(allIPs) > 0 {
-			log.Printf("[BOOTSTRAP] Successfully resolved %s to %d IP(s) using %s", 
+			LogDebug("[BOOTSTRAP] Successfully resolved %s to %d IP(s) using %s", 
 				hostname, len(allIPs), bootstrap)
 			break
 		}
@@ -406,16 +405,16 @@ func resolveHostnameWithBootstrap(hostname string, preferredVersion string) ([]n
 
 	if len(allIPs) == 0 {
 		if lastErr != nil {
-			log.Printf("[BOOTSTRAP] FAILED to resolve %s: %v", hostname, lastErr)
+			LogError("[BOOTSTRAP] FAILED to resolve %s: %v", hostname, lastErr)
 			return nil, fmt.Errorf("failed to resolve %s: %w", hostname, lastErr)
 		}
-		log.Printf("[BOOTSTRAP] FAILED to resolve %s: no IPs found", hostname)
+		LogError("[BOOTSTRAP] FAILED to resolve %s: no IPs found", hostname)
 		return nil, fmt.Errorf("no IPs found for %s", hostname)
 	}
 
 	// Cache the successful resolution
 	setBootstrapCache(hostname, allIPs)
-	log.Printf("[BOOTSTRAP] Resolution complete for %s: %v (cached for %v)", 
+	LogDebug("[BOOTSTRAP] Resolution complete for %s: %v (cached for %v)", 
 		hostname, allIPs, bootstrapCacheTTL)
 	
 	return allIPs, nil

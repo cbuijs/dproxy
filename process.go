@@ -10,7 +10,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"math/rand/v2"
 	"net"
 	"sort"
@@ -188,7 +187,7 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 			}
 		}
 		if len(ednsInfo) > 0 {
-			log.Printf("[UPSTREAM_EDNS0] QID:%d | Forwarding with: %s", r.Id, strings.Join(ednsInfo, ", "))
+			LogDebug("[UPSTREAM_EDNS0] QID:%d | Forwarding with: %s", r.Id, strings.Join(ednsInfo, ", "))
 		}
 	}
 
@@ -203,7 +202,7 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	})
 
 	if err != nil {
-		log.Printf("Error forwarding %s from %s: %v", qInfo, ip, err)
+		LogError("Error forwarding %s from %s: %v", qInfo, ip, err)
 		dns.HandleFailed(w, r)
 		return
 	}
@@ -261,7 +260,7 @@ func forwardToUpstreams(ctx context.Context, req *dns.Msg, upstreams []*Upstream
 	case "race":
 		return raceStrategy(ctx, req, upstreams)
 	default:
-		log.Printf("[STRATEGY] Unknown strategy '%s', using failover", strategy)
+		LogWarn("[STRATEGY] Unknown strategy '%s', using failover", strategy)
 		return failoverStrategy(ctx, req, upstreams)
 	}
 }
@@ -271,62 +270,64 @@ func roundRobinStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream
 	selected := int(idx) % len(upstreams)
 	u := upstreams[selected]
 	
-	log.Printf("[STRATEGY] Round-Robin: Selected #%d/%d: %s", selected+1, len(upstreams), u.String())
+	LogDebug("[STRATEGY] Round-Robin: Selected #%d/%d: %s", selected+1, len(upstreams), u.String())
 	
 	resp, rtt, err := u.executeExchange(ctx, req)
 	if err != nil {
-		log.Printf("[STRATEGY] Round-Robin: Failed with %s: %v, trying failover", u.String(), err)
+		LogDebug("[STRATEGY] Round-Robin: Failed with %s: %v, trying failover", u.String(), err)
 		for i := 1; i < len(upstreams); i++ {
 			nextIdx := (selected + i) % len(upstreams)
 			u = upstreams[nextIdx]
-			log.Printf("[STRATEGY] Round-Robin Failover: Trying #%d/%d: %s", nextIdx+1, len(upstreams), u.String())
+			LogDebug("[STRATEGY] Round-Robin Failover: Trying #%d/%d: %s", nextIdx+1, len(upstreams), u.String())
 			resp, rtt, err = u.executeExchange(ctx, req)
 			if err == nil {
-				log.Printf("[STRATEGY] Round-Robin Failover: Success with %s", u.String())
+				LogDebug("[STRATEGY] Round-Robin Failover: Success with %s (RTT: %v)", u.String(), rtt)
 				return resp, u.String(), rtt, nil
 			}
-			log.Printf("[STRATEGY] Round-Robin Failover: Failed with %s: %v", u.String(), err)
+			LogDebug("[STRATEGY] Round-Robin Failover: Failed with %s: %v", u.String(), err)
 		}
 		return nil, "", 0, fmt.Errorf("all upstreams failed in round-robin")
 	}
+	LogDebug("[STRATEGY] Round-Robin: Success with %s (RTT: %v)", u.String(), rtt)
 	return resp, u.String(), rtt, nil
 }
 
 func randomStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*dns.Msg, string, time.Duration, error) {
 	idx := rand.IntN(len(upstreams))
 	u := upstreams[idx]
-	log.Printf("[STRATEGY] Random: Selected #%d/%d: %s", idx+1, len(upstreams), u.String())
+	LogDebug("[STRATEGY] Random: Selected #%d/%d: %s", idx+1, len(upstreams), u.String())
 	resp, rtt, err := u.executeExchange(ctx, req)
 	if err != nil {
-		log.Printf("[STRATEGY] Random: Failed with %s: %v, trying others", u.String(), err)
+		LogDebug("[STRATEGY] Random: Failed with %s: %v, trying others", u.String(), err)
 		for i := 1; i < len(upstreams); i++ {
 			nextIdx := (idx + i) % len(upstreams)
 			u = upstreams[nextIdx]
-			log.Printf("[STRATEGY] Random Failover: Trying #%d/%d: %s", nextIdx+1, len(upstreams), u.String())
+			LogDebug("[STRATEGY] Random Failover: Trying #%d/%d: %s", nextIdx+1, len(upstreams), u.String())
 			resp, rtt, err = u.executeExchange(ctx, req)
 			if err == nil {
-				log.Printf("[STRATEGY] Random Failover: Success with %s", u.String())
+				LogDebug("[STRATEGY] Random Failover: Success with %s (RTT: %v)", u.String(), rtt)
 				return resp, u.String(), rtt, nil
 			}
-			log.Printf("[STRATEGY] Random Failover: Failed with %s: %v", u.String(), err)
+			LogDebug("[STRATEGY] Random Failover: Failed with %s: %v", u.String(), err)
 		}
 		return nil, "", 0, fmt.Errorf("all upstreams failed in random")
 	}
+	LogDebug("[STRATEGY] Random: Success with %s (RTT: %v)", u.String(), rtt)
 	return resp, u.String(), rtt, nil
 }
 
 func failoverStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*dns.Msg, string, time.Duration, error) {
-	log.Printf("[STRATEGY] Failover: Starting sequence with %d upstreams", len(upstreams))
+	LogDebug("[STRATEGY] Failover: Starting sequence with %d upstreams", len(upstreams))
 	for i, u := range upstreams {
-		log.Printf("[STRATEGY] Failover: Attempting #%d/%d: %s", i+1, len(upstreams), u.String())
+		LogDebug("[STRATEGY] Failover: Attempting #%d/%d: %s", i+1, len(upstreams), u.String())
 		resp, rtt, err := u.executeExchange(ctx, req)
 		if err == nil {
-			log.Printf("[STRATEGY] Failover: Success with %s (RTT: %v)", u.String(), rtt)
+			LogDebug("[STRATEGY] Failover: Success with %s (RTT: %v)", u.String(), rtt)
 			return resp, u.String(), rtt, nil
 		}
-		log.Printf("[STRATEGY] Failover: Failed %s: %v", u.String(), err)
+		LogDebug("[STRATEGY] Failover: Failed %s: %v", u.String(), err)
 	}
-	log.Printf("[STRATEGY] Failover: All %d upstreams failed", len(upstreams))
+	LogDebug("[STRATEGY] Failover: All %d upstreams failed", len(upstreams))
 	return nil, "", 0, errors.New("all upstreams failed in failover")
 }
 
@@ -434,21 +435,21 @@ func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (
 	var selectedUpstream *Upstream
 	if shouldExplore && explorationTarget != nil {
 		selectedUpstream = explorationTarget
-		log.Printf("[STRATEGY] Fastest: EXPLORING %s (reason: %s)", selectedUpstream.String(), explorationReason)
+		LogDebug("[STRATEGY] Fastest: EXPLORING %s (reason: %s)", selectedUpstream.String(), explorationReason)
 	} else {
 		selectedUpstream = best
-		log.Printf("[STRATEGY] Fastest: Selected %s (RTT: %v)", best.String(), time.Duration(bestRTT))
+		LogDebug("[STRATEGY] Fastest: Selected %s (RTT: %v)", best.String(), time.Duration(bestRTT))
 	}
 
 	resp, rtt, err := selectedUpstream.executeExchange(ctx, req)
 	if err != nil {
-		log.Printf("[STRATEGY] Fastest: Failed with %s: %v, trying alternatives", selectedUpstream.String(), err)
+		LogDebug("[STRATEGY] Fastest: Failed with %s: %v, trying alternatives", selectedUpstream.String(), err)
 		for _, s := range stats {
 			if s.upstream == selectedUpstream { continue }
 			u := s.upstream
 			resp, rtt, err = u.executeExchange(ctx, req)
 			if err == nil {
-				log.Printf("[STRATEGY] Fastest Failover: Success with %s (RTT: %v)", u.String(), rtt)
+				LogDebug("[STRATEGY] Fastest Failover: Success with %s (RTT: %v)", u.String(), rtt)
 				return resp, u.String(), rtt, nil
 			}
 		}
@@ -459,7 +460,7 @@ func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (
 }
 
 func raceStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*dns.Msg, string, time.Duration, error) {
-	log.Printf("[STRATEGY] Race: Starting race among %d upstreams", len(upstreams))
+	LogDebug("[STRATEGY] Race: Starting race among %d upstreams", len(upstreams))
 	type result struct {
 		msg  *dns.Msg
 		name string
@@ -472,6 +473,11 @@ func raceStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*dn
 	for _, u := range upstreams {
 		go func(upstream *Upstream) {
 			resp, rtt, err := upstream.executeExchange(ctx, req)
+			if err != nil {
+				LogDebug("[STRATEGY] Race: Upstream %s failed: %v", upstream.String(), err)
+			} else {
+				LogDebug("[STRATEGY] Race: Upstream %s responded in %v", upstream.String(), rtt)
+			}
 			select {
 			case resCh <- result{msg: resp, name: upstream.String(), rtt: rtt, err: err}:
 			case <-ctx.Done():
@@ -486,6 +492,7 @@ func raceStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*dn
 			if res.err == nil {
 				successCount++
 				if successCount == 1 {
+					LogDebug("[STRATEGY] Race: Winner is %s (RTT: %v)", res.name, res.rtt)
 					cancel()
 					return res.msg, res.name, res.rtt, nil
 				}
@@ -548,7 +555,7 @@ func logRequest(qid uint16, reqCtx *RequestContext, qInfo, upstreamQInfo, status
 	}
 	ingress := sb.String()
 
-	log.Printf("[QRY] QID:%d | Client:%s | MAC:%s | Proto:%s | Ingress:%s | Query:%s",
+	LogInfo("[QRY] QID:%d | Client:%s | MAC:%s | Proto:%s | Ingress:%s | Query:%s",
 		qid, reqCtx.ClientIP, macStr, reqCtx.Protocol, ingress, qInfo)
 
 	if upstream != "" && upstream != "CACHE" {
@@ -556,7 +563,7 @@ func logRequest(qid uint16, reqCtx *RequestContext, qInfo, upstreamQInfo, status
 		if upstreamQInfo != "" {
 			useInfo = upstreamQInfo
 		}
-		log.Printf("[FWD] QID:%d | Upstream:%s | RTT:%v | Query:%s | Response:%s", qid, upstream, upstreamRTT, useInfo, status)
+		LogInfo("[FWD] QID:%d | Upstream:%s | RTT:%v | Query:%s | Response:%s", qid, upstream, upstreamRTT, useInfo, status)
 	}
 
 	sb.Reset()
@@ -587,7 +594,7 @@ func logRequest(qid uint16, reqCtx *RequestContext, qInfo, upstreamQInfo, status
 	ansStr := sb.String()
 	if ansStr == "" { ansStr = "Empty" }
 
-	log.Printf("[RSP] QID:%d | Status:%s | TotalTime:%v | Answers:[%s]", qid, status, duration, ansStr)
+	LogInfo("[RSP] QID:%d | Status:%s | TotalTime:%v | Answers:[%s]", qid, status, duration, ansStr)
 }
 
 func extractEDNS0ClientInfo(msg *dns.Msg, reqCtx *RequestContext) {
@@ -610,11 +617,11 @@ func extractEDNS0ClientInfo(msg *dns.Msg, reqCtx *RequestContext) {
 				ipNet = &net.IPNet{IP: o.Address, Mask: maskBytes}
 			}
 			reqCtx.ClientECSNet = ipNet
-			log.Printf("[EDNS0] Extracted ECS: %s/%d (family: %d)", o.Address.String(), mask, family)
+			LogDebug("[EDNS0] Extracted ECS: %s/%d (family: %d)", o.Address.String(), mask, family)
 		case *dns.EDNS0_LOCAL:
 			if o.Code == EDNS0_OPTION_MAC && len(o.Data) > 0 {
 				reqCtx.ClientEDNSMAC = net.HardwareAddr(o.Data)
-				log.Printf("[EDNS0] Extracted MAC from Option 65001: %s", reqCtx.ClientEDNSMAC.String())
+				LogDebug("[EDNS0] Extracted MAC from Option 65001: %s", reqCtx.ClientEDNSMAC.String())
 			}
 		}
 	}
@@ -663,16 +670,16 @@ func addEDNS0Options(msg *dns.Msg, ip net.IP, mac net.HardwareAddr) {
 	ecsMode := config.Server.EDNS0.ECS.Mode
 	macMode := config.Server.EDNS0.MAC.Mode
 	macSource := config.Server.EDNS0.MAC.Source
-	log.Printf("[EDNS0] Processing options for upstream (ECS mode: %s, MAC mode: %s)", ecsMode, macMode)
-	log.Printf("[EDNS0] Client IP: %v, ARP MAC: %v", ip, mac)
+	LogDebug("[EDNS0] Processing options for upstream (ECS mode: %s, MAC mode: %s)", ecsMode, macMode)
+	LogDebug("[EDNS0] Client IP: %v, ARP MAC: %v", ip, mac)
 	for _, opt := range o.Option {
 		if ecs, ok := opt.(*dns.EDNS0_SUBNET); ok {
 			hasECS = true
-			log.Printf("[EDNS0] Found existing ECS from client: %s/%d (family: %d)", ecs.Address, ecs.SourceNetmask, ecs.Family)
+			LogDebug("[EDNS0] Found existing ECS from client: %s/%d (family: %d)", ecs.Address, ecs.SourceNetmask, ecs.Family)
 		} else if local, ok := opt.(*dns.EDNS0_LOCAL); ok && local.Code == EDNS0_OPTION_MAC {
 			hasMAC = true
 			existingMAC = net.HardwareAddr(local.Data)
-			log.Printf("[EDNS0] Found existing MAC from client: %s", existingMAC)
+			LogDebug("[EDNS0] Found existing MAC from client: %s", existingMAC)
 		}
 	}
 	for _, opt := range o.Option {
@@ -681,41 +688,41 @@ func addEDNS0Options(msg *dns.Msg, ip net.IP, mac net.HardwareAddr) {
 			switch ecsMode {
 			case "preserve":
 				opts = append(opts, opt)
-				log.Printf("[EDNS0] ECS: Preserving client's ECS: %s/%d", v.Address, v.SourceNetmask)
+				LogDebug("[EDNS0] ECS: Preserving client's ECS: %s/%d", v.Address, v.SourceNetmask)
 			case "add":
 				if !hasECS {
-					log.Printf("[EDNS0] ECS: Client has no ECS, will add client IP")
+					LogDebug("[EDNS0] ECS: Client has no ECS, will add client IP")
 				} else {
 					opts = append(opts, opt)
-					log.Printf("[EDNS0] ECS: Client already has ECS, preserving: %s/%d", v.Address, v.SourceNetmask)
+					LogDebug("[EDNS0] ECS: Client already has ECS, preserving: %s/%d", v.Address, v.SourceNetmask)
 				}
 			case "replace":
-				log.Printf("[EDNS0] ECS: Replacing client's ECS %s/%d with client IP", v.Address, v.SourceNetmask)
+				LogDebug("[EDNS0] ECS: Replacing client's ECS %s/%d with client IP", v.Address, v.SourceNetmask)
 			case "remove":
-				log.Printf("[EDNS0] ECS: Removing client's ECS: %s/%d", v.Address, v.SourceNetmask)
+				LogDebug("[EDNS0] ECS: Removing client's ECS: %s/%d", v.Address, v.SourceNetmask)
 			}
 		case *dns.EDNS0_LOCAL:
 			if v.Code == EDNS0_OPTION_MAC {
 				switch macMode {
 				case "preserve":
 					opts = append(opts, opt)
-					log.Printf("[EDNS0] MAC: Preserving client's MAC: %s", net.HardwareAddr(v.Data))
+					LogDebug("[EDNS0] MAC: Preserving client's MAC: %s", net.HardwareAddr(v.Data))
 				case "add":
 					if !hasMAC {
-						log.Printf("[EDNS0] MAC: Client has no MAC, will add from source")
+						LogDebug("[EDNS0] MAC: Client has no MAC, will add from source")
 					} else {
 						opts = append(opts, opt)
-						log.Printf("[EDNS0] MAC: Client already has MAC, preserving: %s", net.HardwareAddr(v.Data))
+						LogDebug("[EDNS0] MAC: Client already has MAC, preserving: %s", net.HardwareAddr(v.Data))
 					}
 				case "replace":
-					log.Printf("[EDNS0] MAC: Replacing client's MAC %s with source MAC", net.HardwareAddr(v.Data))
+					LogDebug("[EDNS0] MAC: Replacing client's MAC %s with source MAC", net.HardwareAddr(v.Data))
 				case "remove":
-					log.Printf("[EDNS0] MAC: Removing client's MAC: %s", net.HardwareAddr(v.Data))
+					LogDebug("[EDNS0] MAC: Removing client's MAC: %s", net.HardwareAddr(v.Data))
 				case "prefer-edns0":
 					opts = append(opts, opt)
-					log.Printf("[EDNS0] MAC: Preferring client's EDNS0 MAC: %s", net.HardwareAddr(v.Data))
+					LogDebug("[EDNS0] MAC: Preferring client's EDNS0 MAC: %s", net.HardwareAddr(v.Data))
 				case "prefer-arp":
-					log.Printf("[EDNS0] MAC: Preferring ARP MAC over client's EDNS0 MAC: %s", net.HardwareAddr(v.Data))
+					LogDebug("[EDNS0] MAC: Preferring ARP MAC over client's EDNS0 MAC: %s", net.HardwareAddr(v.Data))
 				}
 			} else {
 				opts = append(opts, opt)
@@ -743,23 +750,23 @@ func addEDNS0Options(msg *dns.Msg, ip net.IP, mac net.HardwareAddr) {
 		if isIPv6 {
 			if config.Server.EDNS0.ECS.IPv6Mask > 0 {
 				mask = uint8(config.Server.EDNS0.ECS.IPv6Mask)
-				log.Printf("[EDNS0] ECS: Using configured IPv6 mask: /%d", mask)
+				LogDebug("[EDNS0] ECS: Using configured IPv6 mask: /%d", mask)
 			} else if config.Server.EDNS0.ECS.SourceMask > 0 {
 				mask = uint8(config.Server.EDNS0.ECS.SourceMask)
-				log.Printf("[EDNS0] ECS: Using configured source mask for IPv6: /%d", mask)
+				LogDebug("[EDNS0] ECS: Using configured source mask for IPv6: /%d", mask)
 			} else {
-				log.Printf("[EDNS0] ECS: Using default IPv6 mask: /%d", mask)
+				LogDebug("[EDNS0] ECS: Using default IPv6 mask: /%d", mask)
 			}
 			if mask > 128 { mask = 128 }
 		} else {
 			if config.Server.EDNS0.ECS.IPv4Mask > 0 {
 				mask = uint8(config.Server.EDNS0.ECS.IPv4Mask)
-				log.Printf("[EDNS0] ECS: Using configured IPv4 mask: /%d", mask)
+				LogDebug("[EDNS0] ECS: Using configured IPv4 mask: /%d", mask)
 			} else if config.Server.EDNS0.ECS.SourceMask > 0 {
 				mask = uint8(config.Server.EDNS0.ECS.SourceMask)
-				log.Printf("[EDNS0] ECS: Using configured source mask for IPv4: /%d", mask)
+				LogDebug("[EDNS0] ECS: Using configured source mask for IPv4: /%d", mask)
 			} else {
-				log.Printf("[EDNS0] ECS: Using default IPv4 mask: /%d", mask)
+				LogDebug("[EDNS0] ECS: Using default IPv4 mask: /%d", mask)
 			}
 			if mask > 32 { mask = 32 }
 		}
@@ -769,61 +776,61 @@ func addEDNS0Options(msg *dns.Msg, ip net.IP, mac net.HardwareAddr) {
 			SourceNetmask: mask,
 			Address:       ip,
 		})
-		log.Printf("[EDNS0] ECS: Added to upstream: %s/%d (family: %d)", ip, mask, family)
+		LogDebug("[EDNS0] ECS: Added to upstream: %s/%d (family: %d)", ip, mask, family)
 	} else if !shouldAddECS && ip != nil {
-		log.Printf("[EDNS0] ECS: Not adding to upstream (mode: %s, hasECS: %v)", ecsMode, hasECS)
+		LogDebug("[EDNS0] ECS: Not adding to upstream (mode: %s, hasECS: %v)", ecsMode, hasECS)
 	}
 	shouldAddMAC := false
 	var macToAdd net.HardwareAddr
 	switch macMode {
 	case "preserve":
 		shouldAddMAC = false
-		log.Printf("[EDNS0] MAC: Preserve mode - not adding new MAC")
+		LogDebug("[EDNS0] MAC: Preserve mode - not adding new MAC")
 	case "add":
 		shouldAddMAC = !hasMAC
 		macToAdd = determineMAC(mac, existingMAC, macSource)
 		if shouldAddMAC {
-			log.Printf("[EDNS0] MAC: Add mode - will add MAC from source: %s", macSource)
+			LogDebug("[EDNS0] MAC: Add mode - will add MAC from source: %s", macSource)
 		} else {
-			log.Printf("[EDNS0] MAC: Add mode - client already has MAC, not adding")
+			LogDebug("[EDNS0] MAC: Add mode - client already has MAC, not adding")
 		}
 	case "replace":
 		shouldAddMAC = true
 		macToAdd = determineMAC(mac, existingMAC, macSource)
-		log.Printf("[EDNS0] MAC: Replace mode - will add MAC from source: %s", macSource)
+		LogDebug("[EDNS0] MAC: Replace mode - will add MAC from source: %s", macSource)
 	case "remove":
 		shouldAddMAC = false
-		log.Printf("[EDNS0] MAC: Remove mode - not adding MAC")
+		LogDebug("[EDNS0] MAC: Remove mode - not adding MAC")
 	case "prefer-edns0":
 		if hasMAC {
 			shouldAddMAC = false
-			log.Printf("[EDNS0] MAC: Prefer-EDNS0 mode - already kept client's MAC")
+			LogDebug("[EDNS0] MAC: Prefer-EDNS0 mode - already kept client's MAC")
 		} else if mac != nil && (macSource == "arp" || macSource == "both") {
 			shouldAddMAC = true
 			macToAdd = mac
-			log.Printf("[EDNS0] MAC: Prefer-EDNS0 mode - no client MAC, adding ARP MAC")
+			LogDebug("[EDNS0] MAC: Prefer-EDNS0 mode - no client MAC, adding ARP MAC")
 		} else {
-			log.Printf("[EDNS0] MAC: Prefer-EDNS0 mode - no MAC available")
+			LogDebug("[EDNS0] MAC: Prefer-EDNS0 mode - no MAC available")
 		}
 	case "prefer-arp":
 		if mac != nil && (macSource == "arp" || macSource == "both") {
 			shouldAddMAC = true
 			macToAdd = mac
-			log.Printf("[EDNS0] MAC: Prefer-ARP mode - using ARP MAC: %s", mac)
+			LogDebug("[EDNS0] MAC: Prefer-ARP mode - using ARP MAC: %s", mac)
 		} else if hasMAC && (macSource == "edns0" || macSource == "both") {
 			shouldAddMAC = true
 			macToAdd = existingMAC
-			log.Printf("[EDNS0] MAC: Prefer-ARP mode - no ARP MAC, using client's EDNS0 MAC")
+			LogDebug("[EDNS0] MAC: Prefer-ARP mode - no ARP MAC, using client's EDNS0 MAC")
 		} else {
-			log.Printf("[EDNS0] MAC: Prefer-ARP mode - no MAC available")
+			LogDebug("[EDNS0] MAC: Prefer-ARP mode - no MAC available")
 		}
 	}
 	if shouldAddMAC && macToAdd != nil {
 		opts = append(opts, &dns.EDNS0_LOCAL{Code: EDNS0_OPTION_MAC, Data: macToAdd})
-		log.Printf("[EDNS0] MAC: Added to upstream: %s", macToAdd)
+		LogDebug("[EDNS0] MAC: Added to upstream: %s", macToAdd)
 	}
 	o.Option = opts
-	log.Printf("[EDNS0] Final upstream EDNS0 options count: %d", len(opts))
+	LogDebug("[EDNS0] Final upstream EDNS0 options count: %d", len(opts))
 }
 
 func determineMAC(arpMAC, edns0MAC net.HardwareAddr, source string) net.HardwareAddr {

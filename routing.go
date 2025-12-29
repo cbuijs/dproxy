@@ -45,7 +45,7 @@ func SelectUpstreams(ctx *RequestContext) ([]*Upstream, string, string) {
 	for _, rule := range config.Routing.RoutingRules {
 		matched, reason := matchRule(&rule.Match, ctx)
 		if matched {
-			log.Printf("[ROUTING] HIT Rule: '%s' | Trigger: %s | Client: %s",
+			LogDebug("[ROUTING] HIT Rule: '%s' | Trigger: %s | Client: %s",
 				rule.Name, reason, ctx.ClientIP)
 			return rule.parsedUpstreams, rule.Strategy, rule.Name
 		}

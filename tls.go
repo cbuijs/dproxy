@@ -13,7 +13,6 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
-	"log"
 	"math/big"
 	"net"
 	"os"
@@ -30,7 +29,7 @@ func getTLSConfig(certPath, keyPath, listenIP string) (*tls.Config, error) {
 			return nil, fmt.Errorf("failed to load certificates: %w", err)
 		}
 	} else {
-		log.Println("Generating self-signed certificate...")
+		LogInfo("Generating self-signed certificate...")
 		cert, err = generateSelfSignedCert(listenIP)
 		if err != nil {
 			return nil, fmt.Errorf("failed to generate certificate: %w", err)

@@ -32,6 +32,10 @@ server:
   tls:
     cert_file: ""  # Path to your .crt or .pem file
     key_file: ""   # Path to your .key file
+
+  # Log Level: DEBUG, INFO, WARN, ERROR
+  # Default: INFO
+  log_level: "INFO"
   
   # DoH (DNS over HTTPS) Configuration
   doh:

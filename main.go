@@ -107,6 +107,9 @@ Usage: %s -config <config.yaml>
 	if err := LoadConfig(*configFile); err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
+	
+	// Apply Log Level from Config
+	SetLogLevel(config.Server.LogLevel)
 
 	// Initialize shutdown context
 	shutdownContext, shutdownCancel = context.WithCancel(context.Background())
@@ -130,23 +133,23 @@ Usage: %s -config <config.yaml>
 
 	// Wait for shutdown signal
 	sig := <-sigChan
-	log.Printf("Received signal: %v - initiating graceful shutdown...", sig)
+	LogInfo("Received signal: %v - initiating graceful shutdown...", sig)
 
 	// Trigger graceful shutdown
 	gracefulShutdown(servers)
 
 	// Wait for all servers to stop
 	serverWg.Wait()
-	log.Println("All servers stopped")
+	LogInfo("All servers stopped")
 
 	// Cancel background tasks
 	shutdownCancel()
 
 	// Wait for background tasks to finish
 	shutdownWg.Wait()
-	log.Println("All background tasks stopped")
+	LogInfo("All background tasks stopped")
 
-	log.Println("Shutdown complete")
+	LogInfo("Shutdown complete")
 }
 
 // startBackgroundTasks starts all background maintenance routines
@@ -167,20 +170,20 @@ func startBackgroundTasks() {
 
 	// DNS cache maintenance
 	if config.Cache.Enabled {
-		log.Println("Caching: Enabled")
+		LogInfo("Caching: Enabled")
 		shutdownWg.Add(1)
 		go func() {
 			defer shutdownWg.Done()
 			maintainDNSCache(shutdownContext)
 		}()
 	} else {
-		log.Println("Caching: Disabled")
+		LogInfo("Caching: Disabled")
 	}
 }
 
 // gracefulShutdown performs graceful shutdown of all servers
 func gracefulShutdown(servers []ServerShutdowner) {
-	log.Println("Stopping all listeners...")
+	LogInfo("Stopping all listeners...")
 
 	// Create a context with timeout for shutdown
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -195,9 +198,9 @@ func gracefulShutdown(servers []ServerShutdowner) {
 			go func(index int, server ServerShutdowner) {
 				defer wg.Done()
 				if err := server.Shutdown(ctx); err != nil {
-					log.Printf("Error shutting down server %d: %v", index, err)
+					LogError("Error shutting down server %d: %v", index, err)
 				} else {
-					log.Printf("Server %d shut down successfully", index)
+					LogInfo("Server %d shut down successfully", index)
 				}
 			}(i, srv)
 		}
@@ -212,9 +215,9 @@ func gracefulShutdown(servers []ServerShutdowner) {
 
 	select {
 	case <-done:
-		log.Println("All servers shut down gracefully")
+		LogInfo("All servers shut down gracefully")
 	case <-ctx.Done():
-		log.Println("Shutdown timeout reached - forcing exit")
+		LogInfo("Shutdown timeout reached - forcing exit")
 	}
 }
 

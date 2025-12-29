@@ -12,7 +12,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"sync"
@@ -99,9 +98,9 @@ func startServers(wg *sync.WaitGroup, tlsConfig *tls.Config) []ServerShutdowner 
 	})
 	go func() {
 		defer wg.Done()
-		log.Printf("Starting DNS UDP on %s:%d", listenAddr, udpPort)
+		LogInfo("Starting DNS UDP on %s:%d", listenAddr, udpPort)
 		if err := udpServer.ListenAndServe(); err != nil {
-			log.Printf("UDP server stopped: %v", err)
+			LogError("UDP server stopped: %v", err)
 		}
 	}()
 	servers = append(servers, &DNSServerWrapper{udpServer})
@@ -121,9 +120,9 @@ func startServers(wg *sync.WaitGroup, tlsConfig *tls.Config) []ServerShutdowner 
 	})
 	go func() {
 		defer wg.Done()
-		log.Printf("Starting DNS TCP on %s:%d", listenAddr, udpPort)
+		LogInfo("Starting DNS TCP on %s:%d", listenAddr, udpPort)
 		if err := tcpServer.ListenAndServe(); err != nil {
-			log.Printf("TCP server stopped: %v", err)
+			LogError("TCP server stopped: %v", err)
 		}
 	}()
 	servers = append(servers, &DNSServerWrapper{tcpServer})
@@ -146,9 +145,9 @@ func startServers(wg *sync.WaitGroup, tlsConfig *tls.Config) []ServerShutdowner 
 	})
 	go func() {
 		defer wg.Done()
-		log.Printf("Starting DoT on %s:%d", listenAddr, tlsPort)
+		LogInfo("Starting DoT on %s:%d", listenAddr, tlsPort)
 		if err := dotServer.ListenAndServe(); err != nil {
-			log.Printf("DoT server stopped: %v", err)
+			LogError("DoT server stopped: %v", err)
 		}
 	}()
 	servers = append(servers, &DNSServerWrapper{dotServer})
@@ -164,10 +163,10 @@ func startServers(wg *sync.WaitGroup, tlsConfig *tls.Config) []ServerShutdowner 
 		defer close(doqDone)
 		
 		addr := fmt.Sprintf("%s:%d", listenAddr, tlsPort)
-		log.Printf("Starting DoQ on %s", addr)
+		LogInfo("Starting DoQ on %s", addr)
 		listener, err := quic.ListenAddr(addr, tlsConfig, nil)
 		if err != nil {
-			log.Printf("DoQ listen error: %v", err)
+			LogError("DoQ listen error: %v", err)
 			return
 		}
 		doqWrapper.listener = listener
@@ -175,7 +174,7 @@ func startServers(wg *sync.WaitGroup, tlsConfig *tls.Config) []ServerShutdowner 
 		for {
 			select {
 			case <-doqCtx.Done():
-				log.Println("DoQ server stopped")
+				LogInfo("DoQ server stopped")
 				return
 			default:
 				sess, err := listener.Accept(doqCtx)
@@ -184,7 +183,7 @@ func startServers(wg *sync.WaitGroup, tlsConfig *tls.Config) []ServerShutdowner 
 					case <-doqCtx.Done():
 						return
 					default:
-						log.Printf("DoQ accept error: %v", err)
+						LogError("DoQ accept error: %v", err)
 						continue
 					}
 				}
@@ -206,18 +205,18 @@ func startServers(wg *sync.WaitGroup, tlsConfig *tls.Config) []ServerShutdowner 
 
 	go func() {
 		defer wg.Done()
-		log.Printf("Starting DoH/DoH3 on %s", addr)
+		LogInfo("Starting DoH/DoH3 on %s", addr)
 		
 		// Start HTTP/3 in a goroutine
 		go func() {
 			if err := h3Server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				log.Printf("DoH3 server stopped: %v", err)
+				LogError("DoH3 server stopped: %v", err)
 			}
 		}()
 		
 		// Start HTTP/1.1 & HTTP/2
 		if err := h1Server.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
-			log.Printf("DoH server stopped: %v", err)
+			LogError("DoH server stopped: %v", err)
 		}
 	}()
 	servers = append(servers, &HTTPServerWrapper{h1Server})
