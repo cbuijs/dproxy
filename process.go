@@ -58,23 +58,7 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 
 	extractEDNS0ClientInfo(r, reqCtx)
 
-	msg := r.Copy()
-	addEDNS0Options(msg, ip, mac)
-
-        // Add detailed logging of what we're actually forwarding
-        if opt := msg.IsEdns0(); opt != nil {
-            var ednsInfo []string
-            for _, option := range opt.Option {
-                if ecs, ok := option.(*dns.EDNS0_SUBNET); ok {
-                    ednsInfo = append(ednsInfo, fmt.Sprintf("ECS=%s/%d", ecs.Address, ecs.SourceNetmask))
-                } else if local, ok := option.(*dns.EDNS0_LOCAL); ok && local.Code == EDNS0_OPTION_MAC {
-                    ednsInfo = append(ednsInfo, fmt.Sprintf("MAC65001=%s", net.HardwareAddr(local.Data)))
-                }
-            }
-            if len(ednsInfo) > 0 {
-                log.Printf("[UPSTREAM_EDNS0] QID:%d | Forwarding with: %s", r.Id, strings.Join(ednsInfo, ", "))
-            }
-        }
+	// OPTIMIZATION: Message copying and EDNS0 modification logic moved below cache check
 
 	var qInfo, cacheKey, ecsSubnet string
 	if len(r.Question) > 0 {
@@ -128,11 +112,37 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	if config.Cache.Enabled && cacheKey != "" {
 		if cachedResp := getFromCache(cacheKey, r.Id); cachedResp != nil {
 			cleanResponse(cachedResp)
-			logRequest(r.Id, reqCtx, qInfo, "CACHE_HIT", "CACHE", 0, time.Since(start), cachedResp)
+			// Pass empty upstreamQInfo for cache hits
+			logRequest(r.Id, reqCtx, qInfo, "", "CACHE_HIT", "CACHE", 0, time.Since(start), cachedResp)
 			w.WriteMsg(cachedResp)
-			return
+			return // Return early on cache hit, saving CPU/allocations
 		}
 	}
+
+	// --- HEAVY LIFTING START ---
+	// Operations below this line are expensive and only needed if going upstream.
+	
+	msg := r.Copy() // Deep copy only needed for upstream modification
+	addEDNS0Options(msg, ip, mac)
+	
+	// Capture the ACTUAL upstream query info (after modifications) for the [FWD] log
+	upstreamQInfo := buildUpstreamInfo(msg)
+
+	// Add detailed logging of what we're actually forwarding
+	if opt := msg.IsEdns0(); opt != nil {
+		var ednsInfo []string
+		for _, option := range opt.Option {
+			if ecs, ok := option.(*dns.EDNS0_SUBNET); ok {
+				ednsInfo = append(ednsInfo, fmt.Sprintf("ECS=%s/%d", ecs.Address, ecs.SourceNetmask))
+			} else if local, ok := option.(*dns.EDNS0_LOCAL); ok && local.Code == EDNS0_OPTION_MAC {
+				ednsInfo = append(ednsInfo, fmt.Sprintf("MAC65001=%s", net.HardwareAddr(local.Data)))
+			}
+		}
+		if len(ednsInfo) > 0 {
+			log.Printf("[UPSTREAM_EDNS0] QID:%d | Forwarding with: %s", r.Id, strings.Join(ednsInfo, ", "))
+		}
+	}
+	// --- HEAVY LIFTING END ---
 
 	// Use singleflight to coalesce identical requests
 	result, err, shared := requestGroup.Do(cacheKey, func() (interface{}, error) {
@@ -171,7 +181,8 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		status = fmt.Sprintf("%s (COALESCED)", status)
 	}
 
-	logRequest(r.Id, reqCtx, qInfo, status, qr.upstreamStr, qr.rtt, time.Since(start), resp)
+	// Pass the specific upstreamQInfo to log what was actually forwarded
+	logRequest(r.Id, reqCtx, qInfo, upstreamQInfo, status, qr.upstreamStr, qr.rtt, time.Since(start), resp)
 
 	resp.Id = r.Id
 	w.WriteMsg(resp)
@@ -628,7 +639,8 @@ func cleanResponse(msg *dns.Msg) {
 	}
 }
 
-func logRequest(qid uint16, reqCtx *RequestContext, qInfo, status, upstream string, upstreamRTT, duration time.Duration, resp *dns.Msg) {
+// logRequest now takes an optional upstreamQInfo argument to support [FWD] logging of the actual upstream query
+func logRequest(qid uint16, reqCtx *RequestContext, qInfo, upstreamQInfo, status, upstream string, upstreamRTT, duration time.Duration, resp *dns.Msg) {
 	macStr := "N/A"
 	if reqCtx.ClientMAC != nil {
 		macStr = reqCtx.ClientMAC.String()
@@ -642,11 +654,17 @@ func logRequest(qid uint16, reqCtx *RequestContext, qInfo, status, upstream stri
 		ingress += fmt.Sprintf(" | Path:%s", reqCtx.ServerPath)
 	}
 
+	// [QRY] logs always use the client's view (qInfo)
 	log.Printf("[QRY] QID:%d | Client:%s | MAC:%s | Proto:%s | Ingress:%s | Query:%s",
 		qid, reqCtx.ClientIP, macStr, reqCtx.Protocol, ingress, qInfo)
 
 	if upstream != "" && upstream != "CACHE" {
-		log.Printf("[FWD] QID:%d | Upstream:%s | RTT:%v | Query:%s | Response:%s", qid, upstream, upstreamRTT, qInfo, status)
+		// [FWD] logs prefer upstreamQInfo if available, otherwise fallback to qInfo
+		useInfo := qInfo
+		if upstreamQInfo != "" {
+			useInfo = upstreamQInfo
+		}
+		log.Printf("[FWD] QID:%d | Upstream:%s | RTT:%v | Query:%s | Response:%s", qid, upstream, upstreamRTT, useInfo, status)
 	}
 
 	var answers []string
@@ -715,6 +733,34 @@ func extractEDNS0ClientInfo(msg *dns.Msg, reqCtx *RequestContext) {
 			}
 		}
 	}
+}
+
+// buildUpstreamInfo constructs a query info string from the modified message options
+func buildUpstreamInfo(msg *dns.Msg) string {
+	if len(msg.Question) == 0 {
+		return ""
+	}
+	q := msg.Question[0]
+	info := fmt.Sprintf("%s (%s)", q.Name, dns.TypeToString[q.Qtype])
+
+	opt := msg.IsEdns0()
+	if opt != nil {
+		var extra []string
+		for _, o := range opt.Option {
+			switch v := o.(type) {
+			case *dns.EDNS0_SUBNET:
+				extra = append(extra, fmt.Sprintf("ECS:%s/%d", v.Address.String(), v.SourceNetmask))
+			case *dns.EDNS0_LOCAL:
+				if v.Code == EDNS0_OPTION_MAC {
+					extra = append(extra, fmt.Sprintf("MAC65001:%s", net.HardwareAddr(v.Data).String()))
+				}
+			}
+		}
+		if len(extra) > 0 {
+			info += fmt.Sprintf(" [%s]", strings.Join(extra, " "))
+		}
+	}
+	return info
 }
 
 func addEDNS0Options(msg *dns.Msg, ip net.IP, mac net.HardwareAddr) {
