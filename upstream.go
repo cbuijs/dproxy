@@ -348,11 +348,13 @@ func resolveHostnameWithBootstrap(hostname string, preferredVersion string) ([]n
 		c := &dns.Client{Net: "udp", Timeout: 3 * time.Second}
 
 		if useIPv4 {
-			msg := new(dns.Msg)
+			// OPTIMIZATION: Use message pool
+			msg := getMsg()
 			msg.SetQuestion(dns.Fqdn(hostname), dns.TypeA)
 			
 			log.Printf("[BOOTSTRAP] Querying %s for %s (A record)", bootstrap, hostname)
 			resp, rtt, err := c.Exchange(msg, bootstrap)
+			putMsg(msg) // Release request message
 			
 			if err == nil && resp != nil {
 				log.Printf("[BOOTSTRAP] Response from %s for %s: %d answers (RTT: %v)", 
@@ -371,11 +373,13 @@ func resolveHostnameWithBootstrap(hostname string, preferredVersion string) ([]n
 		}
 
 		if useIPv6 {
-			msg := new(dns.Msg)
+			// OPTIMIZATION: Use message pool
+			msg := getMsg()
 			msg.SetQuestion(dns.Fqdn(hostname), dns.TypeAAAA)
 			
 			log.Printf("[BOOTSTRAP] Querying %s for %s (AAAA record)", bootstrap, hostname)
 			resp, rtt, err := c.Exchange(msg, bootstrap)
+			putMsg(msg) // Release request message
 			
 			if err == nil && resp != nil {
 				log.Printf("[BOOTSTRAP] Response from %s for %s: %d answers (RTT: %v)", 
@@ -542,8 +546,15 @@ func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetAddr str
 		return nil, err
 	}
 
-	resp := new(dns.Msg)
+	// OPTIMIZATION: Use message pool for the response
+	// The caller (doExchange -> executeExchange) passes this back up.
+	// We CANNOT putMsg() here. It will be collected eventually by GC 
+	// or we'd need a complex lifecycle management since it flows up to process.go
+	// However, we save the allocation of new(dns.Msg) which is still a win.
+	resp := getMsg()
+	
 	if err := resp.Unpack(respBuf); err != nil {
+		putMsg(resp) // Error case: can return immediately
 		return nil, err
 	}
 	return resp, nil
@@ -594,8 +605,10 @@ func (u *Upstream) exchangeDoH(ctx context.Context, req *dns.Msg) (*dns.Msg, err
 		return nil, err
 	}
 
-	resp := new(dns.Msg)
+	// OPTIMIZATION: Use message pool for the response
+	resp := getMsg()
 	if err := resp.Unpack(respBody); err != nil {
+		putMsg(resp)
 		return nil, err
 	}
 	return resp, nil

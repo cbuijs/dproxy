@@ -258,7 +258,25 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	var msg *dns.Msg
+	// OPTIMIZATION: Use message pool
+	msg := getMsg()
+	// IMPORTANT: We must NOT return this message to the pool inside this function,
+	// because processDNSRequest passes it to Singleflight or Cache, and it might be 
+	// referenced asynchronously. 
+	// Ideally, we would putMsg() when we are sure it's done, but because of 
+	// singleflight and async logging, ownership is complex. 
+	// For now, let's allow it to be collected normally if it escapes, 
+	// OR ensure processDNSRequest copies it if it needs to keep it.
+	// 
+	// However, looking at process.go:
+	// - It extracts info (safe)
+	// - If cache hit -> returns cached resp (safe, msg unused)
+	// - If cache miss -> msg.Copy() is called for upstream.
+	// So `msg` is effectively read-only in processDNSRequest and not stored.
+	// Thus, we CAN return it to the pool after processDNSRequest returns.
+	
+	defer putMsg(msg)
+
 	var err error
 
 	proto := "DoH"
@@ -273,7 +291,6 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		data, _ := io.ReadAll(r.Body)
-		msg = new(dns.Msg)
 		err = msg.Unpack(data)
 	case http.MethodGet:
 		b64str := r.URL.Query().Get("dns")
@@ -286,7 +303,6 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Invalid base64", http.StatusBadRequest)
 			return
 		}
-		msg = new(dns.Msg)
 		err = msg.Unpack(data)
 	default:
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -342,7 +358,11 @@ func handleDoQSession(sess quic.Connection) {
 			if _, err := io.ReadFull(str, buf); err != nil {
 				return
 			}
-			msg := new(dns.Msg)
+			
+			// OPTIMIZATION: Use message pool
+			msg := getMsg()
+			defer putMsg(msg)
+			
 			if err := msg.Unpack(buf); err != nil {
 				return
 			}

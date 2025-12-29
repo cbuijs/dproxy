@@ -35,10 +35,11 @@ func resolveUpstreams(upstreams interface{}, groups map[string][]string) ([]stri
 	}
 }
 
-func SelectUpstreams(ctx *RequestContext) ([]*Upstream, string) {
+// SelectUpstreams returns the upstreams, strategy, and the RULE NAME for caching
+func SelectUpstreams(ctx *RequestContext) ([]*Upstream, string, string) {
 	if config == nil || config.Routing.RoutingRules == nil {
 		log.Fatal("Config not loaded - this should never happen")
-		return nil, ""
+		return nil, "", ""
 	}
 
 	for _, rule := range config.Routing.RoutingRules {
@@ -46,11 +47,11 @@ func SelectUpstreams(ctx *RequestContext) ([]*Upstream, string) {
 		if matched {
 			log.Printf("[ROUTING] HIT Rule: '%s' | Trigger: %s | Client: %s",
 				rule.Name, reason, ctx.ClientIP)
-			return rule.parsedUpstreams, rule.Strategy
+			return rule.parsedUpstreams, rule.Strategy, rule.Name
 		}
 	}
 
-	return config.Routing.DefaultRule.parsedUpstreams, config.Routing.DefaultRule.Strategy
+	return config.Routing.DefaultRule.parsedUpstreams, config.Routing.DefaultRule.Strategy, "DEFAULT"
 }
 
 func matchRule(m *MatchConditions, ctx *RequestContext) (bool, string) {

@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/miekg/dns"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -26,6 +27,37 @@ var bufPool = sync.Pool{
 	New: func() any {
 		return make([]byte, 4096)
 	},
+}
+
+// OPTIMIZATION: Message pool to reduce GC pressure
+var msgPool = sync.Pool{
+	New: func() any {
+		return new(dns.Msg)
+	},
+}
+
+// Helper to get a clean message
+func getMsg() *dns.Msg {
+	m := msgPool.Get().(*dns.Msg)
+	// Completely reset the message to reuse the struct
+	// We preserve the underlying slice capacity to reduce future allocations
+	m.MsgHdr = dns.MsgHdr{}
+	m.Compress = false
+	m.Question = m.Question[:0]
+	m.Answer = m.Answer[:0]
+	m.Ns = m.Ns[:0]
+	m.Extra = m.Extra[:0]
+	return m
+}
+
+// Helper to free a message
+func putMsg(m *dns.Msg) {
+	if m == nil {
+		return
+	}
+	// Clear potential references to help GC before pooling
+	// Note: We don't nil the slices, just reset length in getMsg
+	msgPool.Put(m)
 }
 
 // Global configuration instance

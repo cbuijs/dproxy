@@ -14,7 +14,9 @@ import (
 	"math/rand/v2"
 	"net"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/miekg/dns"
@@ -36,6 +38,28 @@ type RequestContext struct {
 	Protocol       string
 }
 
+// Reset clears the RequestContext for reuse in sync.Pool
+func (rc *RequestContext) Reset() {
+	rc.ClientIP = nil
+	rc.ClientMAC = nil
+	rc.ClientECS = nil
+	rc.ClientECSNet = nil
+	rc.ClientEDNSMAC = nil
+	rc.ServerIP = nil
+	rc.ServerPort = 0
+	rc.ServerHostname = ""
+	rc.ServerPath = ""
+	rc.QueryName = ""
+	rc.Protocol = ""
+}
+
+// Pool to reduce GC pressure for high-frequency request objects
+var reqCtxPool = sync.Pool{
+	New: func() any {
+		return &RequestContext{}
+	},
+}
+
 // --- Result type for singleflight ---
 
 type queryResult struct {
@@ -46,8 +70,20 @@ type queryResult struct {
 
 // --- Core Processing ---
 
-func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, reqCtx *RequestContext) {
+func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, reqCtxFromHandler *RequestContext) {
 	start := time.Now()
+
+	// Reuse RequestContext
+	reqCtx := reqCtxPool.Get().(*RequestContext)
+	reqCtx.Reset()
+	defer reqCtxPool.Put(reqCtx)
+
+	// Copy basic data
+	reqCtx.ServerIP = reqCtxFromHandler.ServerIP
+	reqCtx.ServerPort = reqCtxFromHandler.ServerPort
+	reqCtx.Protocol = reqCtxFromHandler.Protocol
+	reqCtx.ServerHostname = reqCtxFromHandler.ServerHostname
+	reqCtx.ServerPath = reqCtxFromHandler.ServerPath
 
 	remoteAddr := w.RemoteAddr()
 	ip := getIPFromAddr(remoteAddr)
@@ -58,77 +94,90 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 
 	extractEDNS0ClientInfo(r, reqCtx)
 
-	// OPTIMIZATION: Message copying and EDNS0 modification logic moved below cache check
+	// Build qInfo for logging (Optimized Builder)
+	var qInfo, cacheKey string
+	var sb strings.Builder
 
-	var qInfo, cacheKey, ecsSubnet string
 	if len(r.Question) > 0 {
 		q := r.Question[0]
 		reqCtx.QueryName = strings.TrimSuffix(strings.ToLower(q.Name), ".")
-		qInfo = fmt.Sprintf("%s (%s)", q.Name, dns.TypeToString[q.Qtype])
+		
+		sb.Grow(len(q.Name) + 10)
+		sb.WriteString(q.Name)
+		sb.WriteString(" (")
+		sb.WriteString(dns.TypeToString[q.Qtype])
+		sb.WriteString(")")
+		qInfo = sb.String()
+		sb.Reset()
 	}
 
-	if reqCtx.ClientECS != nil {
-		if reqCtx.ClientECSNet != nil {
-			mask, _ := reqCtx.ClientECSNet.Mask.Size()
-			ecsSubnet = fmt.Sprintf("%s/%d", reqCtx.ClientECS.String(), mask)
-		} else {
-			ecsSubnet = reqCtx.ClientECS.String()
-		}
-	}
-
+	// Append EDNS0 info to qInfo
 	if opt := r.IsEdns0(); opt != nil {
-		var extra []string
+		sb.WriteString(qInfo)
+		firstExtra := true
 		if reqCtx.ClientECS != nil {
-			extra = append(extra, fmt.Sprintf("ECS:%s", ecsSubnet))
+			sb.WriteString(" [ECS:")
+			if reqCtx.ClientECSNet != nil {
+				mask, _ := reqCtx.ClientECSNet.Mask.Size()
+				sb.WriteString(reqCtx.ClientECS.String())
+				sb.WriteString("/")
+				sb.WriteString(strconv.Itoa(mask))
+			} else {
+				sb.WriteString(reqCtx.ClientECS.String())
+			}
+			sb.WriteString("]")
+			firstExtra = false
 		}
 		if reqCtx.ClientEDNSMAC != nil {
-			extra = append(extra, fmt.Sprintf("MAC65001:%s", reqCtx.ClientEDNSMAC.String()))
+			if !firstExtra { sb.WriteString(" ") } else { sb.WriteString(" [") }
+			sb.WriteString("MAC65001:")
+			sb.WriteString(reqCtx.ClientEDNSMAC.String())
+			if firstExtra { sb.WriteString("]") }
 		}
-		if len(extra) > 0 {
-			qInfo += fmt.Sprintf(" [%s]", strings.Join(extra, " "))
-		}
+		if sb.Len() > len(qInfo) { qInfo = sb.String() }
+		sb.Reset()
 	}
+
+	// Determine Upstreams and RULE NAME
+	selectedUpstreams, selectedStrategy, ruleName := SelectUpstreams(reqCtx)
 
 	if len(r.Question) > 0 {
 		q := r.Question[0]
 
-		effectiveIP := reqCtx.ClientIP
-		if reqCtx.ClientECS != nil {
-			effectiveIP = reqCtx.ClientECS
-		}
+		// CRITICAL SIMPLIFICATION:
+		// The cache partition is strictly the Rule Name.
+		// All clients hitting the same rule share the same cache.
+		routingKey := ruleName
 
-		effectiveMAC := reqCtx.ClientMAC
-		if reqCtx.ClientEDNSMAC != nil {
-			effectiveMAC = reqCtx.ClientEDNSMAC
-		}
-
-		routingKey := fmt.Sprintf("%s:%d:%s:%s:%s:%s",
-			reqCtx.ServerIP, reqCtx.ServerPort, reqCtx.ServerHostname, reqCtx.ServerPath,
-			effectiveIP, effectiveMAC)
-		cacheKey = fmt.Sprintf("%s|%d|%d|%s", q.Name, q.Qtype, q.Qclass, routingKey)
+		// Build Cache Key
+		sb.Reset()
+		sb.WriteString(q.Name)
+		sb.WriteString("|")
+		sb.WriteString(strconv.Itoa(int(q.Qtype)))
+		sb.WriteString("|")
+		sb.WriteString(strconv.Itoa(int(q.Qclass)))
+		sb.WriteString("|")
+		sb.WriteString(routingKey)
+		cacheKey = sb.String()
 	}
 
-	// Check cache before singleflight
+	// Check cache
 	if config.Cache.Enabled && cacheKey != "" {
 		if cachedResp := getFromCache(cacheKey, r.Id); cachedResp != nil {
-			cleanResponse(cachedResp)
-			// Pass empty upstreamQInfo for cache hits
-			logRequest(r.Id, reqCtx, qInfo, "", "CACHE_HIT", "CACHE", 0, time.Since(start), cachedResp)
+			// LOGGING UPDATE: Include Rule Name in cache hit status
+			status := fmt.Sprintf("CACHE_HIT (%s)", ruleName)
+			logRequest(r.Id, reqCtx, qInfo, "", status, "CACHE", 0, time.Since(start), cachedResp)
 			w.WriteMsg(cachedResp)
-			return // Return early on cache hit, saving CPU/allocations
+			return 
 		}
 	}
 
-	// --- HEAVY LIFTING START ---
-	// Operations below this line are expensive and only needed if going upstream.
-	
-	msg := r.Copy() // Deep copy only needed for upstream modification
+	// --- UPSTREAM PROCESSING ---
+	msg := r.Copy()
 	addEDNS0Options(msg, ip, mac)
-	
-	// Capture the ACTUAL upstream query info (after modifications) for the [FWD] log
 	upstreamQInfo := buildUpstreamInfo(msg)
 
-	// Add detailed logging of what we're actually forwarding
+	// Logging
 	if opt := msg.IsEdns0(); opt != nil {
 		var ednsInfo []string
 		for _, option := range opt.Option {
@@ -142,11 +191,11 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 			log.Printf("[UPSTREAM_EDNS0] QID:%d | Forwarding with: %s", r.Id, strings.Join(ednsInfo, ", "))
 		}
 	}
-	// --- HEAVY LIFTING END ---
 
-	// Use singleflight to coalesce identical requests
+	// Singleflight
 	result, err, shared := requestGroup.Do(cacheKey, func() (interface{}, error) {
-		resp, upstreamStr, rtt, err := forwardToUpstreamsWithContext(ctx, msg, reqCtx)
+		// Pass selected upstreams/strategy to avoid re-calculating
+		resp, upstreamStr, rtt, err := forwardToUpstreams(ctx, msg, selectedUpstreams, selectedStrategy)
 		if err != nil {
 			return nil, err
 		}
@@ -162,7 +211,6 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	qr := result.(queryResult)
 	resp := qr.msg
 
-	// If this was a shared result, make a copy to avoid race conditions
 	if shared && resp != nil {
 		resp = resp.Copy()
 	}
@@ -171,7 +219,6 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		cleanResponse(resp)
 	}
 
-	// Add to cache
 	if config.Cache.Enabled && resp != nil {
 		addToCache(cacheKey, resp)
 	}
@@ -181,7 +228,6 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		status = fmt.Sprintf("%s (COALESCED)", status)
 	}
 
-	// Pass the specific upstreamQInfo to log what was actually forwarded
 	logRequest(r.Id, reqCtx, qInfo, upstreamQInfo, status, qr.upstreamStr, qr.rtt, time.Since(start), resp)
 
 	resp.Id = r.Id
@@ -189,11 +235,6 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 }
 
 // --- Strategies ---
-
-func forwardToUpstreamsWithContext(ctx context.Context, req *dns.Msg, reqCtx *RequestContext) (*dns.Msg, string, time.Duration, error) {
-	selectedUpstreams, selectedStrategy := SelectUpstreams(reqCtx)
-	return forwardToUpstreams(ctx, req, selectedUpstreams, selectedStrategy)
-}
 
 func forwardToUpstreams(ctx context.Context, req *dns.Msg, upstreams []*Upstream, strategy string) (*dns.Msg, string, time.Duration, error) {
 	if len(upstreams) == 0 {
@@ -211,19 +252,14 @@ func forwardToUpstreams(ctx context.Context, req *dns.Msg, upstreams []*Upstream
 	switch strat {
 	case "round-robin":
 		return roundRobinStrategy(ctx, req, upstreams)
-
 	case "random":
 		return randomStrategy(ctx, req, upstreams)
-
 	case "failover":
 		return failoverStrategy(ctx, req, upstreams)
-
 	case "fastest":
 		return fastestStrategy(ctx, req, upstreams)
-
 	case "race":
 		return raceStrategy(ctx, req, upstreams)
-
 	default:
 		log.Printf("[STRATEGY] Unknown strategy '%s', using failover", strategy)
 		return failoverStrategy(ctx, req, upstreams)
@@ -240,7 +276,6 @@ func roundRobinStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream
 	resp, rtt, err := u.executeExchange(ctx, req)
 	if err != nil {
 		log.Printf("[STRATEGY] Round-Robin: Failed with %s: %v, trying failover", u.String(), err)
-		// Fallback to next upstream
 		for i := 1; i < len(upstreams); i++ {
 			nextIdx := (selected + i) % len(upstreams)
 			u = upstreams[nextIdx]
@@ -254,21 +289,16 @@ func roundRobinStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream
 		}
 		return nil, "", 0, fmt.Errorf("all upstreams failed in round-robin")
 	}
-	
-	log.Printf("[STRATEGY] Round-Robin: Success with %s (RTT: %v)", u.String(), rtt)
 	return resp, u.String(), rtt, nil
 }
 
 func randomStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*dns.Msg, string, time.Duration, error) {
 	idx := rand.IntN(len(upstreams))
 	u := upstreams[idx]
-	
 	log.Printf("[STRATEGY] Random: Selected #%d/%d: %s", idx+1, len(upstreams), u.String())
-	
 	resp, rtt, err := u.executeExchange(ctx, req)
 	if err != nil {
 		log.Printf("[STRATEGY] Random: Failed with %s: %v, trying others", u.String(), err)
-		// Try remaining upstreams in random order
 		for i := 1; i < len(upstreams); i++ {
 			nextIdx := (idx + i) % len(upstreams)
 			u = upstreams[nextIdx]
@@ -282,43 +312,33 @@ func randomStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*
 		}
 		return nil, "", 0, fmt.Errorf("all upstreams failed in random")
 	}
-	
-	log.Printf("[STRATEGY] Random: Success with %s (RTT: %v)", u.String(), rtt)
 	return resp, u.String(), rtt, nil
 }
 
 func failoverStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*dns.Msg, string, time.Duration, error) {
 	log.Printf("[STRATEGY] Failover: Starting sequence with %d upstreams", len(upstreams))
-	
 	for i, u := range upstreams {
 		log.Printf("[STRATEGY] Failover: Attempting #%d/%d: %s", i+1, len(upstreams), u.String())
-		
 		resp, rtt, err := u.executeExchange(ctx, req)
 		if err == nil {
 			log.Printf("[STRATEGY] Failover: Success with %s (RTT: %v)", u.String(), rtt)
 			return resp, u.String(), rtt, nil
 		}
-		
 		log.Printf("[STRATEGY] Failover: Failed %s: %v", u.String(), err)
 	}
-	
 	log.Printf("[STRATEGY] Failover: All %d upstreams failed", len(upstreams))
 	return nil, "", 0, errors.New("all upstreams failed in failover")
 }
 
 func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*dns.Msg, string, time.Duration, error) {
-	// Smart exploration strategy to prevent lock-in
-	// Parameters can be tuned based on your needs
 	const (
-		explorationRate    = 0.15  // 15% of requests explore alternatives
-		staleThreshold     = 30 * time.Second // Consider RTT data stale after this time
-		minProbeInterval   = 10 * time.Second // Minimum time between probes per upstream
-		rttDifferenceRatio = 0.8   // Explore if another upstream is within 80% of best RTT
+		explorationRate    = 0.15
+		staleThreshold     = 30 * time.Second
+		minProbeInterval   = 10 * time.Second
+		rttDifferenceRatio = 0.8
 	)
 
 	now := time.Now()
-	
-	// Build stats with freshness information
 	type upstreamStat struct {
 		upstream     *Upstream
 		rtt          int64
@@ -331,72 +351,44 @@ func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (
 	for i, u := range upstreams {
 		rtt := u.getRTT()
 		lastProbe := u.getLastProbeTime()
-		isStale := rtt > 0 && now.Sub(lastProbe) > staleThreshold
-		
 		stats[i] = upstreamStat{
 			upstream:   u,
 			rtt:        rtt,
 			lastProbed: lastProbe,
-			isStale:    isStale,
+			isStale:    rtt > 0 && now.Sub(lastProbe) > staleThreshold,
 			index:      i,
 		}
 	}
 
-	// Sort by RTT (0 values last, stale data deprioritized)
 	sort.Slice(stats, func(i, j int) bool {
 		rttI, rttJ := stats[i].rtt, stats[j].rtt
 		staleI, staleJ := stats[i].isStale, stats[j].isStale
-		
-		// Prioritize fresh data over stale data
-		if staleI != staleJ {
-			return !staleI // Non-stale comes first
-		}
-		
-		// Both have no RTT data - keep original order
-		if rttI == 0 && rttJ == 0 {
-			return stats[i].index < stats[j].index
-		}
-		
-		// i has no data, j has data - j is better
-		if rttI == 0 {
-			return false
-		}
-		
-		// i has data, j has no data - i is better
-		if rttJ == 0 {
-			return true
-		}
-		
-		// Both have data - lower RTT wins
+		if staleI != staleJ { return !staleI }
+		if rttI == 0 && rttJ == 0 { return stats[i].index < stats[j].index }
+		if rttI == 0 { return false }
+		if rttJ == 0 { return true }
 		return rttI < rttJ
 	})
 
 	best := stats[0].upstream
 	bestRTT := stats[0].rtt
-	
-	// Exploration logic - prevent lock-in
 	shouldExplore := false
 	var explorationTarget *Upstream
 	var explorationReason string
 	
-	// Reason 1: Random exploration (epsilon-greedy approach)
 	if rand.Float64() < explorationRate {
-		// Pick a random upstream that hasn't been probed recently
 		candidates := make([]*Upstream, 0)
-		for _, s := range stats[1:] { // Skip the best one
+		for _, s := range stats[1:] {
 			if now.Sub(s.lastProbed) > minProbeInterval {
 				candidates = append(candidates, s.upstream)
 			}
 		}
-		
 		if len(candidates) > 0 {
 			explorationTarget = candidates[rand.IntN(len(candidates))]
 			shouldExplore = true
-			explorationReason = "random exploration (epsilon-greedy)"
+			explorationReason = "random exploration"
 		}
 	}
-	
-	// Reason 2: Check for upstreams without RTT data
 	if !shouldExplore {
 		for _, s := range stats {
 			if s.rtt == 0 && now.Sub(s.lastProbed) > minProbeInterval {
@@ -407,143 +399,60 @@ func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (
 			}
 		}
 	}
-	
-	// Reason 3: Stale data needs refresh
 	if !shouldExplore && stats[0].isStale {
 		explorationTarget = best
 		shouldExplore = true
 		explorationReason = "RTT data is stale"
 	}
-	
-	// Reason 4: Competitive upstream (within 20% of best RTT)
 	if !shouldExplore && bestRTT > 0 && len(stats) > 1 {
 		for _, s := range stats[1:] {
 			if s.rtt > 0 && now.Sub(s.lastProbed) > minProbeInterval {
-				// Check if this upstream is competitive (within 20% difference)
 				if float64(s.rtt) <= float64(bestRTT)/rttDifferenceRatio {
 					explorationTarget = s.upstream
 					shouldExplore = true
-					explorationReason = fmt.Sprintf("competitive RTT (%v vs best %v)", 
-						time.Duration(s.rtt), time.Duration(bestRTT))
+					explorationReason = fmt.Sprintf("competitive RTT (%v vs best %v)", time.Duration(s.rtt), time.Duration(bestRTT))
 					break
 				}
 			}
 		}
 	}
 	
-	// Reason 5: Background probing of all upstreams periodically
 	for _, s := range stats {
 		if now.Sub(s.lastProbed) > 3*staleThreshold {
-			// This upstream hasn't been checked in a very long time
-			// Launch async probe with a real, commonly-resolved domain
 			go func(u *Upstream) {
 				probeMsg := new(dns.Msg)
-				// Use well-known, highly-available domains from major tech companies
-				// These are guaranteed to resolve and are globally cached
-				probeDomains := []string{
-					"google.com.",      // Google - most queried domain globally
-					"googleapis.com.",  // Google APIs - heavily used by apps
-					"apple.com.",       // Apple - global presence
-					"microsoft.com.",   // Microsoft - enterprise standard
-					"facebook.com.",    // Meta - social media giant
-				}
-				probeDomain := probeDomains[rand.IntN(len(probeDomains))]
-				probeMsg.SetQuestion(probeDomain, dns.TypeA)
+				probeDomains := []string{"google.com.", "apple.com.", "microsoft.com."}
+				probeMsg.SetQuestion(probeDomains[rand.IntN(len(probeDomains))], dns.TypeA)
 				probeMsg.RecursionDesired = true
-				
 				probeCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 				defer cancel()
-				
-				_, rtt, err := u.executeExchange(probeCtx, probeMsg)
-				if err == nil {
-					log.Printf("[STRATEGY] Fastest: Background probe of %s completed (domain: %s, RTT: %v)", 
-						u.String(), probeDomain, rtt)
-				} else {
-					log.Printf("[STRATEGY] Fastest: Background probe of %s failed (domain: %s): %v", 
-						u.String(), probeDomain, err)
-				}
+				u.executeExchange(probeCtx, probeMsg)
 			}(s.upstream)
 		}
 	}
 	
-	// Decide which upstream to use
 	var selectedUpstream *Upstream
 	if shouldExplore && explorationTarget != nil {
 		selectedUpstream = explorationTarget
-		log.Printf("[STRATEGY] Fastest: EXPLORING %s (reason: %s)", 
-			selectedUpstream.String(), explorationReason)
+		log.Printf("[STRATEGY] Fastest: EXPLORING %s (reason: %s)", selectedUpstream.String(), explorationReason)
 	} else {
 		selectedUpstream = best
-		if bestRTT == 0 {
-			log.Printf("[STRATEGY] Fastest: Selected %s (no RTT data yet)", best.String())
-		} else if stats[0].isStale {
-			log.Printf("[STRATEGY] Fastest: Selected %s (RTT: %v - STALE)", 
-				best.String(), time.Duration(bestRTT))
-		} else {
-			log.Printf("[STRATEGY] Fastest: Selected %s (RTT: %v)", 
-				best.String(), time.Duration(bestRTT))
-		}
+		log.Printf("[STRATEGY] Fastest: Selected %s (RTT: %v)", best.String(), time.Duration(bestRTT))
 	}
 
-	// Execute query
 	resp, rtt, err := selectedUpstream.executeExchange(ctx, req)
-	
 	if err != nil {
-		log.Printf("[STRATEGY] Fastest: Failed with %s: %v, trying alternatives", 
-			selectedUpstream.String(), err)
-		
-		// Try remaining upstreams in order of speed
+		log.Printf("[STRATEGY] Fastest: Failed with %s: %v, trying alternatives", selectedUpstream.String(), err)
 		for _, s := range stats {
-			if s.upstream == selectedUpstream {
-				continue // Skip the one we just tried
-			}
-			
+			if s.upstream == selectedUpstream { continue }
 			u := s.upstream
-			currentRTT := s.rtt
-			
-			if currentRTT == 0 {
-				log.Printf("[STRATEGY] Fastest Failover: Trying %s (no RTT data)", u.String())
-			} else {
-				log.Printf("[STRATEGY] Fastest Failover: Trying %s (RTT: %v)", 
-					u.String(), time.Duration(currentRTT))
-			}
-			
 			resp, rtt, err = u.executeExchange(ctx, req)
 			if err == nil {
-				// Check response code
-				if resp.Rcode != dns.RcodeSuccess {
-					log.Printf("[STRATEGY] Fastest Failover: Non-success response from %s (RCODE: %s, RTT: %v - not used for RTT stats)", 
-						u.String(), dns.RcodeToString[resp.Rcode], rtt)
-				} else {
-					log.Printf("[STRATEGY] Fastest Failover: Success with %s (RTT: %v)", 
-						u.String(), rtt)
-				}
+				log.Printf("[STRATEGY] Fastest Failover: Success with %s (RTT: %v)", u.String(), rtt)
 				return resp, u.String(), rtt, nil
 			}
-			
-			log.Printf("[STRATEGY] Fastest Failover: Failed with %s: %v", u.String(), err)
 		}
-		
 		return nil, "", 0, fmt.Errorf("all upstreams failed in fastest strategy")
-	}
-
-	// Check if exploration resulted in non-success response
-	rcodeStr := dns.RcodeToString[resp.Rcode]
-	if resp.Rcode != dns.RcodeSuccess {
-		if shouldExplore {
-			log.Printf("[STRATEGY] Fastest: Exploration completed with %s (RCODE: %s, RTT: %v - not used for RTT stats)", 
-				selectedUpstream.String(), rcodeStr, rtt)
-		} else {
-			log.Printf("[STRATEGY] Fastest: Non-success response from %s (RCODE: %s, RTT: %v - not used for RTT stats)", 
-				selectedUpstream.String(), rcodeStr, rtt)
-		}
-	} else {
-		if shouldExplore {
-			log.Printf("[STRATEGY] Fastest: Exploration successful with %s (RTT: %v)", 
-				selectedUpstream.String(), rtt)
-		} else {
-			log.Printf("[STRATEGY] Fastest: Success with %s (RTT: %v)", selectedUpstream.String(), rtt)
-		}
 	}
 	
 	return resp, selectedUpstream.String(), rtt, nil
@@ -551,69 +460,45 @@ func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (
 
 func raceStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*dns.Msg, string, time.Duration, error) {
 	log.Printf("[STRATEGY] Race: Starting race among %d upstreams", len(upstreams))
-
 	type result struct {
 		msg  *dns.Msg
 		name string
 		rtt  time.Duration
 		err  error
 	}
-
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-
 	resCh := make(chan result, len(upstreams))
-
-	// Launch all queries in parallel
 	for _, u := range upstreams {
 		go func(upstream *Upstream) {
-			log.Printf("[STRATEGY] Race: Querying %s", upstream.String())
 			resp, rtt, err := upstream.executeExchange(ctx, req)
-			
 			select {
 			case resCh <- result{msg: resp, name: upstream.String(), rtt: rtt, err: err}:
 			case <-ctx.Done():
 			}
 		}(u)
 	}
-
 	var lastErr error
 	successCount := 0
-	failCount := 0
-	
-	// Wait for first success or all failures
 	for i := 0; i < len(upstreams); i++ {
 		select {
 		case res := <-resCh:
 			if res.err == nil {
 				successCount++
-				log.Printf("[STRATEGY] Race: Winner #%d: %s (RTT: %v)", successCount, res.name, res.rtt)
-				
-				// First success wins
 				if successCount == 1 {
-					// Cancel other pending requests
 					cancel()
-					
-					log.Printf("[STRATEGY] Race: Completed - %s won", res.name)
 					return res.msg, res.name, res.rtt, nil
 				}
 			} else {
-				failCount++
 				lastErr = res.err
-				log.Printf("[STRATEGY] Race: Failed %s: %v", res.name, res.err)
 			}
-			
 		case <-ctx.Done():
 			return nil, "", 0, ctx.Err()
 		}
 	}
-
-	// All failed
 	if lastErr != nil {
-		log.Printf("[STRATEGY] Race: All %d upstreams failed", len(upstreams))
 		return nil, "", 0, fmt.Errorf("all upstreams failed in race: %w", lastErr)
 	}
-	
 	return nil, "", 0, errors.New("all upstreams failed in race")
 }
 
@@ -625,41 +510,48 @@ func cleanResponse(msg *dns.Msg) {
 	}
 	msg.Ns = nil
 	msg.Extra = nil
-	if len(msg.Answer) > 0 {
-		newAnswer := make([]dns.RR, 0, len(msg.Answer))
-		for _, rr := range msg.Answer {
-			switch rr.Header().Rrtype {
-			case dns.TypeRRSIG, dns.TypeNSEC, dns.TypeNSEC3, dns.TypeNSEC3PARAM, dns.TypeDS, dns.TypeDNSKEY, dns.TypeDLV:
-				continue
-			default:
-				newAnswer = append(newAnswer, rr)
+	if len(msg.Answer) == 0 {
+		return
+	}
+	n := 0
+	for _, rr := range msg.Answer {
+		switch rr.Header().Rrtype {
+		case dns.TypeRRSIG, dns.TypeNSEC, dns.TypeNSEC3, dns.TypeNSEC3PARAM, dns.TypeDS, dns.TypeDNSKEY, dns.TypeDLV:
+			continue
+		default:
+			if n != -1 {
+				msg.Answer[n] = rr
+				n++
 			}
 		}
-		msg.Answer = newAnswer
 	}
+	msg.Answer = msg.Answer[:n]
 }
 
-// logRequest now takes an optional upstreamQInfo argument to support [FWD] logging of the actual upstream query
 func logRequest(qid uint16, reqCtx *RequestContext, qInfo, upstreamQInfo, status, upstream string, upstreamRTT, duration time.Duration, resp *dns.Msg) {
 	macStr := "N/A"
 	if reqCtx.ClientMAC != nil {
 		macStr = reqCtx.ClientMAC.String()
 	}
 
-	ingress := fmt.Sprintf("%s:%d", reqCtx.ServerIP, reqCtx.ServerPort)
+	var sb strings.Builder
+	sb.WriteString(reqCtx.ServerIP.String())
+	sb.WriteString(":")
+	sb.WriteString(strconv.Itoa(reqCtx.ServerPort))
 	if reqCtx.ServerHostname != "" {
-		ingress += fmt.Sprintf(" | Host:%s", reqCtx.ServerHostname)
+		sb.WriteString(" | Host:")
+		sb.WriteString(reqCtx.ServerHostname)
 	}
 	if reqCtx.ServerPath != "" {
-		ingress += fmt.Sprintf(" | Path:%s", reqCtx.ServerPath)
+		sb.WriteString(" | Path:")
+		sb.WriteString(reqCtx.ServerPath)
 	}
+	ingress := sb.String()
 
-	// [QRY] logs always use the client's view (qInfo)
 	log.Printf("[QRY] QID:%d | Client:%s | MAC:%s | Proto:%s | Ingress:%s | Query:%s",
 		qid, reqCtx.ClientIP, macStr, reqCtx.Protocol, ingress, qInfo)
 
 	if upstream != "" && upstream != "CACHE" {
-		// [FWD] logs prefer upstreamQInfo if available, otherwise fallback to qInfo
 		useInfo := qInfo
 		if upstreamQInfo != "" {
 			useInfo = upstreamQInfo
@@ -667,8 +559,9 @@ func logRequest(qid uint16, reqCtx *RequestContext, qInfo, upstreamQInfo, status
 		log.Printf("[FWD] QID:%d | Upstream:%s | RTT:%v | Query:%s | Response:%s", qid, upstream, upstreamRTT, useInfo, status)
 	}
 
-	var answers []string
+	sb.Reset()
 	if resp != nil {
+		first := true
 		addRRs := func(rrs []dns.RR) {
 			for _, rr := range rrs {
 				if _, ok := rr.(*dns.OPT); ok {
@@ -676,11 +569,13 @@ func logRequest(qid uint16, reqCtx *RequestContext, qInfo, upstreamQInfo, status
 				}
 				parts := strings.Fields(rr.String())
 				if len(parts) >= 4 {
-					s := parts[3]
+					if !first { sb.WriteString(", ") }
+					sb.WriteString(parts[3])
 					if len(parts) > 4 {
-						s += " " + strings.Join(parts[4:], " ")
+						sb.WriteString(" ")
+						sb.WriteString(strings.Join(parts[4:], " "))
 					}
-					answers = append(answers, s)
+					first = false
 				}
 			}
 		}
@@ -689,20 +584,15 @@ func logRequest(qid uint16, reqCtx *RequestContext, qInfo, upstreamQInfo, status
 		addRRs(resp.Extra)
 	}
 
-	ansStr := strings.Join(answers, ", ")
-	if ansStr == "" {
-		ansStr = "Empty"
-	}
+	ansStr := sb.String()
+	if ansStr == "" { ansStr = "Empty" }
 
 	log.Printf("[RSP] QID:%d | Status:%s | TotalTime:%v | Answers:[%s]", qid, status, duration, ansStr)
 }
 
 func extractEDNS0ClientInfo(msg *dns.Msg, reqCtx *RequestContext) {
 	opt := msg.IsEdns0()
-	if opt == nil {
-		return
-	}
-
+	if opt == nil { return }
 	for _, option := range opt.Option {
 		switch o := option.(type) {
 		case *dns.EDNS0_SUBNET:
@@ -711,21 +601,16 @@ func extractEDNS0ClientInfo(msg *dns.Msg, reqCtx *RequestContext) {
 			mask := o.SourceNetmask
 			var ipNet *net.IPNet
 			if family == 1 {
-				if mask > 32 {
-					mask = 32
-				}
+				if mask > 32 { mask = 32 }
 				maskBytes := net.CIDRMask(int(mask), 32)
 				ipNet = &net.IPNet{IP: o.Address, Mask: maskBytes}
 			} else if family == 2 {
-				if mask > 128 {
-					mask = 128
-				}
+				if mask > 128 { mask = 128 }
 				maskBytes := net.CIDRMask(int(mask), 128)
 				ipNet = &net.IPNet{IP: o.Address, Mask: maskBytes}
 			}
 			reqCtx.ClientECSNet = ipNet
 			log.Printf("[EDNS0] Extracted ECS: %s/%d (family: %d)", o.Address.String(), mask, family)
-
 		case *dns.EDNS0_LOCAL:
 			if o.Code == EDNS0_OPTION_MAC && len(o.Data) > 0 {
 				reqCtx.ClientEDNSMAC = net.HardwareAddr(o.Data)
@@ -735,14 +620,14 @@ func extractEDNS0ClientInfo(msg *dns.Msg, reqCtx *RequestContext) {
 	}
 }
 
-// buildUpstreamInfo constructs a query info string from the modified message options
 func buildUpstreamInfo(msg *dns.Msg) string {
-	if len(msg.Question) == 0 {
-		return ""
-	}
+	if len(msg.Question) == 0 { return "" }
 	q := msg.Question[0]
-	info := fmt.Sprintf("%s (%s)", q.Name, dns.TypeToString[q.Qtype])
-
+	var sb strings.Builder
+	sb.WriteString(q.Name)
+	sb.WriteString(" (")
+	sb.WriteString(dns.TypeToString[q.Qtype])
+	sb.WriteString(")")
 	opt := msg.IsEdns0()
 	if opt != nil {
 		var extra []string
@@ -757,10 +642,12 @@ func buildUpstreamInfo(msg *dns.Msg) string {
 			}
 		}
 		if len(extra) > 0 {
-			info += fmt.Sprintf(" [%s]", strings.Join(extra, " "))
+			sb.WriteString(" [")
+			sb.WriteString(strings.Join(extra, " "))
+			sb.WriteString("]")
 		}
 	}
-	return info
+	return sb.String()
 }
 
 func addEDNS0Options(msg *dns.Msg, ip net.IP, mac net.HardwareAddr) {
@@ -769,121 +656,91 @@ func addEDNS0Options(msg *dns.Msg, ip net.IP, mac net.HardwareAddr) {
 		msg.SetEdns0(4096, true)
 		o = msg.IsEdns0()
 	}
-
 	var opts []dns.EDNS0
 	var hasECS bool
 	var hasMAC bool
 	var existingMAC net.HardwareAddr
-
 	ecsMode := config.Server.EDNS0.ECS.Mode
 	macMode := config.Server.EDNS0.MAC.Mode
 	macSource := config.Server.EDNS0.MAC.Source
-
 	log.Printf("[EDNS0] Processing options for upstream (ECS mode: %s, MAC mode: %s)", ecsMode, macMode)
 	log.Printf("[EDNS0] Client IP: %v, ARP MAC: %v", ip, mac)
-
-	// First pass: identify existing options
 	for _, opt := range o.Option {
 		if ecs, ok := opt.(*dns.EDNS0_SUBNET); ok {
 			hasECS = true
-			log.Printf("[EDNS0] Found existing ECS from client: %s/%d (family: %d)", 
-				ecs.Address, ecs.SourceNetmask, ecs.Family)
+			log.Printf("[EDNS0] Found existing ECS from client: %s/%d (family: %d)", ecs.Address, ecs.SourceNetmask, ecs.Family)
 		} else if local, ok := opt.(*dns.EDNS0_LOCAL); ok && local.Code == EDNS0_OPTION_MAC {
 			hasMAC = true
 			existingMAC = net.HardwareAddr(local.Data)
 			log.Printf("[EDNS0] Found existing MAC from client: %s", existingMAC)
 		}
 	}
-
-	// Second pass: build new option list based on mode
 	for _, opt := range o.Option {
 		switch v := opt.(type) {
 		case *dns.EDNS0_SUBNET:
-			// Handle ECS based on mode
 			switch ecsMode {
 			case "preserve":
-				opts = append(opts, opt) // Keep original
+				opts = append(opts, opt)
 				log.Printf("[EDNS0] ECS: Preserving client's ECS: %s/%d", v.Address, v.SourceNetmask)
 			case "add":
 				if !hasECS {
-					// Will be added later
 					log.Printf("[EDNS0] ECS: Client has no ECS, will add client IP")
 				} else {
-					opts = append(opts, opt) // Keep original if exists
+					opts = append(opts, opt)
 					log.Printf("[EDNS0] ECS: Client already has ECS, preserving: %s/%d", v.Address, v.SourceNetmask)
 				}
 			case "replace":
-				// Will be replaced later, skip original
 				log.Printf("[EDNS0] ECS: Replacing client's ECS %s/%d with client IP", v.Address, v.SourceNetmask)
 			case "remove":
-				// Skip - removes ECS entirely
 				log.Printf("[EDNS0] ECS: Removing client's ECS: %s/%d", v.Address, v.SourceNetmask)
 			}
 		case *dns.EDNS0_LOCAL:
 			if v.Code == EDNS0_OPTION_MAC {
-				// Handle MAC based on mode
 				switch macMode {
 				case "preserve":
-					opts = append(opts, opt) // Keep original
+					opts = append(opts, opt)
 					log.Printf("[EDNS0] MAC: Preserving client's MAC: %s", net.HardwareAddr(v.Data))
 				case "add":
 					if !hasMAC {
-						// Will be added later
 						log.Printf("[EDNS0] MAC: Client has no MAC, will add from source")
 					} else {
-						opts = append(opts, opt) // Keep original if exists
+						opts = append(opts, opt)
 						log.Printf("[EDNS0] MAC: Client already has MAC, preserving: %s", net.HardwareAddr(v.Data))
 					}
 				case "replace":
-					// Will be replaced later, skip original
 					log.Printf("[EDNS0] MAC: Replacing client's MAC %s with source MAC", net.HardwareAddr(v.Data))
 				case "remove":
-					// Skip - removes MAC entirely
 					log.Printf("[EDNS0] MAC: Removing client's MAC: %s", net.HardwareAddr(v.Data))
 				case "prefer-edns0":
-					opts = append(opts, opt) // Keep EDNS0 MAC, will not add ARP MAC
+					opts = append(opts, opt)
 					log.Printf("[EDNS0] MAC: Preferring client's EDNS0 MAC: %s", net.HardwareAddr(v.Data))
 				case "prefer-arp":
-					// Skip EDNS0 MAC, will add ARP MAC later
 					log.Printf("[EDNS0] MAC: Preferring ARP MAC over client's EDNS0 MAC: %s", net.HardwareAddr(v.Data))
 				}
 			} else {
-				// Keep other EDNS0_LOCAL options
 				opts = append(opts, opt)
 			}
 		default:
-			// Keep all other EDNS0 options
 			opts = append(opts, opt)
 		}
 	}
-
-	// Add ECS if needed based on mode
 	shouldAddECS := false
 	switch ecsMode {
-	case "preserve":
-		shouldAddECS = false // Only keep what was there
-	case "add":
-		shouldAddECS = !hasECS // Add only if not present
-	case "replace":
-		shouldAddECS = true // Always add (replacing any existing)
-	case "remove":
-		shouldAddECS = false // Never add
+	case "preserve": shouldAddECS = false
+	case "add": shouldAddECS = !hasECS
+	case "replace": shouldAddECS = true
+	case "remove": shouldAddECS = false
 	}
-
 	if shouldAddECS && ip != nil {
 		family := uint16(1)
 		mask := uint8(32)
 		isIPv6 := false
-		
 		if ip.To4() == nil {
 			family = 2
 			mask = 128
 			isIPv6 = true
 		}
-
-		// Determine which mask to use (priority: IPv4/IPv6-specific > general > default)
 		if isIPv6 {
-			// IPv6
 			if config.Server.EDNS0.ECS.IPv6Mask > 0 {
 				mask = uint8(config.Server.EDNS0.ECS.IPv6Mask)
 				log.Printf("[EDNS0] ECS: Using configured IPv6 mask: /%d", mask)
@@ -893,13 +750,8 @@ func addEDNS0Options(msg *dns.Msg, ip net.IP, mac net.HardwareAddr) {
 			} else {
 				log.Printf("[EDNS0] ECS: Using default IPv6 mask: /%d", mask)
 			}
-			// Validate
-			if mask > 128 {
-				log.Printf("[EDNS0] WARNING: ECS mask %d exceeds IPv6 maximum (128), using /128", mask)
-				mask = 128
-			}
+			if mask > 128 { mask = 128 }
 		} else {
-			// IPv4
 			if config.Server.EDNS0.ECS.IPv4Mask > 0 {
 				mask = uint8(config.Server.EDNS0.ECS.IPv4Mask)
 				log.Printf("[EDNS0] ECS: Using configured IPv4 mask: /%d", mask)
@@ -909,13 +761,8 @@ func addEDNS0Options(msg *dns.Msg, ip net.IP, mac net.HardwareAddr) {
 			} else {
 				log.Printf("[EDNS0] ECS: Using default IPv4 mask: /%d", mask)
 			}
-			// Validate
-			if mask > 32 {
-				log.Printf("[EDNS0] WARNING: ECS mask %d exceeds IPv4 maximum (32), using /32", mask)
-				mask = 32
-			}
+			if mask > 32 { mask = 32 }
 		}
-
 		opts = append(opts, &dns.EDNS0_SUBNET{
 			Code:          dns.EDNS0SUBNET,
 			Family:        family,
@@ -926,17 +773,14 @@ func addEDNS0Options(msg *dns.Msg, ip net.IP, mac net.HardwareAddr) {
 	} else if !shouldAddECS && ip != nil {
 		log.Printf("[EDNS0] ECS: Not adding to upstream (mode: %s, hasECS: %v)", ecsMode, hasECS)
 	}
-
-	// Add MAC if needed based on mode and source
 	shouldAddMAC := false
 	var macToAdd net.HardwareAddr
-
 	switch macMode {
 	case "preserve":
-		shouldAddMAC = false // Only keep what was there
+		shouldAddMAC = false
 		log.Printf("[EDNS0] MAC: Preserve mode - not adding new MAC")
 	case "add":
-		shouldAddMAC = !hasMAC // Add only if not present
+		shouldAddMAC = !hasMAC
 		macToAdd = determineMAC(mac, existingMAC, macSource)
 		if shouldAddMAC {
 			log.Printf("[EDNS0] MAC: Add mode - will add MAC from source: %s", macSource)
@@ -944,18 +788,18 @@ func addEDNS0Options(msg *dns.Msg, ip net.IP, mac net.HardwareAddr) {
 			log.Printf("[EDNS0] MAC: Add mode - client already has MAC, not adding")
 		}
 	case "replace":
-		shouldAddMAC = true // Always add (replacing any existing)
+		shouldAddMAC = true
 		macToAdd = determineMAC(mac, existingMAC, macSource)
 		log.Printf("[EDNS0] MAC: Replace mode - will add MAC from source: %s", macSource)
 	case "remove":
-		shouldAddMAC = false // Never add
+		shouldAddMAC = false
 		log.Printf("[EDNS0] MAC: Remove mode - not adding MAC")
 	case "prefer-edns0":
 		if hasMAC {
-			shouldAddMAC = false // Already kept in second pass
+			shouldAddMAC = false
 			log.Printf("[EDNS0] MAC: Prefer-EDNS0 mode - already kept client's MAC")
 		} else if mac != nil && (macSource == "arp" || macSource == "both") {
-			shouldAddMAC = true // Add ARP MAC if no EDNS0 MAC
+			shouldAddMAC = true
 			macToAdd = mac
 			log.Printf("[EDNS0] MAC: Prefer-EDNS0 mode - no client MAC, adding ARP MAC")
 		} else {
@@ -974,31 +818,22 @@ func addEDNS0Options(msg *dns.Msg, ip net.IP, mac net.HardwareAddr) {
 			log.Printf("[EDNS0] MAC: Prefer-ARP mode - no MAC available")
 		}
 	}
-
 	if shouldAddMAC && macToAdd != nil {
 		opts = append(opts, &dns.EDNS0_LOCAL{Code: EDNS0_OPTION_MAC, Data: macToAdd})
 		log.Printf("[EDNS0] MAC: Added to upstream: %s", macToAdd)
 	}
-
 	o.Option = opts
 	log.Printf("[EDNS0] Final upstream EDNS0 options count: %d", len(opts))
 }
 
-// determineMAC selects which MAC to use based on source configuration
 func determineMAC(arpMAC, edns0MAC net.HardwareAddr, source string) net.HardwareAddr {
 	switch source {
-	case "arp":
-		return arpMAC
-	case "edns0":
-		return edns0MAC
+	case "arp": return arpMAC
+	case "edns0": return edns0MAC
 	case "both":
-		// Prefer ARP if available, otherwise EDNS0
-		if arpMAC != nil {
-			return arpMAC
-		}
+		if arpMAC != nil { return arpMAC }
 		return edns0MAC
-	default:
-		return arpMAC
+	default: return arpMAC
 	}
 }
 
