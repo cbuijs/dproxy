@@ -135,6 +135,7 @@ func (p *DoQPool) Get(ctx context.Context, addr string, tlsConf *tls.Config) (qu
 }
 
 func (p *DoQPool) cleanup(ctx context.Context) {
+	LogInfo("[DOQ] Starting DoQ connection pool maintenance")
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	
@@ -143,23 +144,32 @@ func (p *DoQPool) cleanup(ctx context.Context) {
 		case <-ctx.Done():
 			// Close all connections on shutdown
 			p.mu.Lock()
+			count := 0
 			for _, sess := range p.sessions {
 				sess.conn.CloseWithError(0, "shutdown")
+				count++
 			}
 			p.sessions = make(map[string]*doqSession)
 			p.mu.Unlock()
+			LogInfo("[DOQ] Closed %d connections on shutdown", count)
 			return
 		case <-ticker.C:
 			p.mu.Lock()
+			closedCount := 0
 			for addr, sess := range p.sessions {
 				sess.mu.Lock()
+				// Idle time limit: 2 minutes
 				if time.Since(sess.lastUsed) > 2*time.Minute {
 					sess.conn.CloseWithError(0, "idle timeout")
 					delete(p.sessions, addr)
+					closedCount++
 				}
 				sess.mu.Unlock()
 			}
 			p.mu.Unlock()
+			if closedCount > 0 {
+				LogDebug("[DOQ] Cleaned up %d idle DoQ connections", closedCount)
+			}
 		}
 	}
 }

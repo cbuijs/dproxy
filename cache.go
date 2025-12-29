@@ -27,12 +27,14 @@ type DNSCache struct {
 var dnsCache = &DNSCache{items: make(map[string]*CacheEntry)}
 
 func maintainDNSCache(ctx context.Context) {
+	LogInfo("[CACHE] Starting background cache maintenance (Limit: %d items)", config.Cache.Size)
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 	
 	for {
 		select {
 		case <-ctx.Done():
+			LogInfo("[CACHE] Stopping background cache maintenance")
 			return
 		case <-ticker.C:
 			pruneCache()
@@ -125,15 +127,21 @@ func addToCache(key string, msg *dns.Msg) {
 	defer dnsCache.Unlock()
 
 	if len(dnsCache.items) >= config.Cache.Size {
+		// First pass: remove expired items immediately
 		now := time.Now()
+		expiredCount := 0
 		for k, v := range dnsCache.items {
 			if now.After(v.Expiration) {
 				delete(dnsCache.items, k)
+				expiredCount++
 			}
 		}
 
 		if len(dnsCache.items) >= config.Cache.Size {
+			LogDebug("[CACHE] Full capacity reached (%d). Triggering SmartLRU eviction.", config.Cache.Size)
 			evictSmartLRU()
+		} else if expiredCount > 0 {
+			LogDebug("[CACHE] Cleared %d expired items to make room.", expiredCount)
 		}
 	}
 
@@ -152,6 +160,8 @@ func evictSmartLRU() {
 	}
 
 	const sampleSize = 50
+	
+	startCount := len(dnsCache.items)
 
 	for i := 0; i < toRemove; i++ {
 		if len(dnsCache.items) == 0 {
@@ -179,16 +189,24 @@ func evictSmartLRU() {
 			delete(dnsCache.items, oldestKey)
 		}
 	}
+	
+	LogDebug("[CACHE] SmartLRU Eviction: Removed %d items (Count: %d -> %d)", 
+		startCount - len(dnsCache.items), startCount, len(dnsCache.items))
 }
 
 func pruneCache() {
 	dnsCache.Lock()
 	defer dnsCache.Unlock()
 	now := time.Now()
+	removed := 0
 	for k, v := range dnsCache.items {
 		if now.After(v.Expiration) {
 			delete(dnsCache.items, k)
+			removed++
 		}
+	}
+	if removed > 0 {
+		LogDebug("[CACHE] Pruned %d expired entries. Current size: %d", removed, len(dnsCache.items))
 	}
 }
 
