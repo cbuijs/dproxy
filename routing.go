@@ -1,6 +1,6 @@
 /*
 File: routing.go
-Description: Logic for evaluating routing rules against request context and selecting the appropriate upstream group.
+Description: High-performance routing logic using Domain Trie (Radix-style) for rapid lookups.
 */
 
 package main
@@ -11,6 +11,135 @@ import (
 	"net"
 	"strings"
 )
+
+// --- Domain Trie Implementation ---
+
+type TrieNode struct {
+	Children map[string]*TrieNode
+	Rule     *RoutingRule // Non-nil if a rule terminates here
+	Wildcard *RoutingRule // Non-nil if a *.domain rule exists here
+}
+
+func NewTrieNode() *TrieNode {
+	return &TrieNode{Children: make(map[string]*TrieNode)}
+}
+
+type DomainTrie struct {
+	Root *TrieNode
+}
+
+func NewDomainTrie() *DomainTrie {
+	return &DomainTrie{Root: NewTrieNode()}
+}
+
+// Insert adds a domain rule. Handles "example.com", ".example.com", "*.example.com"
+// Domain parts are inserted in REVERSE order (com -> example -> www)
+func (t *DomainTrie) Insert(domain string, rule *RoutingRule) {
+	parts := strings.Split(domain, ".")
+
+	// Handle wildcard prefix "*.example.com" or ".example.com"
+	isWildcard := false
+	if parts[0] == "*" {
+		isWildcard = true
+		parts = parts[1:] // Remove "*"
+	} else if parts[0] == "" {
+		// Starts with dot ".example.com" -> treat as wildcard for subdomains + exact match
+		isWildcard = true
+		parts = parts[1:] // Remove empty start
+	}
+
+	node := t.Root
+	// Reverse iteration
+	for i := len(parts) - 1; i >= 0; i-- {
+		part := parts[i]
+		if part == "" {
+			continue
+		}
+
+		if node.Children[part] == nil {
+			node.Children[part] = NewTrieNode()
+		}
+		node = node.Children[part]
+	}
+
+	// If it was "*.example.com", set Wildcard rule
+	if isWildcard {
+		node.Wildcard = rule
+		// Also set exact match if the syntax was ".example.com" (usually implies both)
+		if strings.HasPrefix(domain, ".") {
+			node.Rule = rule
+		}
+	} else {
+		node.Rule = rule
+	}
+}
+
+// Search finds the most specific rule for a query name
+func (t *DomainTrie) Search(qName string) *RoutingRule {
+	parts := strings.Split(qName, ".")
+	node := t.Root
+
+	var lastValidRule *RoutingRule
+
+	// Reverse iteration
+	for i := len(parts) - 1; i >= 0; i-- {
+		part := parts[i]
+
+		// Before moving down, check if current node has a wildcard that applies to the rest
+		if node.Wildcard != nil {
+			lastValidRule = node.Wildcard
+		}
+
+		next, ok := node.Children[part]
+		if !ok {
+			// No deeper match. Return the last wildcard found (if any)
+			return lastValidRule
+		}
+		node = next
+	}
+
+	// Exact match at the leaf
+	if node.Rule != nil {
+		return node.Rule
+	}
+
+	// If exact match not found, but this node had a wildcard (unlikely for leaf but possible)
+	if node.Wildcard != nil {
+		return node.Wildcard
+	}
+
+	return lastValidRule
+}
+
+// --- Globals ---
+
+var (
+	domainRouter *DomainTrie
+	genericRules []RoutingRule // Rules without query_domain
+)
+
+// --- Initialization called from Config Load ---
+
+func BuildRoutingTable(rules []RoutingRule) {
+	trie := NewDomainTrie()
+	var generic []RoutingRule
+
+	for i := range rules {
+		// We use a pointer to the rule in the slice to avoid copying
+		rule := &rules[i]
+		if rule.Match.QueryDomain != "" {
+			trie.Insert(strings.ToLower(rule.Match.QueryDomain), rule)
+		} else {
+			generic = append(generic, *rule)
+		}
+	}
+
+	domainRouter = trie
+	genericRules = generic
+	LogInfo("[ROUTING] Built routing table: Domain Trie built, %d generic rules", len(genericRules))
+}
+
+// --- Main Logic ---
 
 func resolveUpstreams(upstreams interface{}, groups map[string][]string) ([]string, error) {
 	switch v := upstreams.(type) {
@@ -35,18 +164,26 @@ func resolveUpstreams(upstreams interface{}, groups map[string][]string) ([]stri
 	}
 }
 
-// SelectUpstreams returns the upstreams, strategy, and the RULE NAME for caching
+// SelectUpstreams optimized with Trie lookup
 func SelectUpstreams(ctx *RequestContext) ([]*Upstream, string, string) {
-	if config == nil || config.Routing.RoutingRules == nil {
-		log.Fatal("Config not loaded - this should never happen")
+	if config == nil {
+		log.Fatal("Config not loaded")
 		return nil, "", ""
 	}
 
-	for _, rule := range config.Routing.RoutingRules {
+	// 1. Fast Path: Domain Trie Lookup
+	if domainRouter != nil && ctx.QueryName != "" {
+		if rule := domainRouter.Search(ctx.QueryName); rule != nil {
+			LogDebug("[ROUTING] HIT Trie Rule: '%s' | Domain: %s", rule.Name, ctx.QueryName)
+			return rule.parsedUpstreams, rule.Strategy, rule.Name
+		}
+	}
+
+	// 2. Slow Path: Linear scan of generic rules (IP, MAC, etc.)
+	for _, rule := range genericRules {
 		matched, reason := matchRule(&rule.Match, ctx)
 		if matched {
-			LogDebug("[ROUTING] HIT Rule: '%s' | Trigger: %s | Client: %s",
-				rule.Name, reason, ctx.ClientIP)
+			LogDebug("[ROUTING] HIT Generic Rule: '%s' | Trigger: %s", rule.Name, reason)
 			return rule.parsedUpstreams, rule.Strategy, rule.Name
 		}
 	}
@@ -132,35 +269,10 @@ func matchRule(m *MatchConditions, ctx *RequestContext) (bool, string) {
 		}
 	}
 
-	if m.QueryDomain != "" {
-		conditionsChecked++
-		ruleDom := strings.ToLower(m.QueryDomain)
-		qDom := ctx.QueryName
-
-		match := false
-		if strings.HasPrefix(ruleDom, "*.") {
-			base := ruleDom[2:]
-			if strings.HasSuffix(qDom, "."+base) {
-				match = true
-			}
-		} else if strings.HasPrefix(ruleDom, ".") {
-			base := ruleDom[1:]
-			if qDom == base || strings.HasSuffix(qDom, "."+base) {
-				match = true
-			}
-		} else {
-			if qDom == ruleDom {
-				match = true
-			}
-		}
-
-		if match {
-			return true, fmt.Sprintf("QueryDomain=%s", m.QueryDomain)
-		}
-	}
+	// QueryDomain check removed here as it is handled by Trie
 
 	if conditionsChecked == 0 {
-		return true, "NoConditions/MatchAll"
+		return false, ""
 	}
 
 	return false, ""

@@ -52,28 +52,27 @@ func (u *Upstream) String() string {
 func (u *Upstream) updateRTT(d time.Duration, rcode int) {
 	newVal := int64(d)
 	old := atomic.LoadInt64(&u.rtt)
-	
+
 	// Update last probe time regardless of rcode
 	atomic.StoreInt64(&u.lastProbe, time.Now().UnixNano())
-	
+
 	// Only update RTT for successful responses (NOERROR)
-	// NXDOMAIN, SERVFAIL, etc. can have different latency characteristics
 	if rcode != 0 { // dns.RcodeSuccess == 0
 		return
 	}
-	
+
 	if old == 0 {
 		atomic.StoreInt64(&u.rtt, newVal)
 		return
 	}
-	
+
 	// Exponential moving average: 70% old, 30% new
 	avg := int64(float64(old)*0.7 + float64(newVal)*0.3)
 	atomic.StoreInt64(&u.rtt, avg)
 }
 
-func (u *Upstream) getRTT() int64 { 
-	return atomic.LoadInt64(&u.rtt) 
+func (u *Upstream) getRTT() int64 {
+	return atomic.LoadInt64(&u.rtt)
 }
 
 func (u *Upstream) getLastProbeTime() time.Time {
@@ -82,6 +81,45 @@ func (u *Upstream) getLastProbeTime() time.Time {
 		return time.Time{} // Zero time if never probed
 	}
 	return time.Unix(0, nanos)
+}
+
+// --- TCP/DoT Connection Pool ---
+
+type TCPConnPool struct {
+	mu    sync.Mutex
+	conns map[string][]*dns.Conn
+}
+
+var tcpPool = &TCPConnPool{
+	conns: make(map[string][]*dns.Conn),
+}
+
+// Get retrieves a cached connection or returns nil
+func (p *TCPConnPool) Get(key string) *dns.Conn {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	list := p.conns[key]
+	if len(list) > 0 {
+		// Pop the last one
+		conn := list[len(list)-1]
+		p.conns[key] = list[:len(list)-1]
+		return conn
+	}
+	return nil
+}
+
+// Put returns a connection to the pool
+func (p *TCPConnPool) Put(key string, conn *dns.Conn) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// Limit pool size per upstream to prevent leaks
+	if len(p.conns[key]) >= 5 {
+		conn.Close()
+		return
+	}
+	p.conns[key] = append(p.conns[key], conn)
 }
 
 // --- DoQ Connection Pool ---
@@ -138,7 +176,7 @@ func (p *DoQPool) cleanup(ctx context.Context) {
 	LogInfo("[DOQ] Starting DoQ connection pool maintenance")
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -182,32 +220,32 @@ type bootstrapCacheEntry struct {
 }
 
 var (
-	bootstrapCache   = make(map[string]*bootstrapCacheEntry)
-	bootstrapCacheMu sync.RWMutex
+	bootstrapCache    = make(map[string]*bootstrapCacheEntry)
+	bootstrapCacheMu  sync.RWMutex
 	bootstrapCacheTTL = 5 * time.Minute // Cache bootstrap results for 5 minutes
 )
 
 func getBootstrapCache(hostname string) ([]net.IP, bool) {
 	bootstrapCacheMu.RLock()
 	defer bootstrapCacheMu.RUnlock()
-	
+
 	entry, exists := bootstrapCache[hostname]
 	if !exists {
 		return nil, false
 	}
-	
+
 	// Check if cache entry is still valid
 	if time.Since(entry.timestamp) > bootstrapCacheTTL {
 		return nil, false
 	}
-	
+
 	return entry.ips, true
 }
 
 func setBootstrapCache(hostname string, ips []net.IP) {
 	bootstrapCacheMu.Lock()
 	defer bootstrapCacheMu.Unlock()
-	
+
 	bootstrapCache[hostname] = &bootstrapCacheEntry{
 		ips:       ips,
 		timestamp: time.Now(),
@@ -332,7 +370,7 @@ func parseUpstream(raw string, ipVersion string, insecure bool, timeout string) 
 func resolveHostnameWithBootstrap(hostname string, preferredVersion string) ([]net.IP, error) {
 	// Check cache first
 	if cachedIPs, found := getBootstrapCache(hostname); found {
-		LogDebug("[BOOTSTRAP] Using cached resolution for %s: %v (age: %v)", 
+		LogDebug("[BOOTSTRAP] Using cached resolution for %s: %v (age: %v)",
 			hostname, cachedIPs, time.Since(bootstrapCache[hostname].timestamp).Round(time.Second))
 		return cachedIPs, nil
 	}
@@ -351,7 +389,7 @@ func resolveHostnameWithBootstrap(hostname string, preferredVersion string) ([]n
 	LogDebug("[BOOTSTRAP] Resolving hostname: %s (IP version: %s)", hostname, version)
 
 	for i, bootstrap := range bootstrapServers {
-		LogDebug("[BOOTSTRAP] Attempting resolution via bootstrap server [%d/%d]: %s", 
+		LogDebug("[BOOTSTRAP] Attempting resolution via bootstrap server [%d/%d]: %s",
 			i+1, len(bootstrapServers), bootstrap)
 
 		c := &dns.Client{Net: "udp", Timeout: 3 * time.Second}
@@ -360,15 +398,15 @@ func resolveHostnameWithBootstrap(hostname string, preferredVersion string) ([]n
 			// OPTIMIZATION: Use message pool
 			msg := getMsg()
 			msg.SetQuestion(dns.Fqdn(hostname), dns.TypeA)
-			
+
 			LogDebug("[BOOTSTRAP] Querying %s for %s (A record)", bootstrap, hostname)
 			resp, rtt, err := c.Exchange(msg, bootstrap)
 			putMsg(msg) // Release request message
-			
+
 			if err == nil && resp != nil {
-				LogDebug("[BOOTSTRAP] Response from %s for %s: %d answers (RTT: %v)", 
+				LogDebug("[BOOTSTRAP] Response from %s for %s: %d answers (RTT: %v)",
 					bootstrap, hostname, len(resp.Answer), rtt)
-				
+
 				for _, ans := range resp.Answer {
 					if a, ok := ans.(*dns.A); ok {
 						allIPs = append(allIPs, a.A)
@@ -385,15 +423,15 @@ func resolveHostnameWithBootstrap(hostname string, preferredVersion string) ([]n
 			// OPTIMIZATION: Use message pool
 			msg := getMsg()
 			msg.SetQuestion(dns.Fqdn(hostname), dns.TypeAAAA)
-			
+
 			LogDebug("[BOOTSTRAP] Querying %s for %s (AAAA record)", bootstrap, hostname)
 			resp, rtt, err := c.Exchange(msg, bootstrap)
 			putMsg(msg) // Release request message
-			
+
 			if err == nil && resp != nil {
-				LogDebug("[BOOTSTRAP] Response from %s for %s: %d answers (RTT: %v)", 
+				LogDebug("[BOOTSTRAP] Response from %s for %s: %d answers (RTT: %v)",
 					bootstrap, hostname, len(resp.Answer), rtt)
-				
+
 				for _, ans := range resp.Answer {
 					if aaaa, ok := ans.(*dns.AAAA); ok {
 						allIPs = append(allIPs, aaaa.AAAA)
@@ -407,7 +445,7 @@ func resolveHostnameWithBootstrap(hostname string, preferredVersion string) ([]n
 		}
 
 		if len(allIPs) > 0 {
-			LogDebug("[BOOTSTRAP] Successfully resolved %s to %d IP(s) using %s", 
+			LogDebug("[BOOTSTRAP] Successfully resolved %s to %d IP(s) using %s",
 				hostname, len(allIPs), bootstrap)
 			break
 		}
@@ -424,9 +462,9 @@ func resolveHostnameWithBootstrap(hostname string, preferredVersion string) ([]n
 
 	// Cache the successful resolution
 	setBootstrapCache(hostname, allIPs)
-	LogDebug("[BOOTSTRAP] Resolution complete for %s: %v (cached for %v)", 
+	LogDebug("[BOOTSTRAP] Resolution complete for %s: %v (cached for %v)",
 		hostname, allIPs, bootstrapCacheTTL)
-	
+
 	return allIPs, nil
 }
 
@@ -469,22 +507,13 @@ func (u *Upstream) doExchange(ctx context.Context, req *dns.Msg, targetAddr stri
 	insecure := config.Server.InsecureUpstream
 
 	switch u.Proto {
-	case "udp", "tcp":
-		c := &dns.Client{Net: u.Proto, Timeout: timeout}
+	case "udp":
+		c := &dns.Client{Net: "udp", Timeout: timeout}
 		resp, _, err := c.ExchangeContext(ctx, req, targetAddr)
 		return resp, err
 
-	case "dot":
-		c := &dns.Client{
-			Net:     "tcp-tls",
-			Timeout: timeout,
-			TLSConfig: &tls.Config{
-				InsecureSkipVerify: insecure,
-				ServerName:         u.Host,
-			},
-		}
-		resp, _, err := c.ExchangeContext(ctx, req, targetAddr)
-		return resp, err
+	case "tcp", "dot":
+		return u.exchangeTCPPool(ctx, req, targetAddr, u.Proto == "dot", insecure)
 
 	case "doq":
 		return u.exchangeDoQ(ctx, req, targetAddr)
@@ -494,6 +523,76 @@ func (u *Upstream) doExchange(ctx context.Context, req *dns.Msg, targetAddr stri
 	}
 
 	return nil, errors.New("unsupported protocol")
+}
+
+func (u *Upstream) exchangeTCPPool(ctx context.Context, req *dns.Msg, addr string, useTLS bool, insecure bool) (*dns.Msg, error) {
+	// Pool Key
+	poolKey := fmt.Sprintf("%s|%s", u.Proto, addr)
+
+	// 1. Try to get a connection from the pool
+	conn := tcpPool.Get(poolKey)
+
+	// 2. If no connection, dial a new one
+	if conn == nil {
+		var err error
+		conn, err = u.dialTCP(addr, useTLS, insecure)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// 3. Perform Exchange
+	// We need to handle dead connections (write/read fails) by retrying once with a fresh connection
+	conn.SetDeadline(time.Now().Add(getTimeout()))
+
+	if err := conn.WriteMsg(req); err != nil {
+		conn.Close()
+		// Retry once with fresh connection
+		LogDebug("[UPSTREAM] Cached conn failed (%v), retrying dial...", err)
+		conn, err = u.dialTCP(addr, useTLS, insecure)
+		if err != nil {
+			return nil, err
+		}
+		conn.SetDeadline(time.Now().Add(getTimeout()))
+		if err := conn.WriteMsg(req); err != nil {
+			conn.Close()
+			return nil, err
+		}
+	}
+
+	resp, err := conn.ReadMsg()
+	if err != nil {
+		conn.Close()
+		// If the error was EOF on read, it might have been closed by server immediately.
+		// We could retry, but usually Write succeeds and Read fails means real issue.
+		return nil, err
+	}
+
+	// 4. Return connection to pool (if healthy)
+	go tcpPool.Put(poolKey, conn)
+
+	return resp, nil
+}
+
+func (u *Upstream) dialTCP(addr string, useTLS bool, insecure bool) (*dns.Conn, error) {
+	timeout := getTimeout()
+	if useTLS {
+		// DoT
+		c := &dns.Client{
+			Net:     "tcp-tls",
+			Timeout: timeout,
+			TLSConfig: &tls.Config{
+				InsecureSkipVerify: insecure,
+				ServerName:         u.Host,
+			},
+		}
+		// dns.Client.Dial returns a *dns.Conn
+		return c.Dial(addr)
+	}
+
+	// Plain TCP
+	c := &dns.Client{Net: "tcp", Timeout: timeout}
+	return c.Dial(addr)
 }
 
 func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetAddr string) (*dns.Msg, error) {
@@ -556,12 +655,8 @@ func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetAddr str
 	}
 
 	// OPTIMIZATION: Use message pool for the response
-	// The caller (doExchange -> executeExchange) passes this back up.
-	// We CANNOT putMsg() here. It will be collected eventually by GC 
-	// or we'd need a complex lifecycle management since it flows up to process.go
-	// However, we save the allocation of new(dns.Msg) which is still a win.
 	resp := getMsg()
-	
+
 	if err := resp.Unpack(respBuf); err != nil {
 		putMsg(resp) // Error case: can return immediately
 		return nil, err
@@ -585,11 +680,11 @@ func (u *Upstream) exchangeDoH(ctx context.Context, req *dns.Msg) (*dns.Msg, err
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Set required headers for DoH
 	hReq.Header.Set("Content-Type", "application/dns-message")
 	hReq.Header.Set("Accept", "application/dns-message")
-	hReq.Header.Set("User-Agent", "dproxy/1.0")  // Add User-Agent to prevent 403
+	hReq.Header.Set("User-Agent", "dproxy/1.0") // Add User-Agent to prevent 403
 
 	hResp, err := client.Do(hReq)
 	if err != nil {
@@ -604,8 +699,8 @@ func (u *Upstream) exchangeDoH(ctx context.Context, req *dns.Msg) (*dns.Msg, err
 		if len(bodyPreview) > 100 {
 			bodyPreview = bodyPreview[:100] + "..."
 		}
-		
-		return nil, fmt.Errorf("DoH error: %d (%s) - %s", 
+
+		return nil, fmt.Errorf("DoH error: %d (%s) - %s",
 			hResp.StatusCode, http.StatusText(hResp.StatusCode), bodyPreview)
 	}
 

@@ -34,7 +34,7 @@ type ServerConfig struct {
 		CertFile string `yaml:"cert_file"`
 		KeyFile  string `yaml:"key_file"`
 	} `yaml:"tls"`
-	
+
 	// New field for log level
 	LogLevel string `yaml:"log_level"`
 
@@ -44,10 +44,10 @@ type ServerConfig struct {
 	} `yaml:"doh"`
 	EDNS0 struct {
 		ECS struct {
-			Mode       string `yaml:"mode"`         // "preserve", "add", "replace", "remove"
-			SourceMask int    `yaml:"source_mask"`  // Override mask bits for both IPv4/IPv6 (0 = auto)
-			IPv4Mask   int    `yaml:"ipv4_mask"`    // Override mask for IPv4 only (0 = use source_mask)
-			IPv6Mask   int    `yaml:"ipv6_mask"`    // Override mask for IPv6 only (0 = use source_mask)
+			Mode       string `yaml:"mode"`        // "preserve", "add", "replace", "remove"
+			SourceMask int    `yaml:"source_mask"` // Override mask bits for both IPv4/IPv6 (0 = auto)
+			IPv4Mask   int    `yaml:"ipv4_mask"`   // Override mask for IPv4 only (0 = use source_mask)
+			IPv6Mask   int    `yaml:"ipv6_mask"`   // Override mask for IPv6 only (0 = use source_mask)
 		} `yaml:"ecs"`
 		MAC struct {
 			Mode   string `yaml:"mode"`   // "preserve", "add", "replace", "remove", "prefer-edns0", "prefer-arp"
@@ -135,7 +135,7 @@ func LoadConfig(path string) error {
 	if cfg.Server.Ports.HTTPS == 0 {
 		cfg.Server.Ports.HTTPS = 443
 	}
-	
+
 	// Default Log Level
 	if cfg.Server.LogLevel == "" {
 		cfg.Server.LogLevel = "INFO"
@@ -216,7 +216,7 @@ func LoadConfig(path string) error {
 		cfg.Bootstrap.IPVersion = "both"
 	}
 	bootstrapServers = cfg.Bootstrap.Servers
-	
+
 	LogInfo("Bootstrap Configuration: Servers=%v, IPVersion=%s", bootstrapServers, cfg.Bootstrap.IPVersion)
 
 	if cfg.Cache.Size == 0 {
@@ -253,7 +253,7 @@ func LoadConfig(path string) error {
 			rule.Strategy = "failover"
 		}
 
-		// --- Detailed Logging of Loaded Rules (Using LogInfo to ensure visibility at startup) ---
+		// --- Detailed Logging of Loaded Rules ---
 		LogInfo("[RULE] Loaded '%s' (Strategy: %s)", rule.Name, rule.Strategy)
 		m := rule.Match
 		if m.ClientIP != "" {
@@ -327,6 +327,9 @@ func LoadConfig(path string) error {
 		LogInfo("      - %s", u.String())
 	}
 	LogInfo("-----------------------------")
+
+	// --- CRITICAL ADDITION: Build Routing Trie ---
+	BuildRoutingTable(cfg.Routing.RoutingRules)
 
 	config = &cfg
 	return nil

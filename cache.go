@@ -1,11 +1,12 @@
 /*
 File: cache.go
-Description: Thread-safe in-memory DNS cache with TTL enforcement and SmartLRU eviction.
+Description: Thread-safe in-memory DNS cache using O(1) LRU eviction.
 */
 
 package main
 
 import (
+	"container/list"
 	"context"
 	"sync"
 	"time"
@@ -13,31 +14,48 @@ import (
 	"github.com/miekg/dns"
 )
 
-type CacheEntry struct {
+type CacheItem struct {
+	Key        string
 	Msg        *dns.Msg
 	Expiration time.Time
-	LastAccess time.Time
 }
 
 type DNSCache struct {
-	sync.RWMutex
-	items map[string]*CacheEntry
+	sync.Mutex
+	capacity int
+	items    map[string]*list.Element
+	lruList  *list.List
 }
 
-var dnsCache = &DNSCache{items: make(map[string]*CacheEntry)}
+// Initialize with a default size; capacity is updated in maintainDNSCache based on config
+var dnsCache = &DNSCache{
+	capacity: 10000,
+	items:    make(map[string]*list.Element),
+	lruList:  list.New(),
+}
 
 func maintainDNSCache(ctx context.Context) {
-	LogInfo("[CACHE] Starting background cache maintenance (Limit: %d items)", config.Cache.Size)
+	// Update capacity from config
+	dnsCache.Lock()
+	if config.Cache.Size > 0 {
+		dnsCache.capacity = config.Cache.Size
+	}
+	dnsCache.Unlock()
+
+	LogInfo("[CACHE] Starting maintenance (Capacity: %d, Type: LRU)", config.Cache.Size)
+
+	// Ticker for strictly expired items (cleanup)
+	// The LRU handles capacity eviction; this handles TTL expiration cleanup
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-ctx.Done():
-			LogInfo("[CACHE] Stopping background cache maintenance")
+			LogInfo("[CACHE] Stopping maintenance")
 			return
 		case <-ticker.C:
-			pruneCache()
+			pruneExpired()
 		}
 	}
 }
@@ -47,24 +65,27 @@ func getFromCache(key string, reqID uint16) *dns.Msg {
 		return nil
 	}
 
-	dnsCache.RLock()
-	entry, found := dnsCache.items[key]
-	dnsCache.RUnlock()
+	dnsCache.Lock()
+	defer dnsCache.Unlock()
 
+	elem, found := dnsCache.items[key]
 	if !found {
 		return nil
 	}
 
+	// Move to front (Mark as recently used)
+	dnsCache.lruList.MoveToFront(elem)
+
+	entry := elem.Value.(*CacheItem)
+
+	// Check TTL
 	now := time.Now()
 	if now.After(entry.Expiration) {
+		// Lazy eviction
+		dnsCache.lruList.Remove(elem)
+		delete(dnsCache.items, key)
 		return nil
 	}
-
-	dnsCache.Lock()
-	if e, ok := dnsCache.items[key]; ok {
-		e.LastAccess = now
-	}
-	dnsCache.Unlock()
 
 	msg := entry.Msg.Copy()
 	msg.Id = reqID
@@ -97,6 +118,7 @@ func addToCache(key string, msg *dns.Msg) {
 		return
 	}
 
+	// Calculate MinTTL logic
 	minTTL := uint32(3600)
 	foundTTL := false
 	checkRR := func(rrs []dns.RR) {
@@ -126,87 +148,61 @@ func addToCache(key string, msg *dns.Msg) {
 	dnsCache.Lock()
 	defer dnsCache.Unlock()
 
-	if len(dnsCache.items) >= config.Cache.Size {
-		// First pass: remove expired items immediately
-		now := time.Now()
-		expiredCount := 0
-		for k, v := range dnsCache.items {
-			if now.After(v.Expiration) {
-				delete(dnsCache.items, k)
-				expiredCount++
-			}
-		}
+	// Check if update or new
+	if elem, found := dnsCache.items[key]; found {
+		dnsCache.lruList.MoveToFront(elem)
+		entry := elem.Value.(*CacheItem)
+		entry.Msg = msg
+		entry.Expiration = time.Now().Add(time.Duration(minTTL) * time.Second)
+		return
+	}
 
-		if len(dnsCache.items) >= config.Cache.Size {
-			LogDebug("[CACHE] Full capacity reached (%d). Triggering SmartLRU eviction.", config.Cache.Size)
-			evictSmartLRU()
-		} else if expiredCount > 0 {
-			LogDebug("[CACHE] Cleared %d expired items to make room.", expiredCount)
+	// Evict if full
+	if dnsCache.lruList.Len() >= dnsCache.capacity {
+		if oldest := dnsCache.lruList.Back(); oldest != nil {
+			dnsCache.lruList.Remove(oldest)
+			oldestEntry := oldest.Value.(*CacheItem)
+			delete(dnsCache.items, oldestEntry.Key)
 		}
 	}
 
-	now := time.Now()
-	dnsCache.items[key] = &CacheEntry{
+	// Add new
+	item := &CacheItem{
+		Key:        key,
 		Msg:        msg,
-		Expiration: now.Add(time.Duration(minTTL) * time.Second),
-		LastAccess: now,
+		Expiration: time.Now().Add(time.Duration(minTTL) * time.Second),
 	}
+	elem := dnsCache.lruList.PushFront(item)
+	dnsCache.items[key] = elem
 }
 
-func evictSmartLRU() {
-	toRemove := config.Cache.Size / 20
-	if toRemove < 10 {
-		toRemove = 10
-	}
-
-	const sampleSize = 50
-	
-	startCount := len(dnsCache.items)
-
-	for i := 0; i < toRemove; i++ {
-		if len(dnsCache.items) == 0 {
-			break
-		}
-
-		var oldestKey string
-		var oldestTime time.Time
-		first := true
-		count := 0
-
-		for k, v := range dnsCache.items {
-			if first || v.LastAccess.Before(oldestTime) {
-				oldestTime = v.LastAccess
-				oldestKey = k
-				first = false
-			}
-			count++
-			if count >= sampleSize {
-				break
-			}
-		}
-
-		if oldestKey != "" {
-			delete(dnsCache.items, oldestKey)
-		}
-	}
-	
-	LogDebug("[CACHE] SmartLRU Eviction: Removed %d items (Count: %d -> %d)", 
-		startCount - len(dnsCache.items), startCount, len(dnsCache.items))
-}
-
-func pruneCache() {
+func pruneExpired() {
 	dnsCache.Lock()
 	defer dnsCache.Unlock()
+
 	now := time.Now()
-	removed := 0
-	for k, v := range dnsCache.items {
-		if now.After(v.Expiration) {
-			delete(dnsCache.items, k)
-			removed++
+	cleaned := 0
+	
+	// Check the oldest 50 items from the tail
+	// Since LRU is access-based, the tail contains the least recently used, 
+	// which are good candidates for being expired as well.
+	for i := 0; i < 50; i++ {
+		elem := dnsCache.lruList.Back()
+		if elem == nil {
+			break
+		}
+		entry := elem.Value.(*CacheItem)
+		if now.After(entry.Expiration) {
+			dnsCache.lruList.Remove(elem)
+			delete(dnsCache.items, entry.Key)
+			cleaned++
+		} else {
+			// If the tail item isn't expired, we stop to avoid scanning the whole list
+			break
 		}
 	}
-	if removed > 0 {
-		LogDebug("[CACHE] Pruned %d expired entries. Current size: %d", removed, len(dnsCache.items))
+	if cleaned > 0 {
+		LogDebug("[CACHE] Pruned %d expired items from tail", cleaned)
 	}
 }
 
