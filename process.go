@@ -2,7 +2,7 @@
 File: process.go
 Description: Handles the core processing logic for DNS requests, including Singleflight, EDNS0 extraction,
              logging, response cleaning, and forwarding to upstreams with specific strategies.
-             UPDATED: Upstream failure logging promoted from Debug to Warn.
+             UPDATED: Passing RequestContext to forwarding logic for client variable replacement.
 */
 
 package main
@@ -105,7 +105,7 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	if len(r.Question) > 0 {
 		q := r.Question[0]
 		reqCtx.QueryName = strings.TrimSuffix(strings.ToLower(q.Name), ".")
-		
+
 		sb.Grow(len(q.Name) + 10)
 		sb.WriteString(q.Name)
 		sb.WriteString(" (")
@@ -133,12 +133,20 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 			firstExtra = false
 		}
 		if reqCtx.ClientEDNSMAC != nil {
-			if !firstExtra { sb.WriteString(" ") } else { sb.WriteString(" [") }
+			if !firstExtra {
+				sb.WriteString(" ")
+			} else {
+				sb.WriteString(" [")
+			}
 			sb.WriteString("MAC65001:")
 			sb.WriteString(reqCtx.ClientEDNSMAC.String())
-			if firstExtra { sb.WriteString("]") }
+			if firstExtra {
+				sb.WriteString("]")
+			}
 		}
-		if sb.Len() > len(qInfo) { qInfo = sb.String() }
+		if sb.Len() > len(qInfo) {
+			qInfo = sb.String()
+		}
 		sb.Reset()
 	}
 
@@ -172,7 +180,7 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 			status := fmt.Sprintf("CACHE_HIT (%s)", ruleName)
 			logRequest(r.Id, reqCtx, qInfo, "", status, "CACHE", 0, time.Since(start), cachedResp)
 			w.WriteMsg(cachedResp)
-			return 
+			return
 		}
 	}
 
@@ -198,8 +206,8 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 
 	// Singleflight
 	result, err, shared := requestGroup.Do(cacheKey, func() (interface{}, error) {
-		// Pass selected upstreams/strategy to avoid re-calculating
-		resp, upstreamStr, rtt, err := forwardToUpstreams(ctx, msg, selectedUpstreams, selectedStrategy)
+		// Pass selected upstreams/strategy and reqCtx
+		resp, upstreamStr, rtt, err := forwardToUpstreams(ctx, msg, selectedUpstreams, selectedStrategy, reqCtx)
 		if err != nil {
 			return nil, err
 		}
@@ -240,37 +248,37 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 
 // --- Strategies ---
 
-func forwardToUpstreams(ctx context.Context, req *dns.Msg, upstreams []*Upstream, strategy string) (*dns.Msg, string, time.Duration, error) {
+func forwardToUpstreams(ctx context.Context, req *dns.Msg, upstreams []*Upstream, strategy string, reqCtx *RequestContext) (*dns.Msg, string, time.Duration, error) {
 	if len(upstreams) == 0 {
 		return nil, "", 0, errors.New("no upstreams available")
 	}
 
 	if len(upstreams) == 1 {
 		u := upstreams[0]
-		resp, rtt, err := u.executeExchange(ctx, req)
-		return resp, u.String(), rtt, err
+		resp, rtt, err := u.executeExchange(ctx, req, reqCtx)
+		return resp, u.DynamicString(reqCtx), rtt, err
 	}
 
 	strat := strings.ToLower(strategy)
 
 	switch strat {
 	case "round-robin":
-		return roundRobinStrategy(ctx, req, upstreams)
+		return roundRobinStrategy(ctx, req, upstreams, reqCtx)
 	case "random":
-		return randomStrategy(ctx, req, upstreams)
+		return randomStrategy(ctx, req, upstreams, reqCtx)
 	case "failover":
-		return failoverStrategy(ctx, req, upstreams)
+		return failoverStrategy(ctx, req, upstreams, reqCtx)
 	case "fastest":
-		return fastestStrategy(ctx, req, upstreams)
+		return fastestStrategy(ctx, req, upstreams, reqCtx)
 	case "race":
-		return raceStrategy(ctx, req, upstreams)
+		return raceStrategy(ctx, req, upstreams, reqCtx)
 	default:
 		LogWarn("[STRATEGY] Unknown strategy '%s', using failover", strategy)
-		return failoverStrategy(ctx, req, upstreams)
+		return failoverStrategy(ctx, req, upstreams, reqCtx)
 	}
 }
 
-func roundRobinStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*dns.Msg, string, time.Duration, error) {
+func roundRobinStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, reqCtx *RequestContext) (*dns.Msg, string, time.Duration, error) {
 	startIdx := rrCounter.Add(1) - 1
 	n := len(upstreams)
 
@@ -285,21 +293,21 @@ func roundRobinStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream
 		}
 
 		LogDebug("[STRATEGY] Round-Robin: Selected #%d/%d: %s", idx+1, n, u.String())
-		resp, rtt, err := u.executeExchange(ctx, req)
+		resp, rtt, err := u.executeExchange(ctx, req, reqCtx)
 		if err == nil {
-			LogDebug("[STRATEGY] Round-Robin: Success with %s (RTT: %v)", u.String(), rtt)
-			return resp, u.String(), rtt, nil
+			LogDebug("[STRATEGY] Round-Robin: Success with %s (RTT: %v)", u.DynamicString(reqCtx), rtt)
+			return resp, u.DynamicString(reqCtx), rtt, nil
 		}
-		
+
 		// If error (circuit open or network fail), continue loop
 		// UPDATED: LogWarn for visibility
-		LogWarn("[STRATEGY] Round-Robin: Failed with %s: %v", u.String(), err)
+		LogWarn("[STRATEGY] Round-Robin: Failed with %s: %v", u.DynamicString(reqCtx), err)
 	}
-	
+
 	return nil, "", 0, fmt.Errorf("all upstreams failed or unhealthy in round-robin")
 }
 
-func randomStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*dns.Msg, string, time.Duration, error) {
+func randomStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, reqCtx *RequestContext) (*dns.Msg, string, time.Duration, error) {
 	n := len(upstreams)
 	startIdx := rand.IntN(n)
 
@@ -313,37 +321,37 @@ func randomStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*
 		}
 
 		LogDebug("[STRATEGY] Random: Trying #%d/%d: %s", idx+1, n, u.String())
-		resp, rtt, err := u.executeExchange(ctx, req)
+		resp, rtt, err := u.executeExchange(ctx, req, reqCtx)
 		if err == nil {
-			LogDebug("[STRATEGY] Random: Success with %s (RTT: %v)", u.String(), rtt)
-			return resp, u.String(), rtt, nil
+			LogDebug("[STRATEGY] Random: Success with %s (RTT: %v)", u.DynamicString(reqCtx), rtt)
+			return resp, u.DynamicString(reqCtx), rtt, nil
 		}
 		// UPDATED: LogWarn
-		LogWarn("[STRATEGY] Random: Failed with %s: %v", u.String(), err)
+		LogWarn("[STRATEGY] Random: Failed with %s: %v", u.DynamicString(reqCtx), err)
 	}
 
 	return nil, "", 0, fmt.Errorf("all upstreams failed or unhealthy in random")
 }
 
-func failoverStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*dns.Msg, string, time.Duration, error) {
+func failoverStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, reqCtx *RequestContext) (*dns.Msg, string, time.Duration, error) {
 	for i, u := range upstreams {
 		if !u.IsHealthy() {
 			continue
 		}
 
 		LogDebug("[STRATEGY] Failover: Attempting #%d/%d: %s", i+1, len(upstreams), u.String())
-		resp, rtt, err := u.executeExchange(ctx, req)
+		resp, rtt, err := u.executeExchange(ctx, req, reqCtx)
 		if err == nil {
-			LogDebug("[STRATEGY] Failover: Success with %s (RTT: %v)", u.String(), rtt)
-			return resp, u.String(), rtt, nil
+			LogDebug("[STRATEGY] Failover: Success with %s (RTT: %v)", u.DynamicString(reqCtx), rtt)
+			return resp, u.DynamicString(reqCtx), rtt, nil
 		}
 		// UPDATED: LogWarn
-		LogWarn("[STRATEGY] Failover: Failed %s: %v", u.String(), err)
+		LogWarn("[STRATEGY] Failover: Failed %s: %v", u.DynamicString(reqCtx), err)
 	}
 	return nil, "", 0, errors.New("all upstreams failed or unhealthy in failover")
 }
 
-func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*dns.Msg, string, time.Duration, error) {
+func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, reqCtx *RequestContext) (*dns.Msg, string, time.Duration, error) {
 	const (
 		explorationRate    = 0.15
 		staleThreshold     = 30 * time.Second
@@ -353,13 +361,13 @@ func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (
 
 	now := time.Now()
 	type upstreamStat struct {
-		upstream     *Upstream
-		rtt          int64
-		lastProbed   time.Time
-		isStale      bool
-		index        int
+		upstream   *Upstream
+		rtt        int64
+		lastProbed time.Time
+		isStale    bool
+		index      int
 	}
-	
+
 	stats := make([]upstreamStat, 0, len(upstreams))
 	for i, u := range upstreams {
 		// Filter out unhealthy upstreams BEFORE sorting/stats to avoid picking dead ones
@@ -389,10 +397,18 @@ func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (
 	sort.Slice(stats, func(i, j int) bool {
 		rttI, rttJ := stats[i].rtt, stats[j].rtt
 		staleI, staleJ := stats[i].isStale, stats[j].isStale
-		if staleI != staleJ { return !staleI }
-		if rttI == 0 && rttJ == 0 { return stats[i].index < stats[j].index }
-		if rttI == 0 { return false }
-		if rttJ == 0 { return true }
+		if staleI != staleJ {
+			return !staleI
+		}
+		if rttI == 0 && rttJ == 0 {
+			return stats[i].index < stats[j].index
+		}
+		if rttI == 0 {
+			return false
+		}
+		if rttJ == 0 {
+			return true
+		}
 		return rttI < rttJ
 	})
 
@@ -401,7 +417,7 @@ func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (
 	shouldExplore := false
 	var explorationTarget *Upstream
 	var explorationReason string
-	
+
 	if rand.Float64() < explorationRate {
 		candidates := make([]*Upstream, 0)
 		for _, s := range stats[1:] {
@@ -442,7 +458,7 @@ func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (
 			}
 		}
 	}
-	
+
 	for _, s := range stats {
 		if now.Sub(s.lastProbed) > 3*staleThreshold {
 			go func(u *Upstream) {
@@ -452,12 +468,13 @@ func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (
 				probeMsg.RecursionDesired = true
 				probeCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 				defer cancel()
-				// This call will fail fast if circuit is open, or proceed if half-open
-				u.executeExchange(probeCtx, probeMsg)
+				// Pass empty request context for background probes
+				// Variables will default to placeholders (0-0-0-0)
+				u.executeExchange(probeCtx, probeMsg, &RequestContext{})
 			}(s.upstream)
 		}
 	}
-	
+
 	var selectedUpstream *Upstream
 	if shouldExplore && explorationTarget != nil {
 		selectedUpstream = explorationTarget
@@ -467,26 +484,28 @@ func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (
 		LogDebug("[STRATEGY] Fastest: Selected %s (RTT: %v)", best.String(), time.Duration(bestRTT))
 	}
 
-	resp, rtt, err := selectedUpstream.executeExchange(ctx, req)
+	resp, rtt, err := selectedUpstream.executeExchange(ctx, req, reqCtx)
 	if err != nil {
 		// UPDATED: LogWarn
-		LogWarn("[STRATEGY] Fastest: Failed with %s: %v, trying alternatives", selectedUpstream.String(), err)
+		LogWarn("[STRATEGY] Fastest: Failed with %s: %v, trying alternatives", selectedUpstream.DynamicString(reqCtx), err)
 		for _, s := range stats {
-			if s.upstream == selectedUpstream { continue }
+			if s.upstream == selectedUpstream {
+				continue
+			}
 			u := s.upstream
-			resp, rtt, err = u.executeExchange(ctx, req)
+			resp, rtt, err = u.executeExchange(ctx, req, reqCtx)
 			if err == nil {
-				LogDebug("[STRATEGY] Fastest Failover: Success with %s (RTT: %v)", u.String(), rtt)
-				return resp, u.String(), rtt, nil
+				LogDebug("[STRATEGY] Fastest Failover: Success with %s (RTT: %v)", u.DynamicString(reqCtx), rtt)
+				return resp, u.DynamicString(reqCtx), rtt, nil
 			}
 		}
 		return nil, "", 0, fmt.Errorf("all upstreams failed in fastest strategy")
 	}
-	
-	return resp, selectedUpstream.String(), rtt, nil
+
+	return resp, selectedUpstream.DynamicString(reqCtx), rtt, nil
 }
 
-func raceStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*dns.Msg, string, time.Duration, error) {
+func raceStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, reqCtx *RequestContext) (*dns.Msg, string, time.Duration, error) {
 	// Filter healthy upstreams first to avoid spawning useless goroutines
 	candidates := make([]*Upstream, 0, len(upstreams))
 	for _, u := range upstreams {
@@ -500,7 +519,7 @@ func raceStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*dn
 	}
 
 	LogDebug("[STRATEGY] Race: Starting race among %d upstreams (filtered from %d)", len(candidates), len(upstreams))
-	
+
 	type result struct {
 		msg  *dns.Msg
 		name string
@@ -522,16 +541,16 @@ func raceStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*dn
 
 		go func(upstream *Upstream) {
 			defer func() { <-raceLimiter }() // Release semaphore
-			
-			resp, rtt, err := upstream.executeExchange(ctx, req)
+
+			resp, rtt, err := upstream.executeExchange(ctx, req, reqCtx)
 			if err != nil {
 				// UPDATED: LogWarn
-				LogWarn("[STRATEGY] Race: Upstream %s failed: %v", upstream.String(), err)
+				LogWarn("[STRATEGY] Race: Upstream %s failed: %v", upstream.DynamicString(reqCtx), err)
 			} else {
-				LogDebug("[STRATEGY] Race: Upstream %s responded in %v", upstream.String(), rtt)
+				LogDebug("[STRATEGY] Race: Upstream %s responded in %v", upstream.DynamicString(reqCtx), rtt)
 			}
 			select {
-			case resCh <- result{msg: resp, name: upstream.String(), rtt: rtt, err: err}:
+			case resCh <- result{msg: resp, name: upstream.DynamicString(reqCtx), rtt: rtt, err: err}:
 			case <-ctx.Done():
 			}
 		}(u)
@@ -630,7 +649,9 @@ func logRequest(qid uint16, reqCtx *RequestContext, qInfo, upstreamQInfo, status
 				}
 				parts := strings.Fields(rr.String())
 				if len(parts) >= 4 {
-					if !first { sb.WriteString(", ") }
+					if !first {
+						sb.WriteString(", ")
+					}
 					sb.WriteString(parts[3])
 					if len(parts) > 4 {
 						sb.WriteString(" ")
@@ -646,14 +667,18 @@ func logRequest(qid uint16, reqCtx *RequestContext, qInfo, upstreamQInfo, status
 	}
 
 	ansStr := sb.String()
-	if ansStr == "" { ansStr = "Empty" }
+	if ansStr == "" {
+		ansStr = "Empty"
+	}
 
 	LogInfo("[RSP] QID:%d | Status:%s | TotalTime:%v | Answers:[%s]", qid, status, duration, ansStr)
 }
 
 func extractEDNS0ClientInfo(msg *dns.Msg, reqCtx *RequestContext) {
 	opt := msg.IsEdns0()
-	if opt == nil { return }
+	if opt == nil {
+		return
+	}
 	for _, option := range opt.Option {
 		switch o := option.(type) {
 		case *dns.EDNS0_SUBNET:
@@ -662,11 +687,15 @@ func extractEDNS0ClientInfo(msg *dns.Msg, reqCtx *RequestContext) {
 			mask := o.SourceNetmask
 			var ipNet *net.IPNet
 			if family == 1 {
-				if mask > 32 { mask = 32 }
+				if mask > 32 {
+					mask = 32
+				}
 				maskBytes := net.CIDRMask(int(mask), 32)
 				ipNet = &net.IPNet{IP: o.Address, Mask: maskBytes}
 			} else if family == 2 {
-				if mask > 128 { mask = 128 }
+				if mask > 128 {
+					mask = 128
+				}
 				maskBytes := net.CIDRMask(int(mask), 128)
 				ipNet = &net.IPNet{IP: o.Address, Mask: maskBytes}
 			}
@@ -682,7 +711,9 @@ func extractEDNS0ClientInfo(msg *dns.Msg, reqCtx *RequestContext) {
 }
 
 func buildUpstreamInfo(msg *dns.Msg) string {
-	if len(msg.Question) == 0 { return "" }
+	if len(msg.Question) == 0 {
+		return ""
+	}
 	q := msg.Question[0]
 	var sb strings.Builder
 	sb.WriteString(q.Name)
@@ -787,10 +818,14 @@ func addEDNS0Options(msg *dns.Msg, ip net.IP, mac net.HardwareAddr) {
 	}
 	shouldAddECS := false
 	switch ecsMode {
-	case "preserve": shouldAddECS = false
-	case "add": shouldAddECS = !hasECS
-	case "replace": shouldAddECS = true
-	case "remove": shouldAddECS = false
+	case "preserve":
+		shouldAddECS = false
+	case "add":
+		shouldAddECS = !hasECS
+	case "replace":
+		shouldAddECS = true
+	case "remove":
+		shouldAddECS = false
 	}
 	if shouldAddECS && ip != nil {
 		family := uint16(1)
@@ -811,7 +846,9 @@ func addEDNS0Options(msg *dns.Msg, ip net.IP, mac net.HardwareAddr) {
 			} else {
 				LogDebug("[EDNS0] ECS: Using default IPv6 mask: /%d", mask)
 			}
-			if mask > 128 { mask = 128 }
+			if mask > 128 {
+				mask = 128
+			}
 		} else {
 			if config.Server.EDNS0.ECS.IPv4Mask > 0 {
 				mask = uint8(config.Server.EDNS0.ECS.IPv4Mask)
@@ -822,7 +859,9 @@ func addEDNS0Options(msg *dns.Msg, ip net.IP, mac net.HardwareAddr) {
 			} else {
 				LogDebug("[EDNS0] ECS: Using default IPv4 mask: /%d", mask)
 			}
-			if mask > 32 { mask = 32 }
+			if mask > 32 {
+				mask = 32
+			}
 		}
 		opts = append(opts, &dns.EDNS0_SUBNET{
 			Code:          dns.EDNS0SUBNET,
@@ -889,12 +928,17 @@ func addEDNS0Options(msg *dns.Msg, ip net.IP, mac net.HardwareAddr) {
 
 func determineMAC(arpMAC, edns0MAC net.HardwareAddr, source string) net.HardwareAddr {
 	switch source {
-	case "arp": return arpMAC
-	case "edns0": return edns0MAC
-	case "both":
-		if arpMAC != nil { return arpMAC }
+	case "arp":
+		return arpMAC
+	case "edns0":
 		return edns0MAC
-	default: return arpMAC
+	case "both":
+		if arpMAC != nil {
+			return arpMAC
+		}
+		return edns0MAC
+	default:
+		return arpMAC
 	}
 }
 

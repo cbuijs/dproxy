@@ -2,7 +2,7 @@
 File: upstream.go
 Description: Defines the Upstream struct and handles downstream connection logic, pooling, and protocol-specific exchanges.
              Includes Circuit Breaker logic to handle failing upstreams efficiently.
-             UPDATED: Added explicit error logging for connection failures.
+             UPDATED: Added DynamicString() to correctly log resolved URLs with replaced variables.
 */
 
 package main
@@ -19,6 +19,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,17 +32,17 @@ import (
 
 // Circuit Breaker Constants
 const (
-	cbFailureThreshold = 3               // Number of failures before opening circuit
+	cbFailureThreshold = 3                // Number of failures before opening circuit
 	cbProbeInterval    = 30 * time.Second // Time to wait before probing an open circuit
 )
 
 type Upstream struct {
 	URL         *url.URL
 	Proto       string
-	Host        string
+	Host        string // This is the template host (e.g. {client-id}.dns.com)
 	Port        string
 	BootstrapIP string
-	Path        string
+	Path        string // This is the template path
 	ResolvedIPs []net.IP
 	rtt         int64
 	lastProbe   int64 // Unix timestamp in nanoseconds
@@ -62,29 +63,72 @@ func (u *Upstream) String() string {
 	return s
 }
 
+// DynamicString returns the upstream URL with variables ({client-ip}, etc.) replaced
+// based on the provided RequestContext. Used for logging actual request targets.
+func (u *Upstream) DynamicString(rc *RequestContext) string {
+	host, path := u.getDynamicConfig(rc)
+	s := fmt.Sprintf("%s://%s:%s%s", u.Proto, host, u.Port, path)
+	if u.BootstrapIP != "" {
+		s += fmt.Sprintf("#%s", u.BootstrapIP)
+	}
+	return s
+}
+
+// --- Variable Replacement Helper ---
+
+var sanitizeRegex = regexp.MustCompile(`[^a-zA-Z0-9]+`)
+
+func sanitizeClientID(s string) string {
+	return sanitizeRegex.ReplaceAllString(s, "-")
+}
+
+func (u *Upstream) getDynamicConfig(rc *RequestContext) (string, string) {
+	// Fast path: no variables
+	if !strings.Contains(u.Host, "{") && !strings.Contains(u.Path, "{") {
+		return u.Host, u.Path
+	}
+
+	clientIP := "0-0-0-0"
+	if rc != nil && rc.ClientIP != nil {
+		clientIP = sanitizeClientID(rc.ClientIP.String())
+	}
+
+	clientMAC := "00-00-00-00-00-00"
+	if rc != nil && rc.ClientMAC != nil {
+		clientMAC = sanitizeClientID(rc.ClientMAC.String())
+	}
+
+	replacer := strings.NewReplacer(
+		"{client-ip}", clientIP,
+		"{client-mac}", clientMAC,
+	)
+
+	return replacer.Replace(u.Host), replacer.Replace(u.Path)
+}
+
 // --- Circuit Breaker Logic ---
 
-// IsHealthy returns true if the upstream is healthy (Circuit Closed) 
+// IsHealthy returns true if the upstream is healthy (Circuit Closed)
 // or if it is time to probe (Circuit Open but interval passed).
 func (u *Upstream) IsHealthy() bool {
 	// If circuit is closed, it's healthy
 	if !u.cbOpen.Load() {
 		return true
 	}
-	
+
 	// If circuit is open, check if we are allowed to probe (Half-Open state)
 	if time.Now().UnixNano() >= u.cbNextProbe.Load() {
 		LogDebug("[CIRCUIT] Upstream %s entering HALF-OPEN state (Probing)", u.String())
-		return true 
+		return true
 	}
-	
+
 	return false
 }
 
 func (u *Upstream) recordSuccess() {
 	// Reset failures on success
 	u.cbFailures.Store(0)
-	
+
 	// If circuit was open, close it
 	if u.cbOpen.Load() {
 		u.cbOpen.Store(false)
@@ -94,7 +138,7 @@ func (u *Upstream) recordSuccess() {
 
 func (u *Upstream) recordFailure() {
 	newFailures := u.cbFailures.Add(1)
-	
+
 	// Check if we hit the threshold to open the circuit
 	if newFailures >= cbFailureThreshold {
 		// Only log if we are transitioning from Closed to Open
@@ -202,8 +246,11 @@ type doqSession struct {
 var doqPool = &DoQPool{sessions: make(map[string]*doqSession)}
 
 func (p *DoQPool) Get(ctx context.Context, addr string, tlsConf *tls.Config) (quic.Connection, error) {
+	// UPDATED: Include SNI in key to separate sessions for different client IDs
+	poolKey := fmt.Sprintf("%s|%s", addr, tlsConf.ServerName)
+
 	p.mu.RLock()
-	sess, exists := p.sessions[addr]
+	sess, exists := p.sessions[poolKey]
 	p.mu.RUnlock()
 
 	if exists {
@@ -212,7 +259,7 @@ func (p *DoQPool) Get(ctx context.Context, addr string, tlsConf *tls.Config) (qu
 		case <-sess.conn.Context().Done():
 			sess.mu.Unlock()
 			p.mu.Lock()
-			delete(p.sessions, addr)
+			delete(p.sessions, poolKey)
 			p.mu.Unlock()
 		default:
 			sess.lastUsed = time.Now()
@@ -230,7 +277,7 @@ func (p *DoQPool) Get(ctx context.Context, addr string, tlsConf *tls.Config) (qu
 	}
 
 	p.mu.Lock()
-	p.sessions[addr] = &doqSession{conn: conn, lastUsed: time.Now()}
+	p.sessions[poolKey] = &doqSession{conn: conn, lastUsed: time.Now()}
 	p.mu.Unlock()
 
 	return conn, nil
@@ -367,13 +414,17 @@ func parseUpstream(raw string, ipVersion string, insecure bool, timeout string) 
 	}
 
 	// Resolve hostname to IPs
+	// NOTE: If Host contains variables like {client-ip}, direct resolution will fail.
+	// Users using variables in Host MUST provide a bootstrap IP (e.g. tls://...#1.2.3.4)
+	// or ensure the template host is resolvable (unlikely).
 	if bootstrap != "" {
 		up.ResolvedIPs = []net.IP{net.ParseIP(bootstrap)}
 		LogDebug("Upstream %s using bootstrap IP: %s", up.String(), bootstrap)
 	} else if net.ParseIP(host) != nil {
 		up.ResolvedIPs = []net.IP{net.ParseIP(host)}
 		LogDebug("Upstream %s using direct IP: %s", up.String(), host)
-	} else {
+	} else if !strings.Contains(host, "{") {
+		// Only try to resolve if it's not a template
 		LogDebug("Resolving hostname %s using bootstrap servers...", host)
 		ips, err := resolveHostnameWithBootstrap(host, ipVersion)
 		if err != nil {
@@ -381,6 +432,9 @@ func parseUpstream(raw string, ipVersion string, insecure bool, timeout string) 
 		}
 		up.ResolvedIPs = ips
 		LogDebug("Upstream %s resolved to %d IPs: %v", up.String(), len(ips), ips)
+	} else {
+		// Template hostname without bootstrap IP
+		LogWarn("Upstream %s contains variables but no bootstrap IP. Resolution may fail at runtime if not provided.", up.String())
 	}
 
 	timeoutDuration := 5 * time.Second
@@ -395,7 +449,9 @@ func parseUpstream(raw string, ipVersion string, insecure bool, timeout string) 
 		up.httpClient = &http.Client{
 			Timeout: timeoutDuration,
 			Transport: &http.Transport{
-				TLSClientConfig:   &tls.Config{InsecureSkipVerify: insecure, ServerName: host},
+				// UPDATED: Do NOT set ServerName here.
+				// We want http.Client to derive SNI from the request URL, which allows dynamic hosts.
+				TLSClientConfig:   &tls.Config{InsecureSkipVerify: insecure},
 				ForceAttemptHTTP2: true,
 				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 					if len(up.ResolvedIPs) > 0 {
@@ -415,7 +471,8 @@ func parseUpstream(raw string, ipVersion string, insecure bool, timeout string) 
 		up.h3Client = &http.Client{
 			Timeout: timeoutDuration,
 			Transport: &http3.RoundTripper{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: insecure, ServerName: host},
+				// UPDATED: Do NOT set ServerName here.
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: insecure},
 				Dial: func(ctx context.Context, addr string, tlsConf *tls.Config, cfg *quic.Config) (quic.EarlyConnection, error) {
 					if len(up.ResolvedIPs) > 0 {
 						ip := up.ResolvedIPs[rand.IntN(len(up.ResolvedIPs))]
@@ -434,7 +491,7 @@ func parseUpstream(raw string, ipVersion string, insecure bool, timeout string) 
 func resolveHostnameWithBootstrap(hostname string, preferredVersion string) ([]net.IP, error) {
 	// Check cache first
 	if cachedIPs, found := getBootstrapCache(hostname); found {
-		LogDebug("[BOOTSTRAP] Using cached resolution for %s: %v (age: %v)", 
+		LogDebug("[BOOTSTRAP] Using cached resolution for %s: %v (age: %v)",
 			hostname, cachedIPs, time.Since(bootstrapCache[hostname].timestamp).Round(time.Second))
 		return cachedIPs, nil
 	}
@@ -460,7 +517,7 @@ func resolveHostnameWithBootstrap(hostname string, preferredVersion string) ([]n
 
 	// Iterate over bootstrap servers
 	for i, bootstrap := range bootstrapServers {
-		LogDebug("[BOOTSTRAP] Attempting resolution via bootstrap server [%d/%d]: %s", 
+		LogDebug("[BOOTSTRAP] Attempting resolution via bootstrap server [%d/%d]: %s",
 			i+1, len(bootstrapServers), bootstrap)
 
 		c := &dns.Client{Net: "udp", Timeout: 3 * time.Second}
@@ -472,14 +529,14 @@ func resolveHostnameWithBootstrap(hostname string, preferredVersion string) ([]n
 
 			typeName := dns.TypeToString[qType]
 			LogDebug("[BOOTSTRAP] Querying %s for %s (%s record)", bootstrap, hostname, typeName)
-			
+
 			resp, rtt, err := c.Exchange(msg, bootstrap)
 			putMsg(msg) // Release request message
 
 			if err == nil && resp != nil {
-				LogDebug("[BOOTSTRAP] Response from %s for %s (%s): %d answers (RTT: %v)", 
+				LogDebug("[BOOTSTRAP] Response from %s for %s (%s): %d answers (RTT: %v)",
 					bootstrap, hostname, typeName, len(resp.Answer), rtt)
-				
+
 				for _, ans := range resp.Answer {
 					switch r := ans.(type) {
 					case *dns.A:
@@ -498,7 +555,7 @@ func resolveHostnameWithBootstrap(hostname string, preferredVersion string) ([]n
 
 		// If we found any IPs using this server, stop and return them.
 		if len(allIPs) > 0 {
-			LogDebug("[BOOTSTRAP] Successfully resolved %s to %d IP(s) using %s", 
+			LogDebug("[BOOTSTRAP] Successfully resolved %s to %d IP(s) using %s",
 				hostname, len(allIPs), bootstrap)
 			break
 		}
@@ -515,15 +572,16 @@ func resolveHostnameWithBootstrap(hostname string, preferredVersion string) ([]n
 
 	// Cache the successful resolution
 	setBootstrapCache(hostname, allIPs)
-	LogDebug("[BOOTSTRAP] Resolution complete for %s: %v (cached for %v)", 
+	LogDebug("[BOOTSTRAP] Resolution complete for %s: %v (cached for %v)",
 		hostname, allIPs, bootstrapCacheTTL)
-	
+
 	return allIPs, nil
 }
 
 // --- Exchange ---
 
-func (u *Upstream) executeExchange(ctx context.Context, req *dns.Msg) (*dns.Msg, time.Duration, error) {
+// UPDATED: Accepts RequestContext to support {client-ip}/{client-mac} variables
+func (u *Upstream) executeExchange(ctx context.Context, req *dns.Msg, reqCtx *RequestContext) (*dns.Msg, time.Duration, error) {
 	// 1. Circuit Breaker Check
 	if !u.IsHealthy() {
 		return nil, 0, fmt.Errorf("circuit open for %s", u.String())
@@ -531,7 +589,8 @@ func (u *Upstream) executeExchange(ctx context.Context, req *dns.Msg) (*dns.Msg,
 
 	start := time.Now()
 
-	targetHost := u.Host
+	targetHost := u.Host // Default to config host
+	// If configured IP exists, we dial that, but we still need targetHost for SNI if not overridden
 	if len(u.ResolvedIPs) > 0 {
 		targetHost = u.ResolvedIPs[rand.IntN(len(u.ResolvedIPs))].String()
 	}
@@ -544,7 +603,7 @@ func (u *Upstream) executeExchange(ctx context.Context, req *dns.Msg) (*dns.Msg,
 	done := make(chan result, 1)
 
 	go func() {
-		resp, err := u.doExchange(ctx, req, targetAddr)
+		resp, err := u.doExchange(ctx, req, targetAddr, reqCtx)
 		done <- result{resp, err}
 	}()
 
@@ -553,7 +612,7 @@ func (u *Upstream) executeExchange(ctx context.Context, req *dns.Msg) (*dns.Msg,
 		return nil, time.Since(start), ctx.Err()
 	case r := <-done:
 		rtt := time.Since(start)
-		
+
 		// 2. Update Circuit Breaker & RTT
 		if r.err == nil && r.resp != nil {
 			u.recordSuccess()
@@ -562,12 +621,12 @@ func (u *Upstream) executeExchange(ctx context.Context, req *dns.Msg) (*dns.Msg,
 			// Record failure (Network error or Dial error)
 			u.recordFailure()
 		}
-		
+
 		return r.resp, rtt, r.err
 	}
 }
 
-func (u *Upstream) doExchange(ctx context.Context, req *dns.Msg, targetAddr string) (*dns.Msg, error) {
+func (u *Upstream) doExchange(ctx context.Context, req *dns.Msg, targetAddr string, reqCtx *RequestContext) (*dns.Msg, error) {
 	timeout := getTimeout()
 	insecure := config.Server.InsecureUpstream
 
@@ -578,21 +637,27 @@ func (u *Upstream) doExchange(ctx context.Context, req *dns.Msg, targetAddr stri
 		return resp, err
 
 	case "tcp", "dot":
-		return u.exchangeTCPPool(ctx, req, targetAddr, u.Proto == "dot", insecure)
+		return u.exchangeTCPPool(ctx, req, targetAddr, u.Proto == "dot", insecure, reqCtx)
 
 	case "doq":
-		return u.exchangeDoQ(ctx, req, targetAddr)
+		return u.exchangeDoQ(ctx, req, targetAddr, reqCtx)
 
 	case "doh", "doh3":
-		return u.exchangeDoH(ctx, req)
+		return u.exchangeDoH(ctx, req, reqCtx)
 	}
 
 	return nil, errors.New("unsupported protocol")
 }
 
-func (u *Upstream) exchangeTCPPool(ctx context.Context, req *dns.Msg, addr string, useTLS bool, insecure bool) (*dns.Msg, error) {
-	// Pool Key
+func (u *Upstream) exchangeTCPPool(ctx context.Context, req *dns.Msg, addr string, useTLS bool, insecure bool, reqCtx *RequestContext) (*dns.Msg, error) {
+	// Determine dynamic host (SNI)
+	dynamicHost, _ := u.getDynamicConfig(reqCtx)
+
+	// UPDATED: Pool Key must include dynamic SNI for DoT to prevent session reuse across IDs
 	poolKey := fmt.Sprintf("%s|%s", u.Proto, addr)
+	if useTLS {
+		poolKey = fmt.Sprintf("%s|%s|%s", u.Proto, addr, dynamicHost)
+	}
 
 	// 1. Try to get a connection from the pool
 	conn := tcpPool.Get(poolKey)
@@ -600,21 +665,20 @@ func (u *Upstream) exchangeTCPPool(ctx context.Context, req *dns.Msg, addr strin
 	// 2. If no connection, dial a new one
 	if conn == nil {
 		var err error
-		conn, err = u.dialTCP(addr, useTLS, insecure)
+		conn, err = u.dialTCP(addr, useTLS, insecure, dynamicHost)
 		if err != nil {
 			return nil, err
 		}
 	}
 
 	// 3. Perform Exchange
-	// We need to handle dead connections (write/read fails) by retrying once with a fresh connection
 	conn.SetDeadline(time.Now().Add(getTimeout()))
 
 	if err := conn.WriteMsg(req); err != nil {
 		conn.Close()
 		// Retry once with fresh connection
 		LogDebug("[UPSTREAM] Cached conn failed (%v), retrying dial...", err)
-		conn, err = u.dialTCP(addr, useTLS, insecure)
+		conn, err = u.dialTCP(addr, useTLS, insecure, dynamicHost)
 		if err != nil {
 			return nil, err
 		}
@@ -628,8 +692,6 @@ func (u *Upstream) exchangeTCPPool(ctx context.Context, req *dns.Msg, addr strin
 	resp, err := conn.ReadMsg()
 	if err != nil {
 		conn.Close()
-		// If the error was EOF on read, it might have been closed by server immediately.
-		// We could retry, but usually Write succeeds and Read fails means real issue.
 		return nil, err
 	}
 
@@ -639,7 +701,7 @@ func (u *Upstream) exchangeTCPPool(ctx context.Context, req *dns.Msg, addr strin
 	return resp, nil
 }
 
-func (u *Upstream) dialTCP(addr string, useTLS bool, insecure bool) (*dns.Conn, error) {
+func (u *Upstream) dialTCP(addr string, useTLS bool, insecure bool, sniHost string) (*dns.Conn, error) {
 	timeout := getTimeout()
 	if useTLS {
 		// DoT
@@ -648,14 +710,12 @@ func (u *Upstream) dialTCP(addr string, useTLS bool, insecure bool) (*dns.Conn, 
 			Timeout: timeout,
 			TLSConfig: &tls.Config{
 				InsecureSkipVerify: insecure,
-				ServerName:         u.Host,
+				ServerName:         sniHost, // Use dynamic SNI
 			},
 		}
-		// dns.Client.Dial returns a *dns.Conn
 		conn, err := c.Dial(addr)
 		if err != nil {
-			// UPDATED: LogWarn for DoT Dial failures
-			LogWarn("[UPSTREAM] DoT Dial failed to %s: %v", addr, err)
+			LogWarn("[UPSTREAM] DoT Dial failed to %s (SNI: %s): %v", addr, sniHost, err)
 			return nil, err
 		}
 		return conn, nil
@@ -665,26 +725,27 @@ func (u *Upstream) dialTCP(addr string, useTLS bool, insecure bool) (*dns.Conn, 
 	c := &dns.Client{Net: "tcp", Timeout: timeout}
 	conn, err := c.Dial(addr)
 	if err != nil {
-		// UPDATED: LogWarn for TCP Dial failures
 		LogWarn("[UPSTREAM] TCP Dial failed to %s: %v", addr, err)
 		return nil, err
 	}
 	return conn, nil
 }
 
-func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetAddr string) (*dns.Msg, error) {
+func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetAddr string, reqCtx *RequestContext) (*dns.Msg, error) {
 	insecure := config.Server.InsecureUpstream
+
+	// Determine dynamic SNI
+	dynamicHost, _ := u.getDynamicConfig(reqCtx)
 
 	tlsConf := &tls.Config{
 		InsecureSkipVerify: insecure,
-		ServerName:         u.Host,
+		ServerName:         dynamicHost, // Use dynamic SNI
 		NextProtos:         []string{"doq"},
 	}
 
 	sess, err := doqPool.Get(ctx, targetAddr, tlsConf)
 	if err != nil {
-		// UPDATED: LogWarn
-		LogWarn("[UPSTREAM] DoQ Dial/GetSession failed to %s: %v", targetAddr, err)
+		LogWarn("[UPSTREAM] DoQ Dial/GetSession failed to %s (SNI: %s): %v", targetAddr, dynamicHost, err)
 		return nil, err
 	}
 
@@ -737,13 +798,13 @@ func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetAddr str
 	resp := getMsg()
 
 	if err := resp.Unpack(respBuf); err != nil {
-		putMsg(resp) // Error case: can return immediately
+		putMsg(resp)
 		return nil, err
 	}
 	return resp, nil
 }
 
-func (u *Upstream) exchangeDoH(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
+func (u *Upstream) exchangeDoH(ctx context.Context, req *dns.Msg, reqCtx *RequestContext) (*dns.Msg, error) {
 	client := u.httpClient
 	if u.Proto == "doh3" {
 		client = u.h3Client
@@ -754,7 +815,10 @@ func (u *Upstream) exchangeDoH(ctx context.Context, req *dns.Msg) (*dns.Msg, err
 		return nil, err
 	}
 
-	urlStr := fmt.Sprintf("https://%s:%s%s", u.Host, u.Port, u.Path)
+	// UPDATED: Calculate dynamic host and path per request
+	dynHost, dynPath := u.getDynamicConfig(reqCtx)
+	urlStr := fmt.Sprintf("https://%s:%s%s", dynHost, u.Port, dynPath)
+
 	hReq, err := http.NewRequestWithContext(ctx, "POST", urlStr, bytes.NewReader(buf))
 	if err != nil {
 		return nil, err
@@ -763,28 +827,29 @@ func (u *Upstream) exchangeDoH(ctx context.Context, req *dns.Msg) (*dns.Msg, err
 	// Set required headers for DoH
 	hReq.Header.Set("Content-Type", "application/dns-message")
 	hReq.Header.Set("Accept", "application/dns-message")
-	hReq.Header.Set("User-Agent", "dproxy/1.0") // Add User-Agent to prevent 403
+	hReq.Header.Set("User-Agent", "dproxy/1.0")
+
+	// Note: We are not setting Host header explicitly, so net/http uses the URL host.
+	// Since we updated parseUpstream to remove ServerName from TLS config,
+	// the TLS SNI will also match this URL host.
 
 	hResp, err := client.Do(hReq)
 	if err != nil {
-		// UPDATED: LogWarn
 		LogWarn("[UPSTREAM] DoH/H3 Request failed to %s: %v", urlStr, err)
 		return nil, err
 	}
 	defer hResp.Body.Close()
 
 	if hResp.StatusCode != http.StatusOK {
-		// Read response body for better error context
 		bodyBytes, _ := io.ReadAll(hResp.Body)
 		bodyPreview := string(bodyBytes)
 		if len(bodyPreview) > 100 {
 			bodyPreview = bodyPreview[:100] + "..."
 		}
-		
+
 		err = fmt.Errorf("DoH error: %d (%s) - %s",
 			hResp.StatusCode, http.StatusText(hResp.StatusCode), bodyPreview)
-		
-		// UPDATED: LogWarn
+
 		LogWarn("[UPSTREAM] DoH/H3 HTTP error from %s: %v", urlStr, err)
 		return nil, err
 	}
@@ -794,7 +859,6 @@ func (u *Upstream) exchangeDoH(ctx context.Context, req *dns.Msg) (*dns.Msg, err
 		return nil, err
 	}
 
-	// OPTIMIZATION: Use message pool for the response
 	resp := getMsg()
 	if err := resp.Unpack(respBody); err != nil {
 		putMsg(resp)

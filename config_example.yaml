@@ -171,6 +171,7 @@ cache:
 routing:
   # 1. Upstream Groups
   # Define reusable lists of upstream DNS servers here.
+  # Supports {client-ip} and {client-mac} variables in URL Host and Path.
   upstream_groups:
     public_secure:
       - doh://cloudflare-dns.com/dns-query
