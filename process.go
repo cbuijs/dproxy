@@ -2,6 +2,7 @@
 File: process.go
 Description: Handles the core processing logic for DNS requests, including Singleflight, EDNS0 extraction,
              logging, response cleaning, and forwarding to upstreams with specific strategies.
+             UPDATED: Upstream failure logging promoted from Debug to Warn.
 */
 
 package main
@@ -291,7 +292,8 @@ func roundRobinStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream
 		}
 		
 		// If error (circuit open or network fail), continue loop
-		LogDebug("[STRATEGY] Round-Robin: Failed with %s: %v", u.String(), err)
+		// UPDATED: LogWarn for visibility
+		LogWarn("[STRATEGY] Round-Robin: Failed with %s: %v", u.String(), err)
 	}
 	
 	return nil, "", 0, fmt.Errorf("all upstreams failed or unhealthy in round-robin")
@@ -316,7 +318,8 @@ func randomStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*
 			LogDebug("[STRATEGY] Random: Success with %s (RTT: %v)", u.String(), rtt)
 			return resp, u.String(), rtt, nil
 		}
-		LogDebug("[STRATEGY] Random: Failed with %s: %v", u.String(), err)
+		// UPDATED: LogWarn
+		LogWarn("[STRATEGY] Random: Failed with %s: %v", u.String(), err)
 	}
 
 	return nil, "", 0, fmt.Errorf("all upstreams failed or unhealthy in random")
@@ -334,7 +337,8 @@ func failoverStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) 
 			LogDebug("[STRATEGY] Failover: Success with %s (RTT: %v)", u.String(), rtt)
 			return resp, u.String(), rtt, nil
 		}
-		LogDebug("[STRATEGY] Failover: Failed %s: %v", u.String(), err)
+		// UPDATED: LogWarn
+		LogWarn("[STRATEGY] Failover: Failed %s: %v", u.String(), err)
 	}
 	return nil, "", 0, errors.New("all upstreams failed or unhealthy in failover")
 }
@@ -465,7 +469,8 @@ func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (
 
 	resp, rtt, err := selectedUpstream.executeExchange(ctx, req)
 	if err != nil {
-		LogDebug("[STRATEGY] Fastest: Failed with %s: %v, trying alternatives", selectedUpstream.String(), err)
+		// UPDATED: LogWarn
+		LogWarn("[STRATEGY] Fastest: Failed with %s: %v, trying alternatives", selectedUpstream.String(), err)
 		for _, s := range stats {
 			if s.upstream == selectedUpstream { continue }
 			u := s.upstream
@@ -520,7 +525,8 @@ func raceStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*dn
 			
 			resp, rtt, err := upstream.executeExchange(ctx, req)
 			if err != nil {
-				LogDebug("[STRATEGY] Race: Upstream %s failed: %v", upstream.String(), err)
+				// UPDATED: LogWarn
+				LogWarn("[STRATEGY] Race: Upstream %s failed: %v", upstream.String(), err)
 			} else {
 				LogDebug("[STRATEGY] Race: Upstream %s responded in %v", upstream.String(), rtt)
 			}

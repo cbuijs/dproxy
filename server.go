@@ -1,6 +1,7 @@
 /*
 File: server.go
 Description: Implements the protocol listeners (UDP, TCP, DoT, DoQ, DoH/DoH3) and request handlers.
+             UPDATED: Enhanced logging for failed connection attempts and protocol errors.
 */
 
 package main
@@ -110,8 +111,8 @@ func (w *DoTServerWrapper) acceptLoop() {
 			case <-w.quit:
 				return // Normal shutdown
 			default:
-				// Only log real errors, not closed listener errors during shutdown
-				LogDebug("DoT Accept error: %v", err)
+				// Log real errors as Warn to ensure visibility of listener issues
+				LogWarn("DoT Accept error: %v", err)
 				continue
 			}
 		}
@@ -244,7 +245,8 @@ func startServers(wg *sync.WaitGroup, tlsConfig *tls.Config) []ServerShutdowner 
 					case <-doqCtx.Done():
 						return
 					default:
-						LogError("DoQ accept error: %v", err)
+						// Log as Warn to track connection issues
+						LogWarn("DoQ accept error: %v", err)
 						continue
 					}
 				}
@@ -301,6 +303,7 @@ func getTimeout() time.Duration {
 
 func handleDoTConnection(conn net.Conn) {
 	defer conn.Close()
+	remoteAddr := conn.RemoteAddr()
 
 	// TLS Handshake to get SNI
 	tlsConn, ok := conn.(*tls.Conn)
@@ -311,7 +314,8 @@ func handleDoTConnection(conn net.Conn) {
 	// Handshake timeout
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
 	if err := tlsConn.Handshake(); err != nil {
-		LogDebug("DoT Handshake failed: %v", err)
+		// UPDATED: LogWarn for visibility
+		LogWarn("DoT Handshake failed from %v: %v", remoteAddr, err)
 		return
 	}
 
@@ -333,7 +337,8 @@ func handleDoTConnection(conn net.Conn) {
 		req, err := dconn.ReadMsg()
 		if err != nil {
 			if err != io.EOF {
-				LogDebug("DoT Read error: %v", err)
+				// UPDATED: LogWarn for read errors (protocol violations, early closes)
+				LogWarn("DoT Read error from %v: %v", remoteAddr, err)
 			}
 			return
 		}
@@ -355,6 +360,7 @@ func handleDoTConnection(conn net.Conn) {
 func handleDoH(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), getTimeout())
 	defer cancel()
+	remoteAddr := r.RemoteAddr
 
 	// --- PATH VALIDATION LOGIC ---
 	if config.Server.DOH.StrictPath {
@@ -366,6 +372,7 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if !allowed {
+			LogWarn("DoH Path mismatch from %s: %s", remoteAddr, r.URL.Path)
 			http.Error(w, "Not Found", http.StatusNotFound)
 			return
 		}
@@ -385,6 +392,7 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
 		if r.Header.Get("Content-Type") != "application/dns-message" {
+			LogWarn("DoH Invalid Content-Type from %s: %s", remoteAddr, r.Header.Get("Content-Type"))
 			http.Error(w, "Unsupported Media Type", http.StatusUnsupportedMediaType)
 			return
 		}
@@ -393,21 +401,25 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		b64str := r.URL.Query().Get("dns")
 		if b64str == "" {
+			LogWarn("DoH Missing 'dns' param from %s", remoteAddr)
 			http.Error(w, "Missing dns parameter", http.StatusBadRequest)
 			return
 		}
 		data, e := base64.RawURLEncoding.DecodeString(b64str)
 		if e != nil {
+			LogWarn("DoH Invalid Base64 from %s: %v", remoteAddr, e)
 			http.Error(w, "Invalid base64", http.StatusBadRequest)
 			return
 		}
 		err = msg.Unpack(data)
 	default:
+		LogWarn("DoH Invalid Method from %s: %s", remoteAddr, r.Method)
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	if err != nil {
+		LogWarn("DoH Unpack failed from %s: %v", remoteAddr, err)
 		http.Error(w, "Bad Request", http.StatusBadRequest)
 		return
 	}
@@ -427,10 +439,13 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 func handleDoQSession(sess quic.Connection) {
 	sni := sess.ConnectionState().TLS.ServerName
 	localAddr := sess.LocalAddr()
+	remoteAddr := sess.RemoteAddr()
 
 	for {
 		stream, err := sess.AcceptStream(context.Background())
 		if err != nil {
+			// UPDATED: Log stream accept failures (could be connection teardown or protocol error)
+			LogWarn("DoQ AcceptStream error from %v: %v", remoteAddr, err)
 			return
 		}
 		go func(str quic.Stream) {
@@ -441,6 +456,8 @@ func handleDoQSession(sess quic.Connection) {
 
 			lBuf := make([]byte, 2)
 			if _, err := io.ReadFull(str, lBuf); err != nil {
+				// UPDATED: Log read failures
+				LogWarn("DoQ Read length failed from %v: %v", remoteAddr, err)
 				return
 			}
 			length := binary.BigEndian.Uint16(lBuf)
@@ -454,6 +471,7 @@ func handleDoQSession(sess quic.Connection) {
 			defer bufPool.Put(buf)
 
 			if _, err := io.ReadFull(str, buf); err != nil {
+				LogWarn("DoQ Read body failed from %v: %v", remoteAddr, err)
 				return
 			}
 			
@@ -462,6 +480,7 @@ func handleDoQSession(sess quic.Connection) {
 			defer putMsg(msg)
 			
 			if err := msg.Unpack(buf); err != nil {
+				LogWarn("DoQ Unpack failed from %v: %v", remoteAddr, err)
 				return
 			}
 

@@ -2,6 +2,7 @@
 File: upstream.go
 Description: Defines the Upstream struct and handles downstream connection logic, pooling, and protocol-specific exchanges.
              Includes Circuit Breaker logic to handle failing upstreams efficiently.
+             UPDATED: Added explicit error logging for connection failures.
 */
 
 package main
@@ -651,12 +652,24 @@ func (u *Upstream) dialTCP(addr string, useTLS bool, insecure bool) (*dns.Conn, 
 			},
 		}
 		// dns.Client.Dial returns a *dns.Conn
-		return c.Dial(addr)
+		conn, err := c.Dial(addr)
+		if err != nil {
+			// UPDATED: LogWarn for DoT Dial failures
+			LogWarn("[UPSTREAM] DoT Dial failed to %s: %v", addr, err)
+			return nil, err
+		}
+		return conn, nil
 	}
 
 	// Plain TCP
 	c := &dns.Client{Net: "tcp", Timeout: timeout}
-	return c.Dial(addr)
+	conn, err := c.Dial(addr)
+	if err != nil {
+		// UPDATED: LogWarn for TCP Dial failures
+		LogWarn("[UPSTREAM] TCP Dial failed to %s: %v", addr, err)
+		return nil, err
+	}
+	return conn, nil
 }
 
 func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetAddr string) (*dns.Msg, error) {
@@ -670,6 +683,8 @@ func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetAddr str
 
 	sess, err := doqPool.Get(ctx, targetAddr, tlsConf)
 	if err != nil {
+		// UPDATED: LogWarn
+		LogWarn("[UPSTREAM] DoQ Dial/GetSession failed to %s: %v", targetAddr, err)
 		return nil, err
 	}
 
@@ -752,6 +767,8 @@ func (u *Upstream) exchangeDoH(ctx context.Context, req *dns.Msg) (*dns.Msg, err
 
 	hResp, err := client.Do(hReq)
 	if err != nil {
+		// UPDATED: LogWarn
+		LogWarn("[UPSTREAM] DoH/H3 Request failed to %s: %v", urlStr, err)
 		return nil, err
 	}
 	defer hResp.Body.Close()
@@ -763,9 +780,13 @@ func (u *Upstream) exchangeDoH(ctx context.Context, req *dns.Msg) (*dns.Msg, err
 		if len(bodyPreview) > 100 {
 			bodyPreview = bodyPreview[:100] + "..."
 		}
-
-		return nil, fmt.Errorf("DoH error: %d (%s) - %s",
+		
+		err = fmt.Errorf("DoH error: %d (%s) - %s",
 			hResp.StatusCode, http.StatusText(hResp.StatusCode), bodyPreview)
+		
+		// UPDATED: LogWarn
+		LogWarn("[UPSTREAM] DoH/H3 HTTP error from %s: %v", urlStr, err)
+		return nil, err
 	}
 
 	respBody, err := io.ReadAll(hResp.Body)
