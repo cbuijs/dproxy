@@ -57,6 +57,7 @@ func (u *Upstream) updateRTT(d time.Duration, rcode int) {
 	atomic.StoreInt64(&u.lastProbe, time.Now().UnixNano())
 
 	// Only update RTT for successful responses (NOERROR)
+	// NXDOMAIN, SERVFAIL, etc. can have different latency characteristics
 	if rcode != 0 { // dns.RcodeSuccess == 0
 		return
 	}
@@ -370,7 +371,7 @@ func parseUpstream(raw string, ipVersion string, insecure bool, timeout string) 
 func resolveHostnameWithBootstrap(hostname string, preferredVersion string) ([]net.IP, error) {
 	// Check cache first
 	if cachedIPs, found := getBootstrapCache(hostname); found {
-		LogDebug("[BOOTSTRAP] Using cached resolution for %s: %v (age: %v)",
+		LogDebug("[BOOTSTRAP] Using cached resolution for %s: %v (age: %v)", 
 			hostname, cachedIPs, time.Since(bootstrapCache[hostname].timestamp).Round(time.Second))
 		return cachedIPs, nil
 	}
@@ -383,69 +384,58 @@ func resolveHostnameWithBootstrap(hostname string, preferredVersion string) ([]n
 		version = config.Bootstrap.IPVersion
 	}
 
-	useIPv4 := version == "ipv4" || version == "both"
-	useIPv6 := version == "ipv6" || version == "both"
+	// Determine which record types to query
+	var qTypes []uint16
+	if version == "ipv4" || version == "both" {
+		qTypes = append(qTypes, dns.TypeA)
+	}
+	if version == "ipv6" || version == "both" {
+		qTypes = append(qTypes, dns.TypeAAAA)
+	}
 
 	LogDebug("[BOOTSTRAP] Resolving hostname: %s (IP version: %s)", hostname, version)
 
+	// Iterate over bootstrap servers
 	for i, bootstrap := range bootstrapServers {
-		LogDebug("[BOOTSTRAP] Attempting resolution via bootstrap server [%d/%d]: %s",
+		LogDebug("[BOOTSTRAP] Attempting resolution via bootstrap server [%d/%d]: %s", 
 			i+1, len(bootstrapServers), bootstrap)
 
 		c := &dns.Client{Net: "udp", Timeout: 3 * time.Second}
 
-		if useIPv4 {
-			// OPTIMIZATION: Use message pool
+		// Iterate over record types (A, AAAA) to avoid code duplication
+		for _, qType := range qTypes {
 			msg := getMsg()
-			msg.SetQuestion(dns.Fqdn(hostname), dns.TypeA)
+			msg.SetQuestion(dns.Fqdn(hostname), qType)
 
-			LogDebug("[BOOTSTRAP] Querying %s for %s (A record)", bootstrap, hostname)
+			typeName := dns.TypeToString[qType]
+			LogDebug("[BOOTSTRAP] Querying %s for %s (%s record)", bootstrap, hostname, typeName)
+			
 			resp, rtt, err := c.Exchange(msg, bootstrap)
 			putMsg(msg) // Release request message
 
 			if err == nil && resp != nil {
-				LogDebug("[BOOTSTRAP] Response from %s for %s: %d answers (RTT: %v)",
-					bootstrap, hostname, len(resp.Answer), rtt)
-
+				LogDebug("[BOOTSTRAP] Response from %s for %s (%s): %d answers (RTT: %v)", 
+					bootstrap, hostname, typeName, len(resp.Answer), rtt)
+				
 				for _, ans := range resp.Answer {
-					if a, ok := ans.(*dns.A); ok {
-						allIPs = append(allIPs, a.A)
-						LogDebug("[BOOTSTRAP]   Found A record: %s → %s", hostname, a.A.String())
+					switch r := ans.(type) {
+					case *dns.A:
+						allIPs = append(allIPs, r.A)
+						LogDebug("[BOOTSTRAP]   Found A record: %s → %s", hostname, r.A.String())
+					case *dns.AAAA:
+						allIPs = append(allIPs, r.AAAA)
+						LogDebug("[BOOTSTRAP]   Found AAAA record: %s → %s", hostname, r.AAAA.String())
 					}
 				}
 			} else {
 				lastErr = err
-				LogDebug("[BOOTSTRAP] Failed to resolve %s (A) via %s: %v", hostname, bootstrap, err)
+				LogDebug("[BOOTSTRAP] Failed to resolve %s (%s) via %s: %v", hostname, typeName, bootstrap, err)
 			}
 		}
 
-		if useIPv6 {
-			// OPTIMIZATION: Use message pool
-			msg := getMsg()
-			msg.SetQuestion(dns.Fqdn(hostname), dns.TypeAAAA)
-
-			LogDebug("[BOOTSTRAP] Querying %s for %s (AAAA record)", bootstrap, hostname)
-			resp, rtt, err := c.Exchange(msg, bootstrap)
-			putMsg(msg) // Release request message
-
-			if err == nil && resp != nil {
-				LogDebug("[BOOTSTRAP] Response from %s for %s: %d answers (RTT: %v)",
-					bootstrap, hostname, len(resp.Answer), rtt)
-
-				for _, ans := range resp.Answer {
-					if aaaa, ok := ans.(*dns.AAAA); ok {
-						allIPs = append(allIPs, aaaa.AAAA)
-						LogDebug("[BOOTSTRAP]   Found AAAA record: %s → %s", hostname, aaaa.AAAA.String())
-					}
-				}
-			} else {
-				lastErr = err
-				LogDebug("[BOOTSTRAP] Failed to resolve %s (AAAA) via %s: %v", hostname, bootstrap, err)
-			}
-		}
-
+		// If we found any IPs using this server, stop and return them.
 		if len(allIPs) > 0 {
-			LogDebug("[BOOTSTRAP] Successfully resolved %s to %d IP(s) using %s",
+			LogDebug("[BOOTSTRAP] Successfully resolved %s to %d IP(s) using %s", 
 				hostname, len(allIPs), bootstrap)
 			break
 		}
@@ -462,9 +452,9 @@ func resolveHostnameWithBootstrap(hostname string, preferredVersion string) ([]n
 
 	// Cache the successful resolution
 	setBootstrapCache(hostname, allIPs)
-	LogDebug("[BOOTSTRAP] Resolution complete for %s: %v (cached for %v)",
+	LogDebug("[BOOTSTRAP] Resolution complete for %s: %v (cached for %v)", 
 		hostname, allIPs, bootstrapCacheTTL)
-
+	
 	return allIPs, nil
 }
 

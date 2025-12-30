@@ -1,6 +1,7 @@
 /*
 File: cache.go
 Description: Thread-safe in-memory DNS cache using O(1) LRU eviction.
+OPTIMIZED: Stores packed []byte instead of *dns.Msg to reduce GC pressure and memory usage.
 */
 
 package main
@@ -16,7 +17,7 @@ import (
 
 type CacheItem struct {
 	Key        string
-	Msg        *dns.Msg
+	MsgBytes   []byte // CHANGED: Store raw bytes
 	Expiration time.Time
 }
 
@@ -45,7 +46,6 @@ func maintainDNSCache(ctx context.Context) {
 	LogInfo("[CACHE] Starting maintenance (Capacity: %d, Type: LRU)", config.Cache.Size)
 
 	// Ticker for strictly expired items (cleanup)
-	// The LRU handles capacity eviction; this handles TTL expiration cleanup
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 
@@ -73,9 +73,6 @@ func getFromCache(key string, reqID uint16) *dns.Msg {
 		return nil
 	}
 
-	// Move to front (Mark as recently used)
-	dnsCache.lruList.MoveToFront(elem)
-
 	entry := elem.Value.(*CacheItem)
 
 	// Check TTL
@@ -87,11 +84,26 @@ func getFromCache(key string, reqID uint16) *dns.Msg {
 		return nil
 	}
 
-	msg := entry.Msg.Copy()
-	msg.Id = reqID
+	// Move to front (Mark as recently used)
+	dnsCache.lruList.MoveToFront(elem)
 
+	// Unpack from bytes to a fresh message
+	// We use the pool from main.go
+	msg := getMsg()
+	if err := msg.Unpack(entry.MsgBytes); err != nil {
+		// If unpack fails (corruption?), invalidate entry
+		dnsCache.lruList.Remove(elem)
+		delete(dnsCache.items, key)
+		putMsg(msg)
+		return nil
+	}
+
+	msg.Id = reqID
+	
+	// Adjust TTLs
 	ttlDiff := uint32(entry.Expiration.Sub(now).Seconds())
 	if ttlDiff <= 0 {
+		putMsg(msg) // Should have been caught by expiration check, but safety first
 		return nil
 	}
 
@@ -145,15 +157,28 @@ func addToCache(key string, msg *dns.Msg) {
 		return
 	}
 
+	// PACK the message before locking
+	packed, err := msg.Pack()
+	if err != nil {
+		return
+	}
+	
+	// Create a copy of the slice to ensure we own the memory and it fits tightly
+	// (Pack might return a slice of a larger array buffer)
+	finalBytes := make([]byte, len(packed))
+	copy(finalBytes, packed)
+
 	dnsCache.Lock()
 	defer dnsCache.Unlock()
+
+	expiration := time.Now().Add(time.Duration(minTTL) * time.Second)
 
 	// Check if update or new
 	if elem, found := dnsCache.items[key]; found {
 		dnsCache.lruList.MoveToFront(elem)
 		entry := elem.Value.(*CacheItem)
-		entry.Msg = msg
-		entry.Expiration = time.Now().Add(time.Duration(minTTL) * time.Second)
+		entry.MsgBytes = finalBytes // Store bytes
+		entry.Expiration = expiration
 		return
 	}
 
@@ -169,8 +194,8 @@ func addToCache(key string, msg *dns.Msg) {
 	// Add new
 	item := &CacheItem{
 		Key:        key,
-		Msg:        msg,
-		Expiration: time.Now().Add(time.Duration(minTTL) * time.Second),
+		MsgBytes:   finalBytes, // Store bytes
+		Expiration: expiration,
 	}
 	elem := dnsCache.lruList.PushFront(item)
 	dnsCache.items[key] = elem
@@ -184,8 +209,6 @@ func pruneExpired() {
 	cleaned := 0
 	
 	// Check the oldest 50 items from the tail
-	// Since LRU is access-based, the tail contains the least recently used, 
-	// which are good candidates for being expired as well.
 	for i := 0; i < 50; i++ {
 		elem := dnsCache.lruList.Back()
 		if elem == nil {
@@ -197,7 +220,6 @@ func pruneExpired() {
 			delete(dnsCache.items, entry.Key)
 			cleaned++
 		} else {
-			// If the tail item isn't expired, we stop to avoid scanning the whole list
 			break
 		}
 	}

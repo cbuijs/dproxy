@@ -59,6 +59,10 @@ var reqCtxPool = sync.Pool{
 	},
 }
 
+// Global semaphore to limit concurrent race strategy goroutines
+// 256 concurrent racers is plenty for a small router/server
+var raceLimiter = make(chan struct{}, 256)
+
 // --- Result type for singleflight ---
 
 type queryResult struct {
@@ -470,8 +474,19 @@ func raceStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*dn
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	resCh := make(chan result, len(upstreams))
+
 	for _, u := range upstreams {
+		// Acquire semaphore to prevent goroutine explosion
+		select {
+		case raceLimiter <- struct{}{}:
+			// Acquired
+		case <-ctx.Done():
+			return nil, "", 0, ctx.Err()
+		}
+
 		go func(upstream *Upstream) {
+			defer func() { <-raceLimiter }() // Release semaphore
+			
 			resp, rtt, err := upstream.executeExchange(ctx, req)
 			if err != nil {
 				LogDebug("[STRATEGY] Race: Upstream %s failed: %v", upstream.String(), err)
@@ -484,6 +499,7 @@ func raceStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*dn
 			}
 		}(u)
 	}
+
 	var lastErr error
 	successCount := 0
 	for i := 0; i < len(upstreams); i++ {
@@ -493,6 +509,7 @@ func raceStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*dn
 				successCount++
 				if successCount == 1 {
 					LogDebug("[STRATEGY] Race: Winner is %s (RTT: %v)", res.name, res.rtt)
+					// Cancel immediately stops other racers
 					cancel()
 					return res.msg, res.name, res.rtt, nil
 				}

@@ -1,6 +1,7 @@
 /*
 File: routing.go
 Description: High-performance routing logic using Domain Trie (Radix-style) for rapid lookups.
+OPTIMIZED: Uses lazy map initialization to save memory on sparse nodes.
 */
 
 package main
@@ -20,8 +21,9 @@ type TrieNode struct {
 	Wildcard *RoutingRule // Non-nil if a *.domain rule exists here
 }
 
+// NewTrieNode returns a new node without allocating the map (lazy init)
 func NewTrieNode() *TrieNode {
-	return &TrieNode{Children: make(map[string]*TrieNode)}
+	return &TrieNode{}
 }
 
 type DomainTrie struct {
@@ -56,6 +58,11 @@ func (t *DomainTrie) Insert(domain string, rule *RoutingRule) {
 			continue
 		}
 
+		// Lazy Initialization of Children map
+		if node.Children == nil {
+			node.Children = make(map[string]*TrieNode)
+		}
+
 		if node.Children[part] == nil {
 			node.Children[part] = NewTrieNode()
 		}
@@ -88,6 +95,11 @@ func (t *DomainTrie) Search(qName string) *RoutingRule {
 		// Before moving down, check if current node has a wildcard that applies to the rest
 		if node.Wildcard != nil {
 			lastValidRule = node.Wildcard
+		}
+
+		// Optimization: If no children map exists, we can't go deeper
+		if node.Children == nil {
+			return lastValidRule
 		}
 
 		next, ok := node.Children[part]
