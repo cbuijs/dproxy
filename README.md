@@ -5,7 +5,7 @@ Steps to compile:
 git clone https://github.com/cbuijs/dproxy.git
 cd dproxy
 go mod tidy
-go build -v -x -o dproxy
+go build -v -x -ldflags="-s -w" -o dproxy
 chmod +x dproxy
 ./dproxy -h
 ```
