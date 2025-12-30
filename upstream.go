@@ -1,6 +1,7 @@
 /*
 File: upstream.go
 Description: Defines the Upstream struct and handles downstream connection logic, pooling, and protocol-specific exchanges.
+             Includes Circuit Breaker logic to handle failing upstreams efficiently.
 */
 
 package main
@@ -27,6 +28,12 @@ import (
 	"github.com/quic-go/quic-go/http3"
 )
 
+// Circuit Breaker Constants
+const (
+	cbFailureThreshold = 3               // Number of failures before opening circuit
+	cbProbeInterval    = 30 * time.Second // Time to wait before probing an open circuit
+)
+
 type Upstream struct {
 	URL         *url.URL
 	Proto       string
@@ -39,6 +46,11 @@ type Upstream struct {
 	lastProbe   int64 // Unix timestamp in nanoseconds
 	httpClient  *http.Client
 	h3Client    *http.Client
+
+	// Circuit Breaker State
+	cbFailures  atomic.Uint32
+	cbOpen      atomic.Bool  // true = Open (Unhealthy), false = Closed (Healthy)
+	cbNextProbe atomic.Int64 // UnixNano timestamp when next probe is allowed
 }
 
 func (u *Upstream) String() string {
@@ -48,6 +60,56 @@ func (u *Upstream) String() string {
 	}
 	return s
 }
+
+// --- Circuit Breaker Logic ---
+
+// IsHealthy returns true if the upstream is healthy (Circuit Closed) 
+// or if it is time to probe (Circuit Open but interval passed).
+func (u *Upstream) IsHealthy() bool {
+	// If circuit is closed, it's healthy
+	if !u.cbOpen.Load() {
+		return true
+	}
+	
+	// If circuit is open, check if we are allowed to probe (Half-Open state)
+	if time.Now().UnixNano() >= u.cbNextProbe.Load() {
+		LogDebug("[CIRCUIT] Upstream %s entering HALF-OPEN state (Probing)", u.String())
+		return true 
+	}
+	
+	return false
+}
+
+func (u *Upstream) recordSuccess() {
+	// Reset failures on success
+	u.cbFailures.Store(0)
+	
+	// If circuit was open, close it
+	if u.cbOpen.Load() {
+		u.cbOpen.Store(false)
+		LogInfo("[CIRCUIT] Upstream %s recovered (Circuit Closed)", u.String())
+	}
+}
+
+func (u *Upstream) recordFailure() {
+	newFailures := u.cbFailures.Add(1)
+	
+	// Check if we hit the threshold to open the circuit
+	if newFailures >= cbFailureThreshold {
+		// Only log if we are transitioning from Closed to Open
+		if !u.cbOpen.Swap(true) {
+			LogWarn("[CIRCUIT] Upstream %s failed %d times. Circuit OPEN. Backoff %v", u.String(), newFailures, cbProbeInterval)
+		}
+		// Reset/Extend the probe timer
+		u.cbNextProbe.Store(time.Now().Add(cbProbeInterval).UnixNano())
+	} else if u.cbOpen.Load() {
+		// If already open (probing failed), push back next probe
+		LogDebug("[CIRCUIT] Upstream %s probe failed. Circuit remains OPEN. Backoff extended %v", u.String(), cbProbeInterval)
+		u.cbNextProbe.Store(time.Now().Add(cbProbeInterval).UnixNano())
+	}
+}
+
+// --- Metrics ---
 
 func (u *Upstream) updateRTT(d time.Duration, rcode int) {
 	newVal := int64(d)
@@ -461,6 +523,11 @@ func resolveHostnameWithBootstrap(hostname string, preferredVersion string) ([]n
 // --- Exchange ---
 
 func (u *Upstream) executeExchange(ctx context.Context, req *dns.Msg) (*dns.Msg, time.Duration, error) {
+	// 1. Circuit Breaker Check
+	if !u.IsHealthy() {
+		return nil, 0, fmt.Errorf("circuit open for %s", u.String())
+	}
+
 	start := time.Now()
 
 	targetHost := u.Host
@@ -485,9 +552,16 @@ func (u *Upstream) executeExchange(ctx context.Context, req *dns.Msg) (*dns.Msg,
 		return nil, time.Since(start), ctx.Err()
 	case r := <-done:
 		rtt := time.Since(start)
+		
+		// 2. Update Circuit Breaker & RTT
 		if r.err == nil && r.resp != nil {
+			u.recordSuccess()
 			u.updateRTT(rtt, r.resp.Rcode)
+		} else {
+			// Record failure (Network error or Dial error)
+			u.recordFailure()
 		}
+		
 		return r.resp, rtt, r.err
 	}
 }

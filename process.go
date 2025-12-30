@@ -270,59 +270,64 @@ func forwardToUpstreams(ctx context.Context, req *dns.Msg, upstreams []*Upstream
 }
 
 func roundRobinStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*dns.Msg, string, time.Duration, error) {
-	idx := rrCounter.Add(1) - 1
-	selected := int(idx) % len(upstreams)
-	u := upstreams[selected]
-	
-	LogDebug("[STRATEGY] Round-Robin: Selected #%d/%d: %s", selected+1, len(upstreams), u.String())
-	
-	resp, rtt, err := u.executeExchange(ctx, req)
-	if err != nil {
-		LogDebug("[STRATEGY] Round-Robin: Failed with %s: %v, trying failover", u.String(), err)
-		for i := 1; i < len(upstreams); i++ {
-			nextIdx := (selected + i) % len(upstreams)
-			u = upstreams[nextIdx]
-			LogDebug("[STRATEGY] Round-Robin Failover: Trying #%d/%d: %s", nextIdx+1, len(upstreams), u.String())
-			resp, rtt, err = u.executeExchange(ctx, req)
-			if err == nil {
-				LogDebug("[STRATEGY] Round-Robin Failover: Success with %s (RTT: %v)", u.String(), rtt)
-				return resp, u.String(), rtt, nil
-			}
-			LogDebug("[STRATEGY] Round-Robin Failover: Failed with %s: %v", u.String(), err)
+	startIdx := rrCounter.Add(1) - 1
+	n := len(upstreams)
+
+	// Try all upstreams, starting from startIdx
+	for i := 0; i < n; i++ {
+		idx := (int(startIdx) + i) % n
+		u := upstreams[idx]
+
+		// Skip unhealthy upstreams (unless it's time to probe, which IsHealthy returns true for)
+		if !u.IsHealthy() {
+			continue
 		}
-		return nil, "", 0, fmt.Errorf("all upstreams failed in round-robin")
+
+		LogDebug("[STRATEGY] Round-Robin: Selected #%d/%d: %s", idx+1, n, u.String())
+		resp, rtt, err := u.executeExchange(ctx, req)
+		if err == nil {
+			LogDebug("[STRATEGY] Round-Robin: Success with %s (RTT: %v)", u.String(), rtt)
+			return resp, u.String(), rtt, nil
+		}
+		
+		// If error (circuit open or network fail), continue loop
+		LogDebug("[STRATEGY] Round-Robin: Failed with %s: %v", u.String(), err)
 	}
-	LogDebug("[STRATEGY] Round-Robin: Success with %s (RTT: %v)", u.String(), rtt)
-	return resp, u.String(), rtt, nil
+	
+	return nil, "", 0, fmt.Errorf("all upstreams failed or unhealthy in round-robin")
 }
 
 func randomStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*dns.Msg, string, time.Duration, error) {
-	idx := rand.IntN(len(upstreams))
-	u := upstreams[idx]
-	LogDebug("[STRATEGY] Random: Selected #%d/%d: %s", idx+1, len(upstreams), u.String())
-	resp, rtt, err := u.executeExchange(ctx, req)
-	if err != nil {
-		LogDebug("[STRATEGY] Random: Failed with %s: %v, trying others", u.String(), err)
-		for i := 1; i < len(upstreams); i++ {
-			nextIdx := (idx + i) % len(upstreams)
-			u = upstreams[nextIdx]
-			LogDebug("[STRATEGY] Random Failover: Trying #%d/%d: %s", nextIdx+1, len(upstreams), u.String())
-			resp, rtt, err = u.executeExchange(ctx, req)
-			if err == nil {
-				LogDebug("[STRATEGY] Random Failover: Success with %s (RTT: %v)", u.String(), rtt)
-				return resp, u.String(), rtt, nil
-			}
-			LogDebug("[STRATEGY] Random Failover: Failed with %s: %v", u.String(), err)
+	n := len(upstreams)
+	startIdx := rand.IntN(n)
+
+	// Same loop logic as Round-Robin, just different start point
+	for i := 0; i < n; i++ {
+		idx := (startIdx + i) % n
+		u := upstreams[idx]
+
+		if !u.IsHealthy() {
+			continue
 		}
-		return nil, "", 0, fmt.Errorf("all upstreams failed in random")
+
+		LogDebug("[STRATEGY] Random: Trying #%d/%d: %s", idx+1, n, u.String())
+		resp, rtt, err := u.executeExchange(ctx, req)
+		if err == nil {
+			LogDebug("[STRATEGY] Random: Success with %s (RTT: %v)", u.String(), rtt)
+			return resp, u.String(), rtt, nil
+		}
+		LogDebug("[STRATEGY] Random: Failed with %s: %v", u.String(), err)
 	}
-	LogDebug("[STRATEGY] Random: Success with %s (RTT: %v)", u.String(), rtt)
-	return resp, u.String(), rtt, nil
+
+	return nil, "", 0, fmt.Errorf("all upstreams failed or unhealthy in random")
 }
 
 func failoverStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*dns.Msg, string, time.Duration, error) {
-	LogDebug("[STRATEGY] Failover: Starting sequence with %d upstreams", len(upstreams))
 	for i, u := range upstreams {
+		if !u.IsHealthy() {
+			continue
+		}
+
 		LogDebug("[STRATEGY] Failover: Attempting #%d/%d: %s", i+1, len(upstreams), u.String())
 		resp, rtt, err := u.executeExchange(ctx, req)
 		if err == nil {
@@ -331,8 +336,7 @@ func failoverStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) 
 		}
 		LogDebug("[STRATEGY] Failover: Failed %s: %v", u.String(), err)
 	}
-	LogDebug("[STRATEGY] Failover: All %d upstreams failed", len(upstreams))
-	return nil, "", 0, errors.New("all upstreams failed in failover")
+	return nil, "", 0, errors.New("all upstreams failed or unhealthy in failover")
 }
 
 func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*dns.Msg, string, time.Duration, error) {
@@ -352,17 +356,30 @@ func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (
 		index        int
 	}
 	
-	stats := make([]upstreamStat, len(upstreams))
+	stats := make([]upstreamStat, 0, len(upstreams))
 	for i, u := range upstreams {
+		// Filter out unhealthy upstreams BEFORE sorting/stats to avoid picking dead ones
+		if !u.IsHealthy() {
+			continue
+		}
+
 		rtt := u.getRTT()
 		lastProbe := u.getLastProbeTime()
-		stats[i] = upstreamStat{
+		stats = append(stats, upstreamStat{
 			upstream:   u,
 			rtt:        rtt,
 			lastProbed: lastProbe,
 			isStale:    rtt > 0 && now.Sub(lastProbe) > staleThreshold,
 			index:      i,
-		}
+		})
+	}
+
+	if len(stats) == 0 {
+		// All upstreams unhealthy. Try to force one?
+		// Logic: If all are unhealthy, IsHealthy() returns false.
+		// If enough time passed, IsHealthy returns true (Half-Open).
+		// So if we are here, ALL upstreams are dead and Cooling Down.
+		return nil, "", 0, errors.New("all upstreams are unhealthy (circuit open)")
 	}
 
 	sort.Slice(stats, func(i, j int) bool {
@@ -431,6 +448,7 @@ func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (
 				probeMsg.RecursionDesired = true
 				probeCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 				defer cancel()
+				// This call will fail fast if circuit is open, or proceed if half-open
 				u.executeExchange(probeCtx, probeMsg)
 			}(s.upstream)
 		}
@@ -464,7 +482,20 @@ func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (
 }
 
 func raceStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*dns.Msg, string, time.Duration, error) {
-	LogDebug("[STRATEGY] Race: Starting race among %d upstreams", len(upstreams))
+	// Filter healthy upstreams first to avoid spawning useless goroutines
+	candidates := make([]*Upstream, 0, len(upstreams))
+	for _, u := range upstreams {
+		if u.IsHealthy() {
+			candidates = append(candidates, u)
+		}
+	}
+
+	if len(candidates) == 0 {
+		return nil, "", 0, errors.New("all upstreams are unhealthy (circuit open)")
+	}
+
+	LogDebug("[STRATEGY] Race: Starting race among %d upstreams (filtered from %d)", len(candidates), len(upstreams))
+	
 	type result struct {
 		msg  *dns.Msg
 		name string
@@ -473,9 +504,9 @@ func raceStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*dn
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	resCh := make(chan result, len(upstreams))
+	resCh := make(chan result, len(candidates))
 
-	for _, u := range upstreams {
+	for _, u := range candidates {
 		// Acquire semaphore to prevent goroutine explosion
 		select {
 		case raceLimiter <- struct{}{}:
@@ -502,7 +533,7 @@ func raceStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream) (*dn
 
 	var lastErr error
 	successCount := 0
-	for i := 0; i < len(upstreams); i++ {
+	for i := 0; i < len(candidates); i++ {
 		select {
 		case res := <-resCh:
 			if res.err == nil {
