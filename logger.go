@@ -18,7 +18,11 @@ import (
 )
 
 // Global logger instance
-var logger *slog.Logger
+// FIXED: Initialize with a default stderr logger so calls before InitLogger are not lost.
+// Using Stderr is standard for logs to separate from potential stdout data.
+var logger *slog.Logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+	Level: slog.LevelInfo,
+}))
 
 // InitLogger initializes the global logger based on the provided configuration.
 func InitLogger(cfg LoggingConfig) error {
@@ -27,7 +31,8 @@ func InitLogger(cfg LoggingConfig) error {
 	// 1. Setup Console Output
 	for _, output := range cfg.Outputs {
 		if strings.EqualFold(output, "console") {
-			writers = append(writers, os.Stdout)
+			// Use Stderr for console logging to allow piping
+			writers = append(writers, os.Stderr)
 			break
 		}
 	}
@@ -73,7 +78,7 @@ func InitLogger(cfg LoggingConfig) error {
 
 	if len(writers) == 0 {
 		// Default fallback
-		writers = append(writers, os.Stdout)
+		writers = append(writers, os.Stderr)
 	}
 
 	// Create MultiWriter

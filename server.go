@@ -75,6 +75,71 @@ func (w *DoQServerWrapper) Shutdown(ctx context.Context) error {
 	}
 }
 
+// DoTServerWrapper for custom SNI handling
+type DoTServerWrapper struct {
+	listener net.Listener
+	wg       sync.WaitGroup
+	quit     chan struct{}
+}
+
+func (w *DoTServerWrapper) Shutdown(ctx context.Context) error {
+	close(w.quit) // Signal accept loop to stop
+	if w.listener != nil {
+		w.listener.Close()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		w.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (w *DoTServerWrapper) acceptLoop() {
+	for {
+		conn, err := w.listener.Accept()
+		if err != nil {
+			select {
+			case <-w.quit:
+				return // Normal shutdown
+			default:
+				// Only log real errors, not closed listener errors during shutdown
+				LogDebug("DoT Accept error: %v", err)
+				continue
+			}
+		}
+
+		w.wg.Add(1)
+		go func(c net.Conn) {
+			defer w.wg.Done()
+			handleDoTConnection(c)
+		}(conn)
+	}
+}
+
+// idleConn wraps net.Conn to extend deadlines on activity
+type idleConn struct {
+	net.Conn
+	timeout time.Duration
+}
+
+func (c *idleConn) Read(b []byte) (int, error) {
+	c.Conn.SetReadDeadline(time.Now().Add(c.timeout))
+	return c.Conn.Read(b)
+}
+
+func (c *idleConn) Write(b []byte) (int, error) {
+	c.Conn.SetWriteDeadline(time.Now().Add(c.timeout))
+	return c.Conn.Write(b)
+}
+
 func startServers(wg *sync.WaitGroup, tlsConfig *tls.Config) []ServerShutdowner {
 	listenAddr := config.Server.ListenAddr
 	udpPort := config.Server.Ports.UDP
@@ -127,30 +192,26 @@ func startServers(wg *sync.WaitGroup, tlsConfig *tls.Config) []ServerShutdowner 
 	}()
 	servers = append(servers, &DNSServerWrapper{tcpServer})
 
-	// DoT (DNS over TLS) Listener
+	// DoT (DNS over TLS) Listener - Custom Implementation for SNI
 	wg.Add(1)
-	dotServer := &dns.Server{
-		Addr: fmt.Sprintf("%s:%d", listenAddr, tlsPort),
-		Net:  "tcp-tls", TLSConfig: tlsConfig,
+	dotAddr := fmt.Sprintf("%s:%d", listenAddr, tlsPort)
+	dotListener, err := tls.Listen("tcp", dotAddr, tlsConfig)
+	if err != nil {
+		LogWarn("Failed to bind DoT listener: %v", err)
+		wg.Done()
+	} else {
+		dotServer := &DoTServerWrapper{
+			listener: dotListener,
+			quit:     make(chan struct{}),
+		}
+
+		go func() {
+			defer wg.Done()
+			LogInfo("Starting DoT on %s", dotAddr)
+			dotServer.acceptLoop()
+		}()
+		servers = append(servers, dotServer)
 	}
-	dotServer.Handler = dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
-		ctx, cancel := context.WithTimeout(context.Background(), getTimeout())
-		defer cancel()
-		reqCtx := &RequestContext{
-			ServerIP:   getLocalIP(w.LocalAddr()),
-			ServerPort: getLocalPort(w.LocalAddr()),
-			Protocol:   "DoT",
-		}
-		processDNSRequest(ctx, w, r, reqCtx)
-	})
-	go func() {
-		defer wg.Done()
-		LogInfo("Starting DoT on %s:%d", listenAddr, tlsPort)
-		if err := dotServer.ListenAndServe(); err != nil {
-			LogError("DoT server stopped: %v", err)
-		}
-	}()
-	servers = append(servers, &DNSServerWrapper{dotServer})
 
 	// DoQ (DNS over QUIC) Listener
 	wg.Add(1)
@@ -238,6 +299,59 @@ func getTimeout() time.Duration {
 
 // --- Handlers ---
 
+func handleDoTConnection(conn net.Conn) {
+	defer conn.Close()
+
+	// TLS Handshake to get SNI
+	tlsConn, ok := conn.(*tls.Conn)
+	if !ok {
+		return
+	}
+
+	// Handshake timeout
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if err := tlsConn.Handshake(); err != nil {
+		LogDebug("DoT Handshake failed: %v", err)
+		return
+	}
+
+	sni := tlsConn.ConnectionState().ServerName
+
+	// Wrap for idle timeouts (10s default idle)
+	iconn := &idleConn{
+		Conn:    conn,
+		timeout: 10 * time.Second,
+	}
+	// Clear handshake deadline
+	conn.SetDeadline(time.Time{})
+
+	// Manually handle the DNS messages on this connection
+	dconn := new(dns.Conn)
+	dconn.Conn = iconn
+
+	for {
+		req, err := dconn.ReadMsg()
+		if err != nil {
+			if err != io.EOF {
+				LogDebug("DoT Read error: %v", err)
+			}
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), getTimeout())
+		reqCtx := &RequestContext{
+			ServerIP:       getLocalIP(conn.LocalAddr()),
+			ServerPort:     getLocalPort(conn.LocalAddr()),
+			ServerHostname: sni, // SNI captured here
+			Protocol:       "DoT",
+		}
+
+		w := &dotResponseWriter{Conn: dconn}
+		processDNSRequest(ctx, w, req, reqCtx)
+		cancel()
+	}
+}
+
 func handleDoH(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), getTimeout())
 	defer cancel()
@@ -259,21 +373,6 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 
 	// OPTIMIZATION: Use message pool
 	msg := getMsg()
-	// IMPORTANT: We must NOT return this message to the pool inside this function,
-	// because processDNSRequest passes it to Singleflight or Cache, and it might be 
-	// referenced asynchronously. 
-	// Ideally, we would putMsg() when we are sure it's done, but because of 
-	// singleflight and async logging, ownership is complex. 
-	// For now, let's allow it to be collected normally if it escapes, 
-	// OR ensure processDNSRequest copies it if it needs to keep it.
-	// 
-	// However, looking at process.go:
-	// - It extracts info (safe)
-	// - If cache hit -> returns cached resp (safe, msg unused)
-	// - If cache miss -> msg.Copy() is called for upstream.
-	// So `msg` is effectively read-only in processDNSRequest and not stored.
-	// Thus, we CAN return it to the pool after processDNSRequest returns.
-	
 	defer putMsg(msg)
 
 	var err error
@@ -380,6 +479,18 @@ func handleDoQSession(sess quic.Connection) {
 }
 
 // --- Response Writers ---
+
+// dotResponseWriter adapts dns.Conn to dns.ResponseWriter
+type dotResponseWriter struct {
+	*dns.Conn
+}
+
+func (w *dotResponseWriter) Hijack() {
+	// No-op for DoT
+}
+
+func (w *dotResponseWriter) TsigStatus() error { return nil }
+func (w *dotResponseWriter) TsigTimersOnly(bool) {}
 
 type doqResponseWriter struct {
 	stream     quic.Stream

@@ -1,10 +1,39 @@
 # ------------------------------------------------------------------------------
-# dproxy Configuration File (v2.7.2)
+# dproxy Configuration File (v2.8.0)
 # ------------------------------------------------------------------------------
 # This configuration file controls all aspects of the dproxy server, including
 # network listeners, DoH path validation, TLS settings, caching behavior, and
 # advanced routing logic.
 # ------------------------------------------------------------------------------
+
+# --- Logging Configuration ---
+logging:
+  # Log Level: DEBUG, INFO, WARN, ERROR
+  # Default: INFO
+  level: "INFO"
+  
+  # Format: "text" (human readable) or "json" (structured)
+  # Default: "text"
+  format: "text"
+  
+  # Outputs: List of destinations. Options: "console", "file", "syslog"
+  # Default: ["console"]
+  outputs:
+    - "console"
+    # - "file"
+    # - "syslog"
+
+  # File configuration (only used if "file" is in outputs)
+  file:
+    path: "/var/log/dproxy.log"
+    permissions: 0644
+
+  # Syslog configuration (only used if "syslog" is in outputs)
+  syslog:
+    network: "udp"
+    address: "127.0.0.1:514"
+    tag: "dproxy"
+    facility: 16 # Local0
 
 # --- Server Configuration ---
 server:
@@ -32,10 +61,6 @@ server:
   tls:
     cert_file: ""  # Path to your .crt or .pem file
     key_file: ""   # Path to your .key file
-
-  # Log Level: DEBUG, INFO, WARN, ERROR
-  # Default: INFO
-  log_level: "INFO"
   
   # DoH (DNS over HTTPS) Configuration
   doh:
@@ -146,16 +171,6 @@ cache:
 routing:
   # 1. Upstream Groups
   # Define reusable lists of upstream DNS servers here.
-  # Supported schemes:
-  #   - udp:// (Standard DNS)
-  #   - tcp:// (Standard DNS over TCP)
-  #   - dot:// or tls:// (DNS over TLS)
-  #   - doh:// or https:// (DNS over HTTPS)
-  #   - doh3:// or h3:// (DNS over HTTP/3)
-  #   - doq:// or quic:// (DNS over QUIC)
-  #
-  # You can pin a specific IP for a hostname using the # fragment:
-  #   e.g., doh://example.com/dns-query#1.2.3.4
   upstream_groups:
     public_secure:
       - doh://cloudflare-dns.com/dns-query
@@ -171,100 +186,18 @@ routing:
 
   # 2. Routing Rules
   # Rules are evaluated from top to bottom. The first matching rule wins.
-  # Strategies available:
-  #   - failover:    Try 1st, if fails try 2nd, etc. (Reliability)
-  #   - round-robin: Rotate through upstreams sequentially. (Load balancing)
-  #   - random:      Pick a random upstream. (Simple distribution)
-  #   - fastest:     Track RTT and prefer the fastest server. (Performance)
-  #   - race:        Query all upstreams simultaneously, return first response. (Aggressive speed)
   routing_rules:
-    
-    # --------------------------------------------------------------------------
-    # REFERENCE: ALL AVAILABLE MATCH TYPES
-    # --------------------------------------------------------------------------
-    
-    # 1. Query Domain (Domain Name Matching)
-    # Syntax:
-    #   "domain.com"   -> Exact match only
-    #   ".domain.com"  -> Matches "domain.com" AND "sub.domain.com"
-    #   "*.domain.com" -> Matches "sub.domain.com" but NOT "domain.com"
     - name: "Local Domains"
       match:
         query_domain: ".home.arpa"
       upstreams: local_internal
       strategy: failover
 
-    # 2. Client IP (Exact Match)
     - name: "Specific Client"
       match:
         client_ip: "192.168.1.50"
       upstreams: public_secure
       strategy: fastest
-
-    # 3. Client CIDR (Subnet Match)
-    - name: "Guest VLAN"
-      match:
-        client_cidr: "192.168.20.0/24"
-      upstreams: public_secure
-      strategy: round-robin
-
-    # 4. Client MAC Address (Hardware Address)
-    # Note: Only works if the client is on the same local network segment.
-    - name: "Kids Tablet"
-      match:
-        client_mac: "aa:bb:cc:dd:ee:ff"
-      upstreams: family_safe
-      strategy: failover
-
-    # 5. ECS (EDNS Client Subnet)
-    # Matches the subnet provided in the EDNS0 Client Subnet option.
-    - name: "Remote Office ECS"
-      match:
-        client_ecs: "10.5.0.0/16"
-      upstreams: local_internal
-      strategy: failover
-    
-    # 6. EDNS0 MAC (Option Code 65001)
-    # Matches a custom MAC address embedded in EDNS0 option 65001.
-    # Often used by routers (like MikroTik) forwarding DNS.
-    - name: "Device via EDNS MAC"
-      match:
-        client_edns_mac: "11:22:33:44:55:66"
-      upstreams: family_safe
-      strategy: race
-
-    # 7. Server IP (Inbound Listener IP)
-    # Matches the IP address of the interface receiving the request.
-    - name: "Inbound Interface VIP"
-      match:
-        server_ip: "10.0.0.5"
-      upstreams: public_secure
-      strategy: random
-
-    # 8. Server Port (Inbound Listener Port)
-    # Matches the port the request was received on.
-    - name: "Standard DNS Port"
-      match:
-        server_port: 53
-      upstreams: local_internal
-      strategy: round-robin
-
-    # 9. Server Hostname (DoT/DoH/DoQ SNI or Host Header)
-    # Matches the server name requested by the client (SNI or HTTP Host).
-    - name: "DoH Hostname"
-      match:
-        server_hostname: "dns.mycompany.com"
-      upstreams: public_secure
-      strategy: failover
-
-    # 10. Server Path (DoH Path)
-    # Matches the URL path of a DoH request (e.g., /family, /dns-query).
-    # Useful for assigning different policies to different URL endpoints.
-    - name: "Family Filter Path"
-      match:
-        server_path: "/family"
-      upstreams: family_safe
-      strategy: failover
 
   # 3. Default Rule (REQUIRED)
   # This rule is applied if no other rules match.

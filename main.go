@@ -104,19 +104,15 @@ Usage: %s -config <config.yaml>
 	}
 
 	// Load configuration
+	// Note: LoadConfig now handles InitLogger internally to ensure startup logs 
+	// respect the configured logging level/output immediately.
 	if err := LoadConfig(*configFile); err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
-	
-	// Initialize Logger with modern configuration
-	if err := InitLogger(config.Logging); err != nil {
-		log.Fatalf("Failed to initialize logger: %v", err)
-	}
+
+	// Initialize Logger call REMOVED - it is now done inside LoadConfig
 
 	// Log configuration summary after logger is ready
-	// We also log the loaded rules which happens inside LoadConfig, 
-	// but since InitLogger is called after, we might miss the very first messages from LoadConfig.
-	// To fix this cleanly without circular deps, we just re-log critical start info here.
 	LogInfo("Configuration loaded successfully from %s", *configFile)
 
 	// Initialize shutdown context
