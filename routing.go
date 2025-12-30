@@ -2,6 +2,7 @@
 File: routing.go
 Description: High-performance routing logic using Domain Trie (Radix-style) for rapid lookups.
 OPTIMIZED: Uses lazy map initialization to save memory on sparse nodes.
+UPDATED: Support for multiple values per match condition type.
 */
 
 package main
@@ -21,7 +22,6 @@ type TrieNode struct {
 	Wildcard *RoutingRule // Non-nil if a *.domain rule exists here
 }
 
-// NewTrieNode returns a new node without allocating the map (lazy init)
 func NewTrieNode() *TrieNode {
 	return &TrieNode{}
 }
@@ -35,30 +35,25 @@ func NewDomainTrie() *DomainTrie {
 }
 
 // Insert adds a domain rule. Handles "example.com", ".example.com", "*.example.com"
-// Domain parts are inserted in REVERSE order (com -> example -> www)
 func (t *DomainTrie) Insert(domain string, rule *RoutingRule) {
 	parts := strings.Split(domain, ".")
 
-	// Handle wildcard prefix "*.example.com" or ".example.com"
 	isWildcard := false
 	if parts[0] == "*" {
 		isWildcard = true
-		parts = parts[1:] // Remove "*"
+		parts = parts[1:]
 	} else if parts[0] == "" {
-		// Starts with dot ".example.com" -> treat as wildcard for subdomains + exact match
 		isWildcard = true
-		parts = parts[1:] // Remove empty start
+		parts = parts[1:]
 	}
 
 	node := t.Root
-	// Reverse iteration
 	for i := len(parts) - 1; i >= 0; i-- {
 		part := parts[i]
 		if part == "" {
 			continue
 		}
 
-		// Lazy Initialization of Children map
 		if node.Children == nil {
 			node.Children = make(map[string]*TrieNode)
 		}
@@ -69,10 +64,8 @@ func (t *DomainTrie) Insert(domain string, rule *RoutingRule) {
 		node = node.Children[part]
 	}
 
-	// If it was "*.example.com", set Wildcard rule
 	if isWildcard {
 		node.Wildcard = rule
-		// Also set exact match if the syntax was ".example.com" (usually implies both)
 		if strings.HasPrefix(domain, ".") {
 			node.Rule = rule
 		}
@@ -88,34 +81,28 @@ func (t *DomainTrie) Search(qName string) *RoutingRule {
 
 	var lastValidRule *RoutingRule
 
-	// Reverse iteration
 	for i := len(parts) - 1; i >= 0; i-- {
 		part := parts[i]
 
-		// Before moving down, check if current node has a wildcard that applies to the rest
 		if node.Wildcard != nil {
 			lastValidRule = node.Wildcard
 		}
 
-		// Optimization: If no children map exists, we can't go deeper
 		if node.Children == nil {
 			return lastValidRule
 		}
 
 		next, ok := node.Children[part]
 		if !ok {
-			// No deeper match. Return the last wildcard found (if any)
 			return lastValidRule
 		}
 		node = next
 	}
 
-	// Exact match at the leaf
 	if node.Rule != nil {
 		return node.Rule
 	}
 
-	// If exact match not found, but this node had a wildcard (unlikely for leaf but possible)
 	if node.Wildcard != nil {
 		return node.Wildcard
 	}
@@ -137,18 +124,41 @@ func BuildRoutingTable(rules []RoutingRule) {
 	var generic []RoutingRule
 
 	for i := range rules {
-		// We use a pointer to the rule in the slice to avoid copying
 		rule := &rules[i]
-		if rule.Match.QueryDomain != "" {
-			trie.Insert(strings.ToLower(rule.Match.QueryDomain), rule)
-		} else {
-			generic = append(generic, *rule)
+		
+		// Check if rule has any query_domain conditions
+		if len(rule.Match.QueryDomain) > 0 {
+			// Insert each domain into the trie
+			for _, domain := range rule.Match.QueryDomain {
+				trie.Insert(strings.ToLower(domain), rule)
+			}
+			
+			// If rule ONLY has query_domain conditions, don't add to generic
+			// But if it has other conditions too, we need it in generic as well
+			if !hasNonDomainConditions(&rule.Match) {
+				continue
+			}
 		}
+		
+		generic = append(generic, *rule)
 	}
 
 	domainRouter = trie
 	genericRules = generic
 	LogInfo("[ROUTING] Built routing table: Domain Trie built, %d generic rules", len(genericRules))
+}
+
+// hasNonDomainConditions checks if match has conditions other than query_domain
+func hasNonDomainConditions(m *MatchConditions) bool {
+	return len(m.ClientIP) > 0 ||
+		len(m.ClientCIDR) > 0 ||
+		len(m.ClientMAC) > 0 ||
+		len(m.ClientECS) > 0 ||
+		len(m.ClientEDNSMAC) > 0 ||
+		len(m.ServerIP) > 0 ||
+		len(m.ServerPort) > 0 ||
+		len(m.ServerHostname) > 0 ||
+		len(m.ServerPath) > 0
 }
 
 // --- Main Logic ---
@@ -203,6 +213,7 @@ func SelectUpstreams(ctx *RequestContext) ([]*Upstream, string, string) {
 	return config.Routing.DefaultRule.parsedUpstreams, config.Routing.DefaultRule.Strategy, "DEFAULT"
 }
 
+// matchRule checks if any condition matches (OR logic across all conditions)
 func matchRule(m *MatchConditions, ctx *RequestContext) (bool, string) {
 	effectiveIP := ctx.ClientIP
 	if ctx.ClientECS != nil {
@@ -216,78 +227,142 @@ func matchRule(m *MatchConditions, ctx *RequestContext) (bool, string) {
 
 	conditionsChecked := 0
 
-	// --- OR Logic Checks ---
+	// --- OR Logic Checks - Multiple values per condition type ---
 
-	if m.parsedClientIP != nil {
+	// Check Client IPs (any match)
+	if len(m.parsedClientIPs) > 0 {
 		conditionsChecked++
-		if effectiveIP != nil && m.parsedClientIP.Equal(effectiveIP) {
-			return true, fmt.Sprintf("ClientIP=%s", effectiveIP)
+		for _, ip := range m.parsedClientIPs {
+			if effectiveIP != nil && ip.Equal(effectiveIP) {
+				return true, fmt.Sprintf("ClientIP=%s", effectiveIP)
+			}
 		}
 	}
 
-	if m.parsedClientCIDR != nil {
+	// Check Client CIDRs (any match)
+	if len(m.parsedClientCIDRs) > 0 {
 		conditionsChecked++
-		if effectiveIP != nil && m.parsedClientCIDR.Contains(effectiveIP) {
-			return true, fmt.Sprintf("ClientCIDR=%s (matched %s)", m.ClientCIDR, effectiveIP)
+		for _, cidr := range m.parsedClientCIDRs {
+			if effectiveIP != nil && cidr.Contains(effectiveIP) {
+				return true, fmt.Sprintf("ClientCIDR=%s (matched %s)", cidr.String(), effectiveIP)
+			}
 		}
 	}
 
-	if m.parsedClientMAC != nil {
+	// Check Client MACs (any match)
+	if len(m.parsedClientMACs) > 0 {
 		conditionsChecked++
-		if effectiveMAC != nil && macEqual(m.parsedClientMAC, effectiveMAC) {
-			return true, fmt.Sprintf("ClientMAC=%s", effectiveMAC)
+		for _, mac := range m.parsedClientMACs {
+			if effectiveMAC != nil && macEqual(mac, effectiveMAC) {
+				return true, fmt.Sprintf("ClientMAC=%s", effectiveMAC)
+			}
 		}
 	}
 
-	if m.parsedClientECS != nil {
+	// Check Client ECS (any match)
+	if len(m.parsedClientECSs) > 0 {
 		conditionsChecked++
-		if ctx.ClientECS != nil && m.parsedClientECS.Contains(ctx.ClientECS) {
-			return true, fmt.Sprintf("ClientECS=%s", ctx.ClientECS)
+		for _, ecs := range m.parsedClientECSs {
+			if ctx.ClientECS != nil && ecs.Contains(ctx.ClientECS) {
+				return true, fmt.Sprintf("ClientECS=%s", ctx.ClientECS)
+			}
 		}
 	}
 
-	if m.parsedClientEDNSMAC != nil {
+	// Check Client EDNS MACs (any match)
+	if len(m.parsedClientEDNSMACs) > 0 {
 		conditionsChecked++
-		if ctx.ClientEDNSMAC != nil && macEqual(m.parsedClientEDNSMAC, ctx.ClientEDNSMAC) {
-			return true, fmt.Sprintf("EDNS0MAC=%s", ctx.ClientEDNSMAC)
+		for _, mac := range m.parsedClientEDNSMACs {
+			if ctx.ClientEDNSMAC != nil && macEqual(mac, ctx.ClientEDNSMAC) {
+				return true, fmt.Sprintf("EDNS0MAC=%s", ctx.ClientEDNSMAC)
+			}
 		}
 	}
 
-	if m.parsedServerIP != nil {
+	// Check Server IPs (any match)
+	if len(m.parsedServerIPs) > 0 {
 		conditionsChecked++
-		if ctx.ServerIP != nil && m.parsedServerIP.Equal(ctx.ServerIP) {
-			return true, fmt.Sprintf("ServerIP=%s", ctx.ServerIP)
+		for _, ip := range m.parsedServerIPs {
+			if ctx.ServerIP != nil && ip.Equal(ctx.ServerIP) {
+				return true, fmt.Sprintf("ServerIP=%s", ctx.ServerIP)
+			}
 		}
 	}
 
-	if m.ServerPort != 0 {
+	// Check Server Ports (any match)
+	if len(m.ServerPort) > 0 {
 		conditionsChecked++
-		if ctx.ServerPort == m.ServerPort {
-			return true, fmt.Sprintf("ServerPort=%d", ctx.ServerPort)
+		for _, port := range m.ServerPort {
+			if ctx.ServerPort == port {
+				return true, fmt.Sprintf("ServerPort=%d", ctx.ServerPort)
+			}
 		}
 	}
 
-	if m.ServerHostname != "" {
+	// Check Server Hostnames (any match, case-insensitive)
+	if len(m.ServerHostname) > 0 {
 		conditionsChecked++
-		if strings.EqualFold(ctx.ServerHostname, m.ServerHostname) {
-			return true, fmt.Sprintf("Hostname=%s", m.ServerHostname)
+		for _, hostname := range m.ServerHostname {
+			if strings.EqualFold(ctx.ServerHostname, hostname) {
+				return true, fmt.Sprintf("Hostname=%s", hostname)
+			}
 		}
 	}
 
-	if m.ServerPath != "" {
+	// Check Server Paths (any match)
+	if len(m.ServerPath) > 0 {
 		conditionsChecked++
-		if ctx.ServerPath == m.ServerPath {
-			return true, fmt.Sprintf("Path=%s", m.ServerPath)
+		for _, path := range m.ServerPath {
+			if ctx.ServerPath == path {
+				return true, fmt.Sprintf("Path=%s", path)
+			}
 		}
 	}
 
-	// QueryDomain check removed here as it is handled by Trie
+	// QueryDomain is handled by Trie, but check here for rules with mixed conditions
+	if len(m.QueryDomain) > 0 {
+		conditionsChecked++
+		for _, domain := range m.QueryDomain {
+			if matchDomain(ctx.QueryName, strings.ToLower(domain)) {
+				return true, fmt.Sprintf("QueryDomain=%s", domain)
+			}
+		}
+	}
 
 	if conditionsChecked == 0 {
 		return false, ""
 	}
 
 	return false, ""
+}
+
+// matchDomain checks if queryName matches the domain pattern
+func matchDomain(queryName, pattern string) bool {
+	// Exact match
+	if queryName == pattern {
+		return true
+	}
+
+	// Wildcard match: ".example.com" or "*.example.com" matches "sub.example.com"
+	if strings.HasPrefix(pattern, ".") {
+		suffix := pattern // ".example.com"
+		if strings.HasSuffix(queryName, suffix) {
+			return true
+		}
+		// Also match exact domain without the dot
+		if queryName == pattern[1:] {
+			return true
+		}
+	}
+
+	if strings.HasPrefix(pattern, "*.") {
+		suffix := pattern[1:] // ".example.com"
+		if strings.HasSuffix(queryName, suffix) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func macEqual(a, b net.HardwareAddr) bool {

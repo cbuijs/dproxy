@@ -2,7 +2,7 @@
 File: process.go
 Description: Handles the core processing logic for DNS requests, including Singleflight, EDNS0 extraction,
              logging, response cleaning, and forwarding to upstreams with specific strategies.
-             UPDATED: Passing RequestContext to forwarding logic for client variable replacement.
+             UPDATED: Added cross-fetch trigger after successful upstream responses.
 */
 
 package main
@@ -38,7 +38,6 @@ type RequestContext struct {
 	Protocol       string
 }
 
-// Reset clears the RequestContext for reuse in sync.Pool
 func (rc *RequestContext) Reset() {
 	rc.ClientIP = nil
 	rc.ClientMAC = nil
@@ -53,18 +52,13 @@ func (rc *RequestContext) Reset() {
 	rc.Protocol = ""
 }
 
-// Pool to reduce GC pressure for high-frequency request objects
 var reqCtxPool = sync.Pool{
 	New: func() any {
 		return &RequestContext{}
 	},
 }
 
-// Global semaphore to limit concurrent race strategy goroutines
-// 256 concurrent racers is plenty for a small router/server
 var raceLimiter = make(chan struct{}, 256)
-
-// --- Result type for singleflight ---
 
 type queryResult struct {
 	msg         *dns.Msg
@@ -72,17 +66,13 @@ type queryResult struct {
 	rtt         time.Duration
 }
 
-// --- Core Processing ---
-
 func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, reqCtxFromHandler *RequestContext) {
 	start := time.Now()
 
-	// Reuse RequestContext
 	reqCtx := reqCtxPool.Get().(*RequestContext)
 	reqCtx.Reset()
 	defer reqCtxPool.Put(reqCtx)
 
-	// Copy basic data
 	reqCtx.ServerIP = reqCtxFromHandler.ServerIP
 	reqCtx.ServerPort = reqCtxFromHandler.ServerPort
 	reqCtx.Protocol = reqCtxFromHandler.Protocol
@@ -98,13 +88,14 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 
 	extractEDNS0ClientInfo(r, reqCtx)
 
-	// Build qInfo for logging (Optimized Builder)
 	var qInfo, cacheKey string
+	var qType uint16
 	var sb strings.Builder
 
 	if len(r.Question) > 0 {
 		q := r.Question[0]
 		reqCtx.QueryName = strings.TrimSuffix(strings.ToLower(q.Name), ".")
+		qType = q.Qtype
 
 		sb.Grow(len(q.Name) + 10)
 		sb.WriteString(q.Name)
@@ -115,7 +106,6 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		sb.Reset()
 	}
 
-	// Append EDNS0 info to qInfo
 	if opt := r.IsEdns0(); opt != nil {
 		sb.WriteString(qInfo)
 		firstExtra := true
@@ -150,18 +140,12 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		sb.Reset()
 	}
 
-	// Determine Upstreams and RULE NAME
 	selectedUpstreams, selectedStrategy, ruleName := SelectUpstreams(reqCtx)
 
 	if len(r.Question) > 0 {
 		q := r.Question[0]
-
-		// CRITICAL SIMPLIFICATION:
-		// The cache partition is strictly the Rule Name.
-		// All clients hitting the same rule share the same cache.
 		routingKey := ruleName
 
-		// Build Cache Key
 		sb.Reset()
 		sb.WriteString(q.Name)
 		sb.WriteString("|")
@@ -176,7 +160,6 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	// Check cache
 	if config.Cache.Enabled && cacheKey != "" {
 		if cachedResp := getFromCache(cacheKey, r.Id); cachedResp != nil {
-			// LOGGING UPDATE: Include Rule Name in cache hit status
 			status := fmt.Sprintf("CACHE_HIT (%s)", ruleName)
 			logRequest(r.Id, reqCtx, qInfo, "", status, "CACHE", 0, time.Since(start), cachedResp)
 			w.WriteMsg(cachedResp)
@@ -184,12 +167,10 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		}
 	}
 
-	// --- UPSTREAM PROCESSING ---
 	msg := r.Copy()
 	addEDNS0Options(msg, ip, mac)
 	upstreamQInfo := buildUpstreamInfo(msg)
 
-	// Logging
 	if opt := msg.IsEdns0(); opt != nil {
 		var ednsInfo []string
 		for _, option := range opt.Option {
@@ -206,7 +187,6 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 
 	// Singleflight
 	result, err, shared := requestGroup.Do(cacheKey, func() (interface{}, error) {
-		// Pass selected upstreams/strategy and reqCtx
 		resp, upstreamStr, rtt, err := forwardToUpstreams(ctx, msg, selectedUpstreams, selectedStrategy, reqCtx)
 		if err != nil {
 			return nil, err
@@ -233,6 +213,17 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 
 	if config.Cache.Enabled && resp != nil {
 		addToCache(cacheKey, resp)
+
+		// --- CROSS-FETCH TRIGGER ---
+		// After successful upstream response, trigger background prefetch for related types
+		if resp.Rcode == dns.RcodeSuccess && len(resp.Answer) > 0 {
+			// Create a copy of request context for background goroutine
+			prefetchCtx := &RequestContext{
+				ClientIP:  reqCtx.ClientIP,
+				ClientMAC: reqCtx.ClientMAC,
+			}
+			go TriggerCrossFetch(reqCtx.QueryName, qType, ruleName, selectedUpstreams, selectedStrategy, prefetchCtx)
+		}
 	}
 
 	status := dns.RcodeToString[resp.Rcode]
@@ -282,12 +273,10 @@ func roundRobinStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream
 	startIdx := rrCounter.Add(1) - 1
 	n := len(upstreams)
 
-	// Try all upstreams, starting from startIdx
 	for i := 0; i < n; i++ {
 		idx := (int(startIdx) + i) % n
 		u := upstreams[idx]
 
-		// Skip unhealthy upstreams (unless it's time to probe, which IsHealthy returns true for)
 		if !u.IsHealthy() {
 			continue
 		}
@@ -299,8 +288,6 @@ func roundRobinStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream
 			return resp, u.DynamicString(reqCtx), rtt, nil
 		}
 
-		// If error (circuit open or network fail), continue loop
-		// UPDATED: LogWarn for visibility
 		LogWarn("[STRATEGY] Round-Robin: Failed with %s: %v", u.DynamicString(reqCtx), err)
 	}
 
@@ -311,7 +298,6 @@ func randomStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, re
 	n := len(upstreams)
 	startIdx := rand.IntN(n)
 
-	// Same loop logic as Round-Robin, just different start point
 	for i := 0; i < n; i++ {
 		idx := (startIdx + i) % n
 		u := upstreams[idx]
@@ -326,7 +312,6 @@ func randomStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, re
 			LogDebug("[STRATEGY] Random: Success with %s (RTT: %v)", u.DynamicString(reqCtx), rtt)
 			return resp, u.DynamicString(reqCtx), rtt, nil
 		}
-		// UPDATED: LogWarn
 		LogWarn("[STRATEGY] Random: Failed with %s: %v", u.DynamicString(reqCtx), err)
 	}
 
@@ -345,7 +330,6 @@ func failoverStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, 
 			LogDebug("[STRATEGY] Failover: Success with %s (RTT: %v)", u.DynamicString(reqCtx), rtt)
 			return resp, u.DynamicString(reqCtx), rtt, nil
 		}
-		// UPDATED: LogWarn
 		LogWarn("[STRATEGY] Failover: Failed %s: %v", u.DynamicString(reqCtx), err)
 	}
 	return nil, "", 0, errors.New("all upstreams failed or unhealthy in failover")
@@ -370,7 +354,6 @@ func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, r
 
 	stats := make([]upstreamStat, 0, len(upstreams))
 	for i, u := range upstreams {
-		// Filter out unhealthy upstreams BEFORE sorting/stats to avoid picking dead ones
 		if !u.IsHealthy() {
 			continue
 		}
@@ -387,10 +370,6 @@ func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, r
 	}
 
 	if len(stats) == 0 {
-		// All upstreams unhealthy. Try to force one?
-		// Logic: If all are unhealthy, IsHealthy() returns false.
-		// If enough time passed, IsHealthy returns true (Half-Open).
-		// So if we are here, ALL upstreams are dead and Cooling Down.
 		return nil, "", 0, errors.New("all upstreams are unhealthy (circuit open)")
 	}
 
@@ -468,8 +447,6 @@ func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, r
 				probeMsg.RecursionDesired = true
 				probeCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 				defer cancel()
-				// Pass empty request context for background probes
-				// Variables will default to placeholders (0-0-0-0)
 				u.executeExchange(probeCtx, probeMsg, &RequestContext{})
 			}(s.upstream)
 		}
@@ -486,7 +463,6 @@ func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, r
 
 	resp, rtt, err := selectedUpstream.executeExchange(ctx, req, reqCtx)
 	if err != nil {
-		// UPDATED: LogWarn
 		LogWarn("[STRATEGY] Fastest: Failed with %s: %v, trying alternatives", selectedUpstream.DynamicString(reqCtx), err)
 		for _, s := range stats {
 			if s.upstream == selectedUpstream {
@@ -506,7 +482,6 @@ func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, r
 }
 
 func raceStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, reqCtx *RequestContext) (*dns.Msg, string, time.Duration, error) {
-	// Filter healthy upstreams first to avoid spawning useless goroutines
 	candidates := make([]*Upstream, 0, len(upstreams))
 	for _, u := range upstreams {
 		if u.IsHealthy() {
@@ -531,20 +506,17 @@ func raceStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, reqC
 	resCh := make(chan result, len(candidates))
 
 	for _, u := range candidates {
-		// Acquire semaphore to prevent goroutine explosion
 		select {
 		case raceLimiter <- struct{}{}:
-			// Acquired
 		case <-ctx.Done():
 			return nil, "", 0, ctx.Err()
 		}
 
 		go func(upstream *Upstream) {
-			defer func() { <-raceLimiter }() // Release semaphore
+			defer func() { <-raceLimiter }()
 
 			resp, rtt, err := upstream.executeExchange(ctx, req, reqCtx)
 			if err != nil {
-				// UPDATED: LogWarn
 				LogWarn("[STRATEGY] Race: Upstream %s failed: %v", upstream.DynamicString(reqCtx), err)
 			} else {
 				LogDebug("[STRATEGY] Race: Upstream %s responded in %v", upstream.DynamicString(reqCtx), rtt)
@@ -565,7 +537,6 @@ func raceStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, reqC
 				successCount++
 				if successCount == 1 {
 					LogDebug("[STRATEGY] Race: Winner is %s (RTT: %v)", res.name, res.rtt)
-					// Cancel immediately stops other racers
 					cancel()
 					return res.msg, res.name, res.rtt, nil
 				}

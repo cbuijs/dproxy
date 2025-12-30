@@ -1,6 +1,8 @@
 /*
 File: config.go
 Description: Defines configuration structures and handles YAML parsing and validation.
+UPDATED: Added prefetch configuration (cross-fetch and stale refresh).
+UPDATED: Support for multiple values per match condition type (arrays).
 */
 
 package main
@@ -10,6 +12,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -18,27 +21,27 @@ import (
 
 type Config struct {
 	Server    ServerConfig    `yaml:"server"`
-	Logging   LoggingConfig   `yaml:"logging"` // Added top-level logging config
+	Logging   LoggingConfig   `yaml:"logging"`
 	Bootstrap BootstrapConfig `yaml:"bootstrap"`
 	Cache     CacheConfig     `yaml:"cache"`
 	Routing   RoutingConfig   `yaml:"routing"`
 }
 
 type LoggingConfig struct {
-	Level   string   `yaml:"level"`   // DEBUG, INFO, WARN, ERROR
-	Format  string   `yaml:"format"`  // text, json
-	Outputs []string `yaml:"outputs"` // console, file, syslog
+	Level   string   `yaml:"level"`
+	Format  string   `yaml:"format"`
+	Outputs []string `yaml:"outputs"`
 
 	File struct {
 		Path        string `yaml:"path"`
-		Permissions uint32 `yaml:"permissions"` // e.g. 0644
+		Permissions uint32 `yaml:"permissions"`
 	} `yaml:"file"`
 
 	Syslog struct {
-		Network  string `yaml:"network"`  // udp, tcp
-		Address  string `yaml:"address"`  // e.g. "localhost:514"
-		Tag      string `yaml:"tag"`      // default: dproxy
-		Facility int    `yaml:"facility"` // default: 16 (Local0)
+		Network  string `yaml:"network"`
+		Address  string `yaml:"address"`
+		Tag      string `yaml:"tag"`
+		Facility int    `yaml:"facility"`
 	} `yaml:"syslog"`
 }
 
@@ -54,9 +57,7 @@ type ServerConfig struct {
 		KeyFile  string `yaml:"key_file"`
 	} `yaml:"tls"`
 
-	// Deprecated: use logging.level instead. Kept for backward compat if needed,
-	// but logic will prefer logging.level if set.
-	LogLevel string `yaml:"log_level"`
+	LogLevel string `yaml:"log_level"` // Deprecated
 
 	DOH struct {
 		AllowedPaths []string `yaml:"allowed_paths"`
@@ -64,14 +65,14 @@ type ServerConfig struct {
 	} `yaml:"doh"`
 	EDNS0 struct {
 		ECS struct {
-			Mode       string `yaml:"mode"`        // "preserve", "add", "replace", "remove"
-			SourceMask int    `yaml:"source_mask"` // Override mask bits for both IPv4/IPv6 (0 = auto)
-			IPv4Mask   int    `yaml:"ipv4_mask"`   // Override mask for IPv4 only (0 = use source_mask)
-			IPv6Mask   int    `yaml:"ipv6_mask"`   // Override mask for IPv6 only (0 = use source_mask)
+			Mode       string `yaml:"mode"`
+			SourceMask int    `yaml:"source_mask"`
+			IPv4Mask   int    `yaml:"ipv4_mask"`
+			IPv6Mask   int    `yaml:"ipv6_mask"`
 		} `yaml:"ecs"`
 		MAC struct {
-			Mode   string `yaml:"mode"`   // "preserve", "add", "replace", "remove", "prefer-edns0", "prefer-arp"
-			Source string `yaml:"source"` // "arp", "edns0", "both"
+			Mode   string `yaml:"mode"`
+			Source string `yaml:"source"`
 		} `yaml:"mac"`
 	} `yaml:"edns0"`
 	Timeout          string `yaml:"timeout"`
@@ -84,8 +85,35 @@ type BootstrapConfig struct {
 }
 
 type CacheConfig struct {
-	Enabled bool `yaml:"enabled"`
-	Size    int  `yaml:"size"`
+	Enabled  bool           `yaml:"enabled"`
+	Size     int            `yaml:"size"`
+	Prefetch PrefetchConfig `yaml:"prefetch"`
+}
+
+type PrefetchConfig struct {
+	CrossFetch   CrossFetchConfig   `yaml:"cross_fetch"`
+	StaleRefresh StaleRefreshConfig `yaml:"stale_refresh"`
+}
+
+type CrossFetchConfig struct {
+	Enabled       bool     `yaml:"enabled"`
+	Mode          string   `yaml:"mode"`
+	FetchTypes    []string `yaml:"fetch_types"`
+	MaxConcurrent int      `yaml:"max_concurrent"`
+	Timeout       string   `yaml:"timeout"`
+
+	parsedFetchTypes []uint16
+	parsedTimeout    time.Duration
+}
+
+type StaleRefreshConfig struct {
+	Enabled          bool   `yaml:"enabled"`
+	ThresholdPercent int    `yaml:"threshold_percent"`
+	MinHits          int    `yaml:"min_hits"`
+	MaxConcurrent    int    `yaml:"max_concurrent"`
+	CheckInterval    string `yaml:"check_interval"`
+
+	parsedCheckInterval time.Duration
 }
 
 type RoutingConfig struct {
@@ -109,24 +137,73 @@ type RoutingRule struct {
 	parsedUpstreams []*Upstream
 }
 
-type MatchConditions struct {
-	ClientIP       string `yaml:"client_ip"`
-	ClientCIDR     string `yaml:"client_cidr"`
-	ClientMAC      string `yaml:"client_mac"`
-	ClientECS      string `yaml:"client_ecs"`
-	ClientEDNSMAC  string `yaml:"client_edns_mac"`
-	ServerIP       string `yaml:"server_ip"`
-	ServerPort     int    `yaml:"server_port"`
-	ServerHostname string `yaml:"server_hostname"`
-	ServerPath     string `yaml:"server_path"`
-	QueryDomain    string `yaml:"query_domain"`
+// StringOrSlice is a custom type that accepts either a single string or a list of strings
+type StringOrSlice []string
 
-	parsedClientIP      net.IP
-	parsedClientCIDR    *net.IPNet
-	parsedClientMAC     net.HardwareAddr
-	parsedClientECS     *net.IPNet
-	parsedClientEDNSMAC net.HardwareAddr
-	parsedServerIP      net.IP
+func (s *StringOrSlice) UnmarshalYAML(value *yaml.Node) error {
+	// Try single string first
+	var single string
+	if err := value.Decode(&single); err == nil {
+		*s = []string{single}
+		return nil
+	}
+
+	// Try slice of strings
+	var slice []string
+	if err := value.Decode(&slice); err != nil {
+		return err
+	}
+	*s = slice
+	return nil
+}
+
+// IntOrSlice is a custom type that accepts either a single int or a list of ints
+type IntOrSlice []int
+
+func (s *IntOrSlice) UnmarshalYAML(value *yaml.Node) error {
+	// Try single int first
+	var single int
+	if err := value.Decode(&single); err == nil {
+		*s = []int{single}
+		return nil
+	}
+
+	// Try slice of ints
+	var slice []int
+	if err := value.Decode(&slice); err != nil {
+		return err
+	}
+	*s = slice
+	return nil
+}
+
+// MatchConditions now supports multiple values per condition type
+// All conditions within a type use OR logic (match any)
+// Conditions across types use OR logic as well (any condition match triggers the rule)
+type MatchConditions struct {
+	// Client matching - accepts single value or list
+	ClientIP      StringOrSlice `yaml:"client_ip"`
+	ClientCIDR    StringOrSlice `yaml:"client_cidr"`
+	ClientMAC     StringOrSlice `yaml:"client_mac"`
+	ClientECS     StringOrSlice `yaml:"client_ecs"`
+	ClientEDNSMAC StringOrSlice `yaml:"client_edns_mac"`
+
+	// Server matching - accepts single value or list
+	ServerIP       StringOrSlice `yaml:"server_ip"`
+	ServerPort     IntOrSlice    `yaml:"server_port"`
+	ServerHostname StringOrSlice `yaml:"server_hostname"`
+	ServerPath     StringOrSlice `yaml:"server_path"`
+
+	// Query matching - accepts single value or list
+	QueryDomain StringOrSlice `yaml:"query_domain"`
+
+	// Parsed values (internal) - now slices
+	parsedClientIPs      []net.IP
+	parsedClientCIDRs    []*net.IPNet
+	parsedClientMACs     []net.HardwareAddr
+	parsedClientECSs     []*net.IPNet
+	parsedClientEDNSMACs []net.HardwareAddr
+	parsedServerIPs      []net.IP
 }
 
 // --- Configuration Loading ---
@@ -180,12 +257,10 @@ func LoadConfig(path string) error {
 		cfg.Logging.Syslog.Tag = "dproxy"
 	}
 	if cfg.Logging.Syslog.Facility == 0 {
-		cfg.Logging.Syslog.Facility = 16 // Local0
+		cfg.Logging.Syslog.Facility = 16
 	}
 
-	// --- INITIALIZE LOGGER HERE ---
-	// Initialize logger immediately after loading logging config
-	// This ensures that subsequent parsing logic (e.g. upstreams) is logged with the correct level/outputs.
+	// Initialize logger
 	if err := InitLogger(cfg.Logging); err != nil {
 		return fmt.Errorf("failed to initialize logger: %w", err)
 	}
@@ -209,33 +284,32 @@ func LoadConfig(path string) error {
 	// Validate EDNS0 ECS mode
 	validECSModes := map[string]bool{"preserve": true, "add": true, "replace": true, "remove": true}
 	if !validECSModes[cfg.Server.EDNS0.ECS.Mode] {
-		return fmt.Errorf("invalid edns0.ecs.mode: %s (must be: preserve, add, replace, or remove)", cfg.Server.EDNS0.ECS.Mode)
+		return fmt.Errorf("invalid edns0.ecs.mode: %s", cfg.Server.EDNS0.ECS.Mode)
 	}
 
 	// Validate EDNS0 MAC mode
 	validMACModes := map[string]bool{"preserve": true, "add": true, "replace": true, "remove": true, "prefer-edns0": true, "prefer-arp": true}
 	if !validMACModes[cfg.Server.EDNS0.MAC.Mode] {
-		return fmt.Errorf("invalid edns0.mac.mode: %s (must be: preserve, add, replace, remove, prefer-edns0, or prefer-arp)", cfg.Server.EDNS0.MAC.Mode)
+		return fmt.Errorf("invalid edns0.mac.mode: %s", cfg.Server.EDNS0.MAC.Mode)
 	}
 
 	// Validate EDNS0 MAC source
 	validMACSources := map[string]bool{"arp": true, "edns0": true, "both": true}
 	if !validMACSources[cfg.Server.EDNS0.MAC.Source] {
-		return fmt.Errorf("invalid edns0.mac.source: %s (must be: arp, edns0, or both)", cfg.Server.EDNS0.MAC.Source)
+		return fmt.Errorf("invalid edns0.mac.source: %s", cfg.Server.EDNS0.MAC.Source)
 	}
 
 	// Validate ECS mask values
 	if cfg.Server.EDNS0.ECS.SourceMask < 0 || cfg.Server.EDNS0.ECS.SourceMask > 128 {
-		return fmt.Errorf("invalid edns0.ecs.source_mask: %d (must be 0-128)", cfg.Server.EDNS0.ECS.SourceMask)
+		return fmt.Errorf("invalid edns0.ecs.source_mask: %d", cfg.Server.EDNS0.ECS.SourceMask)
 	}
 	if cfg.Server.EDNS0.ECS.IPv4Mask < 0 || cfg.Server.EDNS0.ECS.IPv4Mask > 32 {
-		return fmt.Errorf("invalid edns0.ecs.ipv4_mask: %d (must be 0-32)", cfg.Server.EDNS0.ECS.IPv4Mask)
+		return fmt.Errorf("invalid edns0.ecs.ipv4_mask: %d", cfg.Server.EDNS0.ECS.IPv4Mask)
 	}
 	if cfg.Server.EDNS0.ECS.IPv6Mask < 0 || cfg.Server.EDNS0.ECS.IPv6Mask > 128 {
-		return fmt.Errorf("invalid edns0.ecs.ipv6_mask: %d (must be 0-128)", cfg.Server.EDNS0.ECS.IPv6Mask)
+		return fmt.Errorf("invalid edns0.ecs.ipv6_mask: %d", cfg.Server.EDNS0.ECS.IPv6Mask)
 	}
 
-	// Log EDNS0 configuration (Use LogInfo so it shows up at startup default level)
 	LogInfo("=== EDNS0 Configuration ===")
 	LogInfo("ECS Mode: %s", cfg.Server.EDNS0.ECS.Mode)
 	if cfg.Server.EDNS0.ECS.SourceMask > 0 {
@@ -268,8 +342,14 @@ func LoadConfig(path string) error {
 
 	LogInfo("Bootstrap Configuration: Servers=%v, IPVersion=%s", bootstrapServers, cfg.Bootstrap.IPVersion)
 
+	// Cache Defaults
 	if cfg.Cache.Size == 0 {
 		cfg.Cache.Size = 10000
+	}
+
+	// Prefetch Configuration
+	if err := parsePrefetchConfig(&cfg.Cache.Prefetch); err != nil {
+		return fmt.Errorf("prefetch config: %w", err)
 	}
 
 	// Parse routing rules
@@ -302,40 +382,9 @@ func LoadConfig(path string) error {
 			rule.Strategy = "failover"
 		}
 
-		// --- Detailed Logging of Loaded Rules ---
+		// Log loaded rule with all match conditions
 		LogInfo("[RULE] Loaded '%s' (Strategy: %s)", rule.Name, rule.Strategy)
-		m := rule.Match
-		if m.ClientIP != "" {
-			LogInfo("   ├─ Match OR: Client IP = %s", m.ClientIP)
-		}
-		if m.ClientCIDR != "" {
-			LogInfo("   ├─ Match OR: Client CIDR = %s", m.ClientCIDR)
-		}
-		if m.ClientMAC != "" {
-			LogInfo("   ├─ Match OR: Client MAC = %s", m.ClientMAC)
-		}
-		if m.ClientECS != "" {
-			LogInfo("   ├─ Match OR: Client ECS = %s", m.ClientECS)
-		}
-		if m.ClientEDNSMAC != "" {
-			LogInfo("   ├─ Match OR: Client EDNS0 MAC = %s", m.ClientEDNSMAC)
-		}
-		if m.ServerIP != "" {
-			LogInfo("   ├─ Match OR: Server IP = %s", m.ServerIP)
-		}
-		if m.ServerPort != 0 {
-			LogInfo("   ├─ Match OR: Server Port = %d", m.ServerPort)
-		}
-		if m.ServerHostname != "" {
-			LogInfo("   ├─ Match OR: Hostname = %s", m.ServerHostname)
-		}
-		if m.ServerPath != "" {
-			LogInfo("   ├─ Match OR: Path = %s", m.ServerPath)
-		}
-		if m.QueryDomain != "" {
-			LogInfo("   ├─ Match OR: Query Domain = %s", m.QueryDomain)
-		}
-
+		logMatchConditions(&rule.Match)
 		LogInfo("   └─ Upstreams (%d):", len(rule.parsedUpstreams))
 		for _, u := range rule.parsedUpstreams {
 			LogInfo("      - %s", u.String())
@@ -368,7 +417,6 @@ func LoadConfig(path string) error {
 		cfg.Routing.DefaultRule.Strategy = "failover"
 	}
 
-	// --- Log Default Rule ---
 	LogInfo("[RULE] Loaded 'DEFAULT' (Strategy: %s)", cfg.Routing.DefaultRule.Strategy)
 	LogInfo("   ├─ Match: * (Catch-All)")
 	LogInfo("   └─ Upstreams (%d):", len(cfg.Routing.DefaultRule.parsedUpstreams))
@@ -377,60 +425,180 @@ func LoadConfig(path string) error {
 	}
 	LogInfo("-----------------------------")
 
-	// --- CRITICAL ADDITION: Build Routing Trie ---
 	BuildRoutingTable(cfg.Routing.RoutingRules)
 
 	config = &cfg
 	return nil
 }
 
+// logMatchConditions logs all configured match conditions for a rule
+func logMatchConditions(m *MatchConditions) {
+	if len(m.ClientIP) > 0 {
+		LogInfo("   ├─ Match OR: Client IP = %v", []string(m.ClientIP))
+	}
+	if len(m.ClientCIDR) > 0 {
+		LogInfo("   ├─ Match OR: Client CIDR = %v", []string(m.ClientCIDR))
+	}
+	if len(m.ClientMAC) > 0 {
+		LogInfo("   ├─ Match OR: Client MAC = %v", []string(m.ClientMAC))
+	}
+	if len(m.ClientECS) > 0 {
+		LogInfo("   ├─ Match OR: Client ECS = %v", []string(m.ClientECS))
+	}
+	if len(m.ClientEDNSMAC) > 0 {
+		LogInfo("   ├─ Match OR: Client EDNS0 MAC = %v", []string(m.ClientEDNSMAC))
+	}
+	if len(m.ServerIP) > 0 {
+		LogInfo("   ├─ Match OR: Server IP = %v", []string(m.ServerIP))
+	}
+	if len(m.ServerPort) > 0 {
+		LogInfo("   ├─ Match OR: Server Port = %v", []int(m.ServerPort))
+	}
+	if len(m.ServerHostname) > 0 {
+		LogInfo("   ├─ Match OR: Hostname = %v", []string(m.ServerHostname))
+	}
+	if len(m.ServerPath) > 0 {
+		LogInfo("   ├─ Match OR: Path = %v", []string(m.ServerPath))
+	}
+	if len(m.QueryDomain) > 0 {
+		LogInfo("   ├─ Match OR: Query Domain = %v", []string(m.QueryDomain))
+	}
+}
+
+func parsePrefetchConfig(p *PrefetchConfig) error {
+	// Cross-fetch defaults
+	cf := &p.CrossFetch
+	if cf.Mode == "" {
+		cf.Mode = "off"
+	}
+
+	validModes := map[string]bool{"off": true, "on_a": true, "on_aaaa": true, "both": true}
+	if !validModes[cf.Mode] {
+		return fmt.Errorf("invalid cross_fetch.mode: %s (must be: off, on_a, on_aaaa, both)", cf.Mode)
+	}
+
+	if len(cf.FetchTypes) == 0 {
+		cf.FetchTypes = []string{"A", "AAAA", "HTTPS"}
+	}
+
+	cf.parsedFetchTypes = parseFetchTypes(cf.FetchTypes)
+	if len(cf.parsedFetchTypes) == 0 && cf.Enabled {
+		return fmt.Errorf("cross_fetch.fetch_types: no valid DNS types specified")
+	}
+
+	if cf.MaxConcurrent <= 0 {
+		cf.MaxConcurrent = 10
+	}
+
+	if cf.Timeout == "" {
+		cf.Timeout = "3s"
+	}
+	d, err := time.ParseDuration(cf.Timeout)
+	if err != nil {
+		return fmt.Errorf("invalid cross_fetch.timeout: %w", err)
+	}
+	cf.parsedTimeout = d
+
+	if cf.Mode != "off" {
+		cf.Enabled = true
+	}
+
+	// Stale refresh defaults
+	sr := &p.StaleRefresh
+	if sr.ThresholdPercent <= 0 {
+		sr.ThresholdPercent = 10
+	}
+	if sr.ThresholdPercent > 100 {
+		return fmt.Errorf("invalid stale_refresh.threshold_percent: %d (must be 1-100)", sr.ThresholdPercent)
+	}
+
+	if sr.MinHits <= 0 {
+		sr.MinHits = 2
+	}
+
+	if sr.MaxConcurrent <= 0 {
+		sr.MaxConcurrent = 5
+	}
+
+	if sr.CheckInterval == "" {
+		sr.CheckInterval = "30s"
+	}
+	d, err = time.ParseDuration(sr.CheckInterval)
+	if err != nil {
+		return fmt.Errorf("invalid stale_refresh.check_interval: %w", err)
+	}
+	sr.parsedCheckInterval = d
+
+	LogInfo("=== Prefetch Configuration ===")
+	LogInfo("Cross-Fetch: Enabled=%v, Mode=%s", cf.Enabled, cf.Mode)
+	if cf.Enabled {
+		LogInfo("  FetchTypes: %v", cf.FetchTypes)
+		LogInfo("  MaxConcurrent: %d, Timeout: %v", cf.MaxConcurrent, cf.parsedTimeout)
+	}
+	LogInfo("Stale-Refresh: Enabled=%v", sr.Enabled)
+	if sr.Enabled {
+		LogInfo("  ThresholdPercent: %d%%, MinHits: %d", sr.ThresholdPercent, sr.MinHits)
+		LogInfo("  MaxConcurrent: %d, CheckInterval: %v", sr.MaxConcurrent, sr.parsedCheckInterval)
+	}
+	LogInfo("==============================")
+
+	return nil
+}
+
+// parseMatchConditions parses all match conditions supporting multiple values
 func parseMatchConditions(m *MatchConditions) error {
-	if m.ClientIP != "" {
-		ip := net.ParseIP(m.ClientIP)
+	// Parse Client IPs
+	for _, ipStr := range m.ClientIP {
+		ip := net.ParseIP(ipStr)
 		if ip == nil {
-			return fmt.Errorf("invalid client_ip: %s", m.ClientIP)
+			return fmt.Errorf("invalid client_ip: %s", ipStr)
 		}
-		m.parsedClientIP = ip
+		m.parsedClientIPs = append(m.parsedClientIPs, ip)
 	}
 
-	if m.ClientCIDR != "" {
-		_, ipnet, err := net.ParseCIDR(m.ClientCIDR)
+	// Parse Client CIDRs
+	for _, cidrStr := range m.ClientCIDR {
+		_, ipnet, err := net.ParseCIDR(cidrStr)
 		if err != nil {
-			return fmt.Errorf("invalid client_cidr: %s", m.ClientCIDR)
+			return fmt.Errorf("invalid client_cidr: %s", cidrStr)
 		}
-		m.parsedClientCIDR = ipnet
+		m.parsedClientCIDRs = append(m.parsedClientCIDRs, ipnet)
 	}
 
-	if m.ClientMAC != "" {
-		mac, err := net.ParseMAC(m.ClientMAC)
+	// Parse Client MACs
+	for _, macStr := range m.ClientMAC {
+		mac, err := net.ParseMAC(macStr)
 		if err != nil {
-			return fmt.Errorf("invalid client_mac: %s", m.ClientMAC)
+			return fmt.Errorf("invalid client_mac: %s", macStr)
 		}
-		m.parsedClientMAC = mac
+		m.parsedClientMACs = append(m.parsedClientMACs, mac)
 	}
 
-	if m.ClientECS != "" {
-		_, ipnet, err := net.ParseCIDR(m.ClientECS)
+	// Parse Client ECS CIDRs
+	for _, ecsStr := range m.ClientECS {
+		_, ipnet, err := net.ParseCIDR(ecsStr)
 		if err != nil {
-			return fmt.Errorf("invalid client_ecs: %s", m.ClientECS)
+			return fmt.Errorf("invalid client_ecs: %s", ecsStr)
 		}
-		m.parsedClientECS = ipnet
+		m.parsedClientECSs = append(m.parsedClientECSs, ipnet)
 	}
 
-	if m.ClientEDNSMAC != "" {
-		mac, err := net.ParseMAC(m.ClientEDNSMAC)
+	// Parse Client EDNS MACs
+	for _, macStr := range m.ClientEDNSMAC {
+		mac, err := net.ParseMAC(macStr)
 		if err != nil {
-			return fmt.Errorf("invalid client_edns_mac: %s", m.ClientEDNSMAC)
+			return fmt.Errorf("invalid client_edns_mac: %s", macStr)
 		}
-		m.parsedClientEDNSMAC = mac
+		m.parsedClientEDNSMACs = append(m.parsedClientEDNSMACs, mac)
 	}
 
-	if m.ServerIP != "" {
-		ip := net.ParseIP(m.ServerIP)
+	// Parse Server IPs
+	for _, ipStr := range m.ServerIP {
+		ip := net.ParseIP(ipStr)
 		if ip == nil {
-			return fmt.Errorf("invalid server_ip: %s", m.ServerIP)
+			return fmt.Errorf("invalid server_ip: %s", ipStr)
 		}
-		m.parsedServerIP = ip
+		m.parsedServerIPs = append(m.parsedServerIPs, ip)
 	}
 
 	return nil

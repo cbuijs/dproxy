@@ -1,9 +1,9 @@
 # ------------------------------------------------------------------------------
-# dproxy Configuration File (v2.8.0)
+# dproxy Configuration File (v2.9.0)
 # ------------------------------------------------------------------------------
 # This configuration file controls all aspects of the dproxy server, including
-# network listeners, DoH path validation, TLS settings, caching behavior, and
-# advanced routing logic.
+# network listeners, DoH path validation, TLS settings, caching behavior,
+# prefetching, and advanced routing logic.
 # ------------------------------------------------------------------------------
 
 # --- Logging Configuration ---
@@ -163,9 +163,139 @@ cache:
   enabled: true
   
   # Maximum number of entries to store in the cache.
-  # When full, SmartLRU eviction is used.
+  # When full, LRU eviction is used.
   # Default: 10000
   size: 10000
+
+  # --- Prefetch Configuration ---
+  # Prefetching improves cache hit rates and reduces latency by proactively
+  # fetching DNS records before they're needed or before they expire.
+  prefetch:
+  
+    # --- Cross-Fetch Configuration ---
+    # When a client queries for one record type (e.g., A), automatically fetch
+    # related record types (e.g., AAAA, HTTPS) in the background and cache them.
+    # This reduces latency for subsequent queries for related records.
+    #
+    # Use case: Modern browsers often query A, AAAA, and HTTPS records in quick
+    # succession. By prefetching all three when one is requested, the other
+    # queries can be served from cache immediately.
+    cross_fetch:
+      # Enable cross-fetch functionality.
+      # Note: This is also implicitly enabled when mode is not "off".
+      # Default: false
+      enabled: false
+      
+      # Mode determines when cross-fetch is triggered:
+      # - "off":     Disabled (no cross-fetching occurs)
+      # - "on_a":    Only trigger cross-fetch when an A (IPv4) query is received
+      # - "on_aaaa": Only trigger cross-fetch when an AAAA (IPv6) query is received
+      # - "both":    Trigger cross-fetch on both A and AAAA queries
+      #
+      # Recommendation:
+      # - Use "on_a" if your network is primarily IPv4
+      # - Use "on_aaaa" if your network is primarily IPv6
+      # - Use "both" for dual-stack networks (most common)
+      # Default: "off"
+      mode: "off"
+      
+      # fetch_types: List of DNS record types to fetch when cross-fetch is triggered.
+      # The triggering record type is automatically excluded from the fetch list.
+      #
+      # Supported types: A, AAAA, HTTPS, MX, TXT, CNAME, SRV, NS, SOA, PTR, CAA, etc.
+      # (Any standard DNS record type supported by the dns library)
+      #
+      # Common configurations:
+      # - ["A", "AAAA", "HTTPS"]     : Best for web browsing (HTTP/3, Happy Eyeballs)
+      # - ["A", "AAAA"]              : Basic dual-stack prefetch
+      # - ["A", "AAAA", "MX"]        : For mail servers
+      # - ["A", "AAAA", "HTTPS", "TXT"] : Web + SPF/DKIM prefetch
+      #
+      # Default: ["A", "AAAA", "HTTPS"]
+      fetch_types:
+        - "A"
+        - "AAAA"
+        - "HTTPS"
+      
+      # max_concurrent: Maximum number of concurrent background fetch operations.
+      # Higher values = faster prefetching but more resource usage.
+      # Lower values = less resource usage but prefetch may queue up.
+      #
+      # Recommendation: 5-20 for home/small office, 20-50 for larger deployments.
+      # Default: 10
+      max_concurrent: 10
+      
+      # timeout: Maximum time to wait for a background fetch to complete.
+      # Background fetches are lower priority than client requests, so a
+      # shorter timeout prevents resource contention.
+      #
+      # Formats: "500ms", "1s", "3s", "5s"
+      # Default: "3s"
+      timeout: "3s"
+
+    # --- Stale Refresh Configuration ---
+    # Proactively refresh popular cache entries before they expire.
+    # This ensures frequently-accessed domains always have fresh cache entries,
+    # eliminating latency spikes when cache entries expire.
+    #
+    # How it works:
+    # 1. The cache tracks hit counts for each entry
+    # 2. When an entry's remaining TTL falls below the threshold AND the entry
+    #    is "popular" (has enough hits), it's refreshed in the background
+    # 3. The client continues to receive the cached response while refresh happens
+    #
+    # This implements RFC 8767 "Serving Stale Data to Improve DNS Resiliency"
+    # best practices for cache management.
+    stale_refresh:
+      # Enable stale refresh functionality.
+      # Default: false
+      enabled: false
+      
+      # threshold_percent: Refresh when remaining TTL is below this percentage
+      # of the original TTL.
+      #
+      # Example: With threshold_percent: 10 and an original TTL of 300s,
+      # refresh is triggered when remaining TTL drops below 30s.
+      #
+      # Lower values = refresh closer to expiry (less traffic, higher risk of stale)
+      # Higher values = refresh earlier (more traffic, always fresh)
+      #
+      # Recommendation: 5-15% for most deployments
+      # Default: 10
+      threshold_percent: 10
+      
+      # min_hits: Minimum number of cache hits before an entry is considered
+      # "popular" and eligible for proactive refresh.
+      #
+      # This prevents refreshing rarely-accessed entries, saving resources.
+      #
+      # Example: With min_hits: 3, an entry must be accessed at least 3 times
+      # before it will be proactively refreshed.
+      #
+      # Lower values = more entries refreshed (higher cache hit rate, more traffic)
+      # Higher values = fewer entries refreshed (lower traffic, some cache misses)
+      #
+      # Recommendation:
+      # - 2-3 for home/small networks (most entries are accessed multiple times)
+      # - 5-10 for larger networks (focus on truly popular entries)
+      # Default: 2
+      min_hits: 2
+      
+      # max_concurrent: Maximum number of concurrent refresh operations.
+      # Refresh operations are background tasks and should not compete with
+      # client requests for resources.
+      #
+      # Default: 5
+      max_concurrent: 5
+      
+      # check_interval: How often to scan the cache for entries needing refresh.
+      #
+      # Shorter intervals = more responsive refresh (higher CPU usage)
+      # Longer intervals = less CPU usage (some entries may expire before refresh)
+      #
+      # Recommendation: 10-60 seconds depending on typical TTLs in your environment
+      # Default: "30s"
+      check_interval: "30s"
 
 # --- Routing Configuration ---
 routing:
@@ -184,16 +314,110 @@ routing:
     
     local_internal:
       - udp://192.168.1.1:53
+    
+    adblock:
+      - doh://dns.adguard-dns.com/dns-query
 
   # 2. Routing Rules
   # Rules are evaluated from top to bottom. The first matching rule wins.
+  # 
+  # MATCH CONDITIONS:
+  # - All conditions within a rule use OR logic (any match triggers the rule)
+  # - Each condition type accepts either a single value OR a list of values
+  # - Values within a list also use OR logic (any value matches)
+  #
+  # SYNTAX EXAMPLES:
+  #   Single value:    client_ip: "192.168.1.50"
+  #   Multiple values: client_ip:
+  #                      - "192.168.1.50"
+  #                      - "192.168.1.51"
+  #                      - "192.168.1.52"
+  #
+  # AVAILABLE CONDITIONS:
+  #   client_ip:       Match client IP address(es)
+  #   client_cidr:     Match client IP against CIDR range(s)
+  #   client_mac:      Match client MAC address(es) from ARP
+  #   client_ecs:      Match EDNS Client Subnet CIDR(s)
+  #   client_edns_mac: Match MAC from EDNS0 option 65001
+  #   server_ip:       Match server/listener IP address(es)
+  #   server_port:     Match server/listener port(s)
+  #   server_hostname: Match SNI/Host header hostname(s)
+  #   server_path:     Match DoH URL path(s)
+  #   query_domain:    Match query domain name(s), supports wildcards
+  #
+  # DOMAIN WILDCARDS:
+  #   "example.com"    - Exact match only
+  #   ".example.com"   - Matches example.com AND all subdomains
+  #   "*.example.com"  - Matches all subdomains (but NOT example.com itself)
+  
   routing_rules:
+    # Example: Route local domains to internal DNS
     - name: "Local Domains"
       match:
-        query_domain: ".home.arpa"
+        query_domain:
+          - ".home.arpa"
+          - ".local"
+          - ".lan"
+          - ".internal"
       upstreams: local_internal
       strategy: failover
 
+    # Example: Block ads for specific clients
+    - name: "AdBlock Clients"
+      match:
+        client_ip:
+          - "192.168.1.100"
+          - "192.168.1.101"
+          - "192.168.1.102"
+        client_mac:
+          - "aa:bb:cc:dd:ee:f1"
+          - "aa:bb:cc:dd:ee:f2"
+      upstreams: adblock
+      strategy: fastest
+
+    # Example: Family-safe DNS for kids' devices
+    - name: "Kids Devices"
+      match:
+        client_cidr:
+          - "192.168.10.0/24"
+          - "192.168.20.0/24"
+        client_mac:
+          - "11:22:33:44:55:66"
+          - "11:22:33:44:55:77"
+      upstreams: family_safe
+      strategy: failover
+
+    # Example: Route specific domains through secure DNS
+    - name: "Secure Domains"
+      match:
+        query_domain:
+          - ".google.com"
+          - ".googleapis.com"
+          - ".gstatic.com"
+          - ".youtube.com"
+      upstreams: public_secure
+      strategy: fastest
+
+    # Example: Different upstream based on DoH path
+    - name: "Family DoH Path"
+      match:
+        server_path:
+          - "/family"
+          - "/safe"
+          - "/kids"
+      upstreams: family_safe
+      strategy: failover
+
+    # Example: Match multiple server ports
+    - name: "Non-Standard Ports"
+      match:
+        server_port:
+          - 5353
+          - 5354
+      upstreams: local_internal
+      strategy: failover
+
+    # Example: Specific client gets specific upstream
     - name: "Specific Client"
       match:
         client_ip: "192.168.1.50"
