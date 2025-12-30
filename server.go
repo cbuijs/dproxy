@@ -2,6 +2,8 @@
 File: server.go
 Description: Implements the protocol listeners (UDP, TCP, DoT, DoQ, DoH/DoH3) and request handlers.
              UPDATED: Enhanced logging for failed connection attempts and protocol errors.
+             UPDATED: Added String() method to ServerShutdowner for verbose shutdown logging.
+             UPDATED: Consistent verbose logging for server startup.
 */
 
 package main
@@ -15,6 +17,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,6 +29,7 @@ import (
 // ServerShutdowner interface for graceful shutdown
 type ServerShutdowner interface {
 	Shutdown(ctx context.Context) error
+	String() string
 }
 
 // DNSServerWrapper wraps dns.Server to implement ServerShutdowner
@@ -37,6 +41,10 @@ func (w *DNSServerWrapper) Shutdown(ctx context.Context) error {
 	return w.Server.ShutdownContext(ctx)
 }
 
+func (w *DNSServerWrapper) String() string {
+	return fmt.Sprintf("Protocol: DNS/%s | Addr: %s", strings.ToUpper(w.Net), w.Addr)
+}
+
 // HTTPServerWrapper wraps http.Server to implement ServerShutdowner
 type HTTPServerWrapper struct {
 	*http.Server
@@ -44,6 +52,10 @@ type HTTPServerWrapper struct {
 
 func (w *HTTPServerWrapper) Shutdown(ctx context.Context) error {
 	return w.Server.Shutdown(ctx)
+}
+
+func (w *HTTPServerWrapper) String() string {
+	return fmt.Sprintf("Protocol: DoH (HTTP/1.1&2) | Addr: %s | Path: /", w.Addr)
 }
 
 // HTTP3ServerWrapper wraps http3.Server to implement ServerShutdowner
@@ -55,11 +67,16 @@ func (w *HTTP3ServerWrapper) Shutdown(ctx context.Context) error {
 	return w.Server.Close()
 }
 
+func (w *HTTP3ServerWrapper) String() string {
+	return fmt.Sprintf("Protocol: DoH3 (QUIC) | Addr: %s | Path: /", w.Addr)
+}
+
 // DoQServerWrapper wraps QUIC listener for DoQ
 type DoQServerWrapper struct {
 	listener *quic.Listener
 	cancel   context.CancelFunc
 	done     chan struct{}
+	Addr     string
 }
 
 func (w *DoQServerWrapper) Shutdown(ctx context.Context) error {
@@ -76,11 +93,16 @@ func (w *DoQServerWrapper) Shutdown(ctx context.Context) error {
 	}
 }
 
+func (w *DoQServerWrapper) String() string {
+	return fmt.Sprintf("Protocol: DoQ | Addr: %s", w.Addr)
+}
+
 // DoTServerWrapper for custom SNI handling
 type DoTServerWrapper struct {
 	listener net.Listener
 	wg       sync.WaitGroup
 	quit     chan struct{}
+	Addr     string
 }
 
 func (w *DoTServerWrapper) Shutdown(ctx context.Context) error {
@@ -101,6 +123,10 @@ func (w *DoTServerWrapper) Shutdown(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+func (w *DoTServerWrapper) String() string {
+	return fmt.Sprintf("Protocol: DoT | Addr: %s", w.Addr)
 }
 
 func (w *DoTServerWrapper) acceptLoop() {
@@ -152,6 +178,9 @@ func startServers(wg *sync.WaitGroup, tlsConfig *tls.Config) []ServerShutdowner 
 	// UDP Listener
 	wg.Add(1)
 	udpServer := &dns.Server{Addr: fmt.Sprintf("%s:%d", listenAddr, udpPort), Net: "udp"}
+	udpWrapper := &DNSServerWrapper{udpServer} // Create wrapper early for logging
+	
+	// Set the Handler *before* wrapping if possible, or just use udpServer inside closure
 	udpServer.Handler = dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
 		ctx, cancel := context.WithTimeout(context.Background(), getTimeout())
 		defer cancel()
@@ -162,18 +191,21 @@ func startServers(wg *sync.WaitGroup, tlsConfig *tls.Config) []ServerShutdowner 
 		}
 		processDNSRequest(ctx, w, r, reqCtx)
 	})
+	
 	go func() {
 		defer wg.Done()
-		LogInfo("Starting DNS UDP on %s:%d", listenAddr, udpPort)
+		LogInfo("Starting Server [%s]", udpWrapper.String())
 		if err := udpServer.ListenAndServe(); err != nil {
-			LogError("UDP server stopped: %v", err)
+			LogError("Server [%s] stopped: %v", udpWrapper.String(), err)
 		}
 	}()
-	servers = append(servers, &DNSServerWrapper{udpServer})
+	servers = append(servers, udpWrapper)
 
 	// TCP Listener
 	wg.Add(1)
 	tcpServer := &dns.Server{Addr: fmt.Sprintf("%s:%d", listenAddr, udpPort), Net: "tcp"}
+	tcpWrapper := &DNSServerWrapper{tcpServer} // Create wrapper early for logging
+
 	tcpServer.Handler = dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
 		ctx, cancel := context.WithTimeout(context.Background(), getTimeout())
 		defer cancel()
@@ -184,14 +216,15 @@ func startServers(wg *sync.WaitGroup, tlsConfig *tls.Config) []ServerShutdowner 
 		}
 		processDNSRequest(ctx, w, r, reqCtx)
 	})
+	
 	go func() {
 		defer wg.Done()
-		LogInfo("Starting DNS TCP on %s:%d", listenAddr, udpPort)
+		LogInfo("Starting Server [%s]", tcpWrapper.String())
 		if err := tcpServer.ListenAndServe(); err != nil {
-			LogError("TCP server stopped: %v", err)
+			LogError("Server [%s] stopped: %v", tcpWrapper.String(), err)
 		}
 	}()
-	servers = append(servers, &DNSServerWrapper{tcpServer})
+	servers = append(servers, tcpWrapper)
 
 	// DoT (DNS over TLS) Listener - Custom Implementation for SNI
 	wg.Add(1)
@@ -204,11 +237,12 @@ func startServers(wg *sync.WaitGroup, tlsConfig *tls.Config) []ServerShutdowner 
 		dotServer := &DoTServerWrapper{
 			listener: dotListener,
 			quit:     make(chan struct{}),
+			Addr:     dotAddr,
 		}
 
 		go func() {
 			defer wg.Done()
-			LogInfo("Starting DoT on %s", dotAddr)
+			LogInfo("Starting Server [%s]", dotServer.String())
 			dotServer.acceptLoop()
 		}()
 		servers = append(servers, dotServer)
@@ -218,17 +252,17 @@ func startServers(wg *sync.WaitGroup, tlsConfig *tls.Config) []ServerShutdowner 
 	wg.Add(1)
 	doqCtx, doqCancel := context.WithCancel(context.Background())
 	doqDone := make(chan struct{})
-	doqWrapper := &DoQServerWrapper{cancel: doqCancel, done: doqDone}
+	doqAddr := fmt.Sprintf("%s:%d", listenAddr, tlsPort)
+	doqWrapper := &DoQServerWrapper{cancel: doqCancel, done: doqDone, Addr: doqAddr}
 	
 	go func() {
 		defer wg.Done()
 		defer close(doqDone)
 		
-		addr := fmt.Sprintf("%s:%d", listenAddr, tlsPort)
-		LogInfo("Starting DoQ on %s", addr)
-		listener, err := quic.ListenAddr(addr, tlsConfig, nil)
+		LogInfo("Starting Server [%s]", doqWrapper.String())
+		listener, err := quic.ListenAddr(doqAddr, tlsConfig, nil)
 		if err != nil {
-			LogError("DoQ listen error: %v", err)
+			LogError("Server [%s] listen error: %v", doqWrapper.String(), err)
 			return
 		}
 		doqWrapper.listener = listener
@@ -236,7 +270,7 @@ func startServers(wg *sync.WaitGroup, tlsConfig *tls.Config) []ServerShutdowner 
 		for {
 			select {
 			case <-doqCtx.Done():
-				LogInfo("DoQ server stopped")
+				LogInfo("Server [%s] stopped", doqWrapper.String())
 				return
 			default:
 				sess, err := listener.Accept(doqCtx)
@@ -265,25 +299,29 @@ func startServers(wg *sync.WaitGroup, tlsConfig *tls.Config) []ServerShutdowner 
 
 	h3Server := &http3.Server{Addr: addr, Handler: mux, TLSConfig: tlsConfig}
 	h1Server := &http.Server{Addr: addr, Handler: mux, TLSConfig: tlsConfig}
+	
+	h1Wrapper := &HTTPServerWrapper{h1Server}
+	h3Wrapper := &HTTP3ServerWrapper{h3Server}
 
 	go func() {
 		defer wg.Done()
-		LogInfo("Starting DoH/DoH3 on %s", addr)
+		LogInfo("Starting Server [%s]", h1Wrapper.String())
+		LogInfo("Starting Server [%s]", h3Wrapper.String())
 		
 		// Start HTTP/3 in a goroutine
 		go func() {
 			if err := h3Server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				LogError("DoH3 server stopped: %v", err)
+				LogError("Server [%s] stopped: %v", h3Wrapper.String(), err)
 			}
 		}()
 		
 		// Start HTTP/1.1 & HTTP/2
 		if err := h1Server.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
-			LogError("DoH server stopped: %v", err)
+			LogError("Server [%s] stopped: %v", h1Wrapper.String(), err)
 		}
 	}()
-	servers = append(servers, &HTTPServerWrapper{h1Server})
-	servers = append(servers, &HTTP3ServerWrapper{h3Server})
+	servers = append(servers, h1Wrapper)
+	servers = append(servers, h3Wrapper)
 
 	return servers
 }

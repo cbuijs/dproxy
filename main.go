@@ -1,6 +1,7 @@
 /*
 File: main.go
 Description: Entry point for the dproxy application. Initializes globals, parses flags, and starts the system.
+             UPDATED: Enhanced shutdown logging to show specific server details (Protocol, Addr).
 */
 
 package main
@@ -202,9 +203,9 @@ func gracefulShutdown(servers []ServerShutdowner) {
 			go func(index int, server ServerShutdowner) {
 				defer wg.Done()
 				if err := server.Shutdown(ctx); err != nil {
-					LogError("Error shutting down server %d: %v", index, err)
+					LogError("Error shutting down server [%s]: %v", server.String(), err)
 				} else {
-					LogInfo("Server %d shut down successfully", index)
+					LogInfo("Server [%s] shut down successfully", server.String())
 				}
 			}(i, srv)
 		}
