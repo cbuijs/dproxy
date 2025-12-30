@@ -18,9 +18,28 @@ import (
 
 type Config struct {
 	Server    ServerConfig    `yaml:"server"`
+	Logging   LoggingConfig   `yaml:"logging"` // Added top-level logging config
 	Bootstrap BootstrapConfig `yaml:"bootstrap"`
 	Cache     CacheConfig     `yaml:"cache"`
 	Routing   RoutingConfig   `yaml:"routing"`
+}
+
+type LoggingConfig struct {
+	Level   string   `yaml:"level"`   // DEBUG, INFO, WARN, ERROR
+	Format  string   `yaml:"format"`  // text, json
+	Outputs []string `yaml:"outputs"` // console, file, syslog
+
+	File struct {
+		Path        string `yaml:"path"`
+		Permissions uint32 `yaml:"permissions"` // e.g. 0644
+	} `yaml:"file"`
+
+	Syslog struct {
+		Network  string `yaml:"network"`  // udp, tcp
+		Address  string `yaml:"address"`  // e.g. "localhost:514"
+		Tag      string `yaml:"tag"`      // default: dproxy
+		Facility int    `yaml:"facility"` // default: 16 (Local0)
+	} `yaml:"syslog"`
 }
 
 type ServerConfig struct {
@@ -35,7 +54,8 @@ type ServerConfig struct {
 		KeyFile  string `yaml:"key_file"`
 	} `yaml:"tls"`
 
-	// New field for log level
+	// Deprecated: use logging.level instead. Kept for backward compat if needed,
+	// but logic will prefer logging.level if set.
 	LogLevel string `yaml:"log_level"`
 
 	DOH struct {
@@ -136,9 +156,31 @@ func LoadConfig(path string) error {
 		cfg.Server.Ports.HTTPS = 443
 	}
 
-	// Default Log Level
-	if cfg.Server.LogLevel == "" {
-		cfg.Server.LogLevel = "INFO"
+	// Logging Defaults
+	if cfg.Logging.Level == "" {
+		if cfg.Server.LogLevel != "" {
+			cfg.Logging.Level = cfg.Server.LogLevel
+		} else {
+			cfg.Logging.Level = "INFO"
+		}
+	}
+	if cfg.Logging.Format == "" {
+		cfg.Logging.Format = "text"
+	}
+	if len(cfg.Logging.Outputs) == 0 {
+		cfg.Logging.Outputs = []string{"console"}
+	}
+	if cfg.Logging.Syslog.Address == "" {
+		cfg.Logging.Syslog.Address = "127.0.0.1:514"
+	}
+	if cfg.Logging.Syslog.Network == "" {
+		cfg.Logging.Syslog.Network = "udp"
+	}
+	if cfg.Logging.Syslog.Tag == "" {
+		cfg.Logging.Syslog.Tag = "dproxy"
+	}
+	if cfg.Logging.Syslog.Facility == 0 {
+		cfg.Logging.Syslog.Facility = 16 // Local0
 	}
 
 	// DoH Defaults
@@ -186,22 +228,6 @@ func LoadConfig(path string) error {
 		return fmt.Errorf("invalid edns0.ecs.ipv6_mask: %d (must be 0-128)", cfg.Server.EDNS0.ECS.IPv6Mask)
 	}
 
-	// Log EDNS0 configuration (Use LogInfo so it shows up at startup default level)
-	LogInfo("=== EDNS0 Configuration ===")
-	LogInfo("ECS Mode: %s", cfg.Server.EDNS0.ECS.Mode)
-	if cfg.Server.EDNS0.ECS.SourceMask > 0 {
-		LogInfo("ECS Source Mask (both): /%d", cfg.Server.EDNS0.ECS.SourceMask)
-	}
-	if cfg.Server.EDNS0.ECS.IPv4Mask > 0 {
-		LogInfo("ECS IPv4 Mask: /%d", cfg.Server.EDNS0.ECS.IPv4Mask)
-	}
-	if cfg.Server.EDNS0.ECS.IPv6Mask > 0 {
-		LogInfo("ECS IPv6 Mask: /%d", cfg.Server.EDNS0.ECS.IPv6Mask)
-	}
-	LogInfo("MAC Mode: %s", cfg.Server.EDNS0.MAC.Mode)
-	LogInfo("MAC Source: %s", cfg.Server.EDNS0.MAC.Source)
-	LogInfo("===========================")
-
 	// Bootstrap Defaults
 	if len(cfg.Bootstrap.Servers) == 0 {
 		cfg.Bootstrap.Servers = []string{"1.1.1.1:53", "8.8.8.8:53"}
@@ -217,14 +243,11 @@ func LoadConfig(path string) error {
 	}
 	bootstrapServers = cfg.Bootstrap.Servers
 
-	LogInfo("Bootstrap Configuration: Servers=%v, IPVersion=%s", bootstrapServers, cfg.Bootstrap.IPVersion)
-
 	if cfg.Cache.Size == 0 {
 		cfg.Cache.Size = 10000
 	}
 
 	// Parse routing rules
-	LogInfo("--- Loading Routing Rules ---")
 	for i := range cfg.Routing.RoutingRules {
 		rule := &cfg.Routing.RoutingRules[i]
 
@@ -251,45 +274,6 @@ func LoadConfig(path string) error {
 
 		if rule.Strategy == "" {
 			rule.Strategy = "failover"
-		}
-
-		// --- Detailed Logging of Loaded Rules ---
-		LogInfo("[RULE] Loaded '%s' (Strategy: %s)", rule.Name, rule.Strategy)
-		m := rule.Match
-		if m.ClientIP != "" {
-			LogInfo("   ├─ Match OR: Client IP = %s", m.ClientIP)
-		}
-		if m.ClientCIDR != "" {
-			LogInfo("   ├─ Match OR: Client CIDR = %s", m.ClientCIDR)
-		}
-		if m.ClientMAC != "" {
-			LogInfo("   ├─ Match OR: Client MAC = %s", m.ClientMAC)
-		}
-		if m.ClientECS != "" {
-			LogInfo("   ├─ Match OR: Client ECS = %s", m.ClientECS)
-		}
-		if m.ClientEDNSMAC != "" {
-			LogInfo("   ├─ Match OR: Client EDNS0 MAC = %s", m.ClientEDNSMAC)
-		}
-		if m.ServerIP != "" {
-			LogInfo("   ├─ Match OR: Server IP = %s", m.ServerIP)
-		}
-		if m.ServerPort != 0 {
-			LogInfo("   ├─ Match OR: Server Port = %d", m.ServerPort)
-		}
-		if m.ServerHostname != "" {
-			LogInfo("   ├─ Match OR: Hostname = %s", m.ServerHostname)
-		}
-		if m.ServerPath != "" {
-			LogInfo("   ├─ Match OR: Path = %s", m.ServerPath)
-		}
-		if m.QueryDomain != "" {
-			LogInfo("   ├─ Match OR: Query Domain = %s", m.QueryDomain)
-		}
-
-		LogInfo("   └─ Upstreams (%d):", len(rule.parsedUpstreams))
-		for _, u := range rule.parsedUpstreams {
-			LogInfo("      - %s", u.String())
 		}
 	}
 
@@ -319,16 +303,7 @@ func LoadConfig(path string) error {
 		cfg.Routing.DefaultRule.Strategy = "failover"
 	}
 
-	// --- Log Default Rule ---
-	LogInfo("[RULE] Loaded 'DEFAULT' (Strategy: %s)", cfg.Routing.DefaultRule.Strategy)
-	LogInfo("   ├─ Match: * (Catch-All)")
-	LogInfo("   └─ Upstreams (%d):", len(cfg.Routing.DefaultRule.parsedUpstreams))
-	for _, u := range cfg.Routing.DefaultRule.parsedUpstreams {
-		LogInfo("      - %s", u.String())
-	}
-	LogInfo("-----------------------------")
-
-	// --- CRITICAL ADDITION: Build Routing Trie ---
+	// --- Build Routing Trie ---
 	BuildRoutingTable(cfg.Routing.RoutingRules)
 
 	config = &cfg

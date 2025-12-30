@@ -172,7 +172,8 @@ func refreshARP(ctx context.Context) {
 	if len(tempTable) != countBefore {
 		LogDebug("[ARP] Table refreshed in %v. Entries: %d (Delta: %d)", 
 			time.Since(start), len(tempTable), len(tempTable)-countBefore)
-	} else if currentLogLevel <= LevelDebug {
+	} else {
+		// LogDebug will handle level checking internally
 		LogDebug("[ARP] Table refreshed in %v. No changes. Entries: %d", 
 			time.Since(start), len(tempTable))
 	}

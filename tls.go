@@ -38,7 +38,8 @@ func getTLSConfig(certPath, keyPath, listenIP string) (*tls.Config, error) {
 
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{"h3", "doq", "h2", "http/1.1"},
+		// Added "dot" for proper DNS over TLS ALPN negotiation
+		NextProtos:   []string{"dot", "h3", "doq", "h2", "http/1.1"},
 		ClientAuth:   tls.NoClientCert,
 		MinVersion:   tls.VersionTLS12,
 	}, nil
