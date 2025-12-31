@@ -100,19 +100,20 @@ routing:
       - udp://192.168.1.1:53
 
   routing_rules:
-    # Example: Blocklist using a HOSTS file
-    # Queries matching entries in /etc/blocked.hosts will be answered immediately
-    # with the IP from the file (e.g., 0.0.0.0 or 127.0.0.1) without going upstream.
-    # hosts_wildcard: true ensures subdomains are also blocked.
+    # Example: Blocklist using a HOSTS file AND online list
+    # Queries matching entries in these lists will be answered immediately.
     - name: "Blocklist"
       match:
         query_domain:
           - "*.ads.example.com"
           - "*.tracker.com"
-      upstreams: public_secure # Fallback if not found in hosts (unlikely for blocklist use case)
+      upstreams: public_secure
       hosts_files:
         - "/etc/blocked.hosts"
+      hosts_urls:
+        - "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
       hosts_wildcard: true
+      hosts_optimize: false # Optional: Set to true to remove redundant subdomains (default: false)
 
     # Example: Local Development Override
     # Check /etc/hosts for local overrides first, then go to internal DNS.

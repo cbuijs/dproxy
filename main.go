@@ -122,22 +122,36 @@ Usage: %s -config <config.yaml>
 	startBackgroundTasks()
 
 	// --- START HOSTS FILE REFRESHERS ---
+	// Strategy: If URLs are present, use a long interval (1h) to be polite.
+	// If only local files are used, use a short interval (30s) for rapid dev feedback.
+	
 	// Check Default Rule
 	if config.Routing.DefaultRule.parsedHosts != nil {
+		interval := 30 * time.Second
+		if config.Routing.DefaultRule.parsedHosts.HasRemote() {
+			interval = 1 * time.Hour
+		}
+		
 		shutdownWg.Add(1)
 		go func() {
 			defer shutdownWg.Done()
-			config.Routing.DefaultRule.parsedHosts.StartAutoRefresh(shutdownContext, 30*time.Second)
+			config.Routing.DefaultRule.parsedHosts.StartAutoRefresh(shutdownContext, interval)
 		}()
 	}
+	
 	// Check specific Routing Rules
 	for i := range config.Routing.RoutingRules {
 		rule := &config.Routing.RoutingRules[i]
 		if rule.parsedHosts != nil {
+			interval := 30 * time.Second
+			if rule.parsedHosts.HasRemote() {
+				interval = 1 * time.Hour
+			}
+
 			shutdownWg.Add(1)
 			go func(hc *HostsCache) {
 				defer shutdownWg.Done()
-				hc.StartAutoRefresh(shutdownContext, 30*time.Second)
+				hc.StartAutoRefresh(shutdownContext, interval)
 			}(rule.parsedHosts)
 		}
 	}

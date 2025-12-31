@@ -2,7 +2,8 @@
 File: process.go
 Description: Handles the core processing logic for DNS requests, including Singleflight, EDNS0 extraction,
              logging, response cleaning, HOSTS file checking, and forwarding to upstreams.
-             UPDATED: HOSTS check added BEFORE internal cache for immediate blocklist effect.
+             UPDATED: Fixed HOSTS Lookup call to handle the 2 return values (answers, found).
+             UPDATED: Updated HOSTS LookupPTR call to handle the 2 return values (answers, found).
 */
 
 package main
@@ -162,22 +163,34 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	// Checked BEFORE internal cache so updates (e.g. blocklists) take effect immediately
 	if hostsCache != nil && len(r.Question) > 0 {
 		var answers []dns.RR
+		var found bool
 		qName := r.Question[0].Name
 
 		if qType == dns.TypePTR {
-			answers = hostsCache.LookupPTR(qName)
+			// Updated signature handling
+			answers, found = hostsCache.LookupPTR(qName)
 		} else {
-			answers = hostsCache.Lookup(qName, qType, hostsWildcard)
+			// Updated signature handling
+			answers, found = hostsCache.Lookup(qName, qType, hostsWildcard)
 		}
 
-		if len(answers) > 0 {
+		if found {
 			resp := new(dns.Msg)
 			resp.SetReply(r)
-			resp.Answer = answers
 			
-			// Log match details
-			LogDebug("[PROCESS] Serving from HOSTS file (Rule: %s)", ruleName)
-			logRequest(r.Id, reqCtx, qInfo, "", "NOERROR (HOSTS)", "HOSTS", 0, time.Since(start), resp)
+			if len(answers) > 0 {
+				resp.Answer = answers
+				LogDebug("[PROCESS] Serving from HOSTS file (Rule: %s)", ruleName)
+				logRequest(r.Id, reqCtx, qInfo, "", "NOERROR (HOSTS)", "HOSTS", 0, time.Since(start), resp)
+			} else {
+				// Found name in hosts, but not for this type (e.g. AAAA query but only IPv4 in hosts)
+				// OR it's a BLOCKED PTR query (0.0.0.0) where answers is nil
+				// Return NXDOMAIN as requested to stop further resolution
+				resp.Rcode = dns.RcodeNameError
+				LogDebug("[PROCESS] Serving NXDOMAIN from HOSTS file (Rule: %s, Type mismatch or Blocked PTR)", ruleName)
+				logRequest(r.Id, reqCtx, qInfo, "", "NXDOMAIN (HOSTS)", "HOSTS", 0, time.Since(start), resp)
+			}
+			
 			w.WriteMsg(resp)
 			return
 		}
