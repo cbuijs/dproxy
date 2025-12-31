@@ -2,7 +2,7 @@
 File: process.go
 Description: Handles the core processing logic for DNS requests, including Singleflight, EDNS0 extraction,
              logging, response cleaning, and forwarding to upstreams with specific strategies.
-             UPDATED: Added cross-fetch trigger after successful upstream responses.
+             UPDATED: Improved error handling to reduce log noise on timeouts and ensure client response.
 */
 
 package main
@@ -58,7 +58,9 @@ var reqCtxPool = sync.Pool{
 	},
 }
 
-var raceLimiter = make(chan struct{}, 256)
+// UPDATED: Increased limiter size to 4096 to accommodate multi-upstream racing
+// and encrypted handshake latencies without starving new requests.
+var raceLimiter = make(chan struct{}, 4096)
 
 type queryResult struct {
 	msg         *dns.Msg
@@ -195,7 +197,14 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	})
 
 	if err != nil {
-		LogError("Error forwarding %s from %s: %v", qInfo, ip, err)
+		// UPDATED: Distinguish between timeout (load shedding) and actual errors
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			LogWarn("Query timeout for %s from %s (Upstreams busy/slow)", qInfo, ip)
+		} else {
+			LogError("Error forwarding %s from %s: %v", qInfo, ip, err)
+		}
+		
+		// Ensure client always gets an answer (SERVFAIL)
 		dns.HandleFailed(w, r)
 		return
 	}
