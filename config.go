@@ -3,6 +3,7 @@ File: config.go
 Description: Defines configuration structures and handles YAML parsing and validation.
 UPDATED: Added prefetch configuration (cross-fetch and stale refresh).
 UPDATED: Support for multiple values per match condition type (arrays).
+UPDATED: Added Listeners configuration for multiple bind addresses/ports.
 */
 
 package main
@@ -45,13 +46,22 @@ type LoggingConfig struct {
 	} `yaml:"syslog"`
 }
 
+type ListenerConfig struct {
+	Address  string `yaml:"address"`
+	Port     int    `yaml:"port"`
+	Protocol string `yaml:"protocol"` // dns, udp, tcp, dot, doq, doh, doh3, https
+}
+
 type ServerConfig struct {
-	ListenAddr string `yaml:"listen_addr"`
+	ListenAddr string `yaml:"listen_addr"` // Deprecated: use Listeners
 	Ports      struct {
 		UDP   int `yaml:"udp"`
 		TLS   int `yaml:"tls"`
 		HTTPS int `yaml:"https"`
 	} `yaml:"ports"`
+
+	Listeners []ListenerConfig `yaml:"listeners"`
+
 	TLS struct {
 		CertFile string `yaml:"cert_file"`
 		KeyFile  string `yaml:"key_file"`
@@ -231,6 +241,34 @@ func LoadConfig(path string) error {
 	}
 	if cfg.Server.Ports.HTTPS == 0 {
 		cfg.Server.Ports.HTTPS = 443
+	}
+
+	// Backward Compatibility: Populate Listeners from old config if Listeners is empty
+	if len(cfg.Server.Listeners) == 0 {
+		// DNS (UDP & TCP)
+		cfg.Server.Listeners = append(cfg.Server.Listeners, ListenerConfig{
+			Address:  cfg.Server.ListenAddr,
+			Port:     cfg.Server.Ports.UDP,
+			Protocol: "dns",
+		})
+		// DoT (TCP)
+		cfg.Server.Listeners = append(cfg.Server.Listeners, ListenerConfig{
+			Address:  cfg.Server.ListenAddr,
+			Port:     cfg.Server.Ports.TLS,
+			Protocol: "dot",
+		})
+		// DoQ (UDP)
+		cfg.Server.Listeners = append(cfg.Server.Listeners, ListenerConfig{
+			Address:  cfg.Server.ListenAddr,
+			Port:     cfg.Server.Ports.TLS,
+			Protocol: "doq",
+		})
+		// HTTPS (DoH & DoH3)
+		cfg.Server.Listeners = append(cfg.Server.Listeners, ListenerConfig{
+			Address:  cfg.Server.ListenAddr,
+			Port:     cfg.Server.Ports.HTTPS,
+			Protocol: "https",
+		})
 	}
 
 	// Logging Defaults

@@ -1,6 +1,7 @@
 /*
 File: tls.go
 Description: Helper functions for loading TLS certificates or generating self-signed certificates.
+UPDATED: Support for multiple listener IPs in self-signed certificate generation.
 */
 
 package main
@@ -19,7 +20,8 @@ import (
 	"time"
 )
 
-func getTLSConfig(certPath, keyPath, listenIP string) (*tls.Config, error) {
+// getTLSConfig now accepts a slice of strings for listenIPs
+func getTLSConfig(certPath, keyPath string, listenIPs []string) (*tls.Config, error) {
 	var cert tls.Certificate
 	var err error
 
@@ -29,8 +31,8 @@ func getTLSConfig(certPath, keyPath, listenIP string) (*tls.Config, error) {
 			return nil, fmt.Errorf("failed to load certificates: %w", err)
 		}
 	} else {
-		LogInfo("Generating self-signed certificate...")
-		cert, err = generateSelfSignedCert(listenIP)
+		LogInfo("Generating self-signed certificate for %v...", listenIPs)
+		cert, err = generateSelfSignedCert(listenIPs)
 		if err != nil {
 			return nil, fmt.Errorf("failed to generate certificate: %w", err)
 		}
@@ -45,15 +47,20 @@ func getTLSConfig(certPath, keyPath, listenIP string) (*tls.Config, error) {
 	}, nil
 }
 
-func generateSelfSignedCert(listenIP string) (tls.Certificate, error) {
+// generateSelfSignedCert now accepts a slice of strings
+func generateSelfSignedCert(listenIPs []string) (tls.Certificate, error) {
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return tls.Certificate{}, err
 	}
 
 	ips := []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")}
-	if ip := net.ParseIP(listenIP); ip != nil {
-		ips = append(ips, ip)
+	
+	// Add all configured listener IPs to SANs
+	for _, ipStr := range listenIPs {
+		if ip := net.ParseIP(ipStr); ip != nil {
+			ips = append(ips, ip)
+		}
 	}
 
 	hostnames := []string{"localhost"}

@@ -2,6 +2,7 @@
 File: main.go
 Description: Entry point for the dproxy application. Initializes globals, parses flags, and starts the system.
              UPDATED: Enhanced shutdown logging to show specific server details (Protocol, Addr).
+             UPDATED: Collects all listener IPs for TLS generation.
 */
 
 package main
@@ -126,8 +127,14 @@ Usage: %s -config <config.yaml>
 	// Start background maintenance routines
 	startBackgroundTasks()
 
+	// Collect all listener IPs for TLS certificate generation
+	var listenIPs []string
+	for _, l := range config.Server.Listeners {
+		listenIPs = append(listenIPs, l.Address)
+	}
+
 	// Setup TLS
-	tlsConfig, err := getTLSConfig(config.Server.TLS.CertFile, config.Server.TLS.KeyFile, config.Server.ListenAddr)
+	tlsConfig, err := getTLSConfig(config.Server.TLS.CertFile, config.Server.TLS.KeyFile, listenIPs)
 	if err != nil {
 		LogFatal("Failed to setup TLS: %v", err)
 	}

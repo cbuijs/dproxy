@@ -1,5 +1,5 @@
 # ------------------------------------------------------------------------------
-# dproxy Configuration File (v2.9.0)
+# dproxy Configuration File (v3.0.0)
 # ------------------------------------------------------------------------------
 # This configuration file controls all aspects of the dproxy server, including
 # network listeners, DoH path validation, TLS settings, caching behavior,
@@ -37,27 +37,58 @@ logging:
 
 # --- Server Configuration ---
 server:
-  # The IP address to bind to. "0.0.0.0" binds to all available interfaces.
-  # Default: "0.0.0.0"
-  listen_addr: "0.0.0.0"
+  # --- Listeners (NEW in v3.0) ---
+  # Configure multiple listeners to bind specific protocols to specific addresses and ports.
+  # This section replaces the old 'listen_addr' and 'ports' configuration.
+  #
+  # Available Protocols:
+  # - "dns":   Standard DNS on both UDP and TCP (Common for Port 53)
+  # - "udp":   Standard DNS on UDP only
+  # - "tcp":   Standard DNS on TCP only
+  # - "dot":   DNS over TLS (RFC 7858)
+  # - "doq":   DNS over QUIC (RFC 9250)
+  # - "https": DNS over HTTPS (Supports HTTP/1.1, HTTP/2, and HTTP/3)
+  # - "doh":   DNS over HTTPS (HTTP/1.1 & HTTP/2 only)
+  # - "doh3":  DNS over HTTPS (HTTP/3 QUIC only)
+  
+  listeners:
+    # Example: Bind Standard DNS (UDP+TCP) to all interfaces
+    - address: "0.0.0.0"
+      port: 53
+      protocol: "dns"
 
-  # Ports to listen on for different protocols.
-  ports:
-    # Standard DNS over UDP and TCP.
-    # Default: 53
-    udp: 53
-    
-    # DNS over TLS (DoT) and DNS over QUIC (DoQ).
-    # Default: 853
-    tls: 853
-    
-    # DNS over HTTPS (DoH) and HTTP/3 (DoH3).
-    # Default: 443
-    https: 443
+    # Example: Bind DoT (TLS) to all interfaces
+    - address: "0.0.0.0"
+      port: 853
+      protocol: "dot"
+
+    # Example: Bind DoH (HTTPS) to all interfaces
+    - address: "0.0.0.0"
+      port: 443
+      protocol: "https"
+
+    # Example: Bind DoQ (QUIC) to all interfaces
+    - address: "0.0.0.0"
+      port: 853
+      protocol: "doq"
+      
+    # Example: Internal management listener (UDP only) on localhost
+    # - address: "127.0.0.1"
+    #   port: 5353
+    #   protocol: "udp"
+
+  # --- Legacy Configuration (Deprecated but Supported) ---
+  # If 'listeners' is empty, these settings will be used to generate default listeners.
+  # listen_addr: "0.0.0.0"
+  # ports:
+  #   udp: 53
+  #   tls: 853
+  #   https: 443
   
   # TLS Certificate settings.
   # Required for DoT, DoQ, DoH, and DoH3.
-  # If left empty, a self-signed certificate will be generated automatically at startup.
+  # If left empty, a self-signed certificate will be generated automatically at startup
+  # covering all configured listener addresses.
   tls:
     cert_file: ""  # Path to your .crt or .pem file
     key_file: ""   # Path to your .key file
