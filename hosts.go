@@ -1,10 +1,12 @@
 /*
 File: hosts.go
-Description: Handles loading, parsing, and querying of standard HOSTS files.
+Description: Handles loading, parsing, and querying of standard HOSTS files AND Domain Lists.
              Supports IPv4, IPv6, PTR (Reverse), and optional wildcard matching for subdomains.
-             UPDATED: Optimized "optimize" function with parallel processing for large lists.
-             UPDATED: Added logic to return NULL responses for 0.0.0.0/:: entries and NXDOMAIN for their PTRs.
-             UPDATED: Extended blocking logic (NULL response/NXDOMAIN) to 127.0.0.1 and ::1.
+             UPDATED: Added logic to detect "Domain Lists" (lines without IPs) and treat them as blocked (0.0.0.0).
+             UPDATED: Parser now returns and logs the detected file format (HOSTS/DOMAINS/MIXED).
+             UPDATED: Strict parsing: discarding empty/comment lines, ensuring HOSTS syntax (IP host...), and stripping leading/trailing dots from domains.
+             UPDATED: Filters out domain names that are syntactically valid IP addresses.
+             UPDATED: Added debug logging for hostname sanitation and skipping.
 */
 
 package main
@@ -274,54 +276,133 @@ func isBlockedIP(ip net.IP) bool {
 	return false
 }
 
-// parseReader is a helper to parse HOSTS content from any reader into provided maps
-func parseReader(r io.Reader, forward map[string][]net.IP, reverse map[string][]string) (int, int) {
+// parseReader is a helper to parse HOSTS content OR DOMAIN lists from any reader.
+// Automatically detects format line-by-line.
+// Returns: addedNames, addedIPs, detectedFormatString
+func parseReader(sourceName string, r io.Reader, forward map[string][]net.IP, reverse map[string][]string) (int, int, string) {
 	addedNames := 0
 	addedIPs := 0
 	
+	// Format detection counters
+	hostsCount := 0
+	domainsCount := 0
+
+	zeroIP := net.IPv4(0, 0, 0, 0) // Used for domain list entries (blocked)
+
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
+		
+		// 1. Skip empty lines and comments (#)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
+		
+		// Remove inline comments
 		if idx := strings.Index(line, "#"); idx != -1 {
 			line = line[:idx]
 		}
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
+		
+		// Re-trim after removing comments
+		line = strings.TrimSpace(line)
+		if line == "" {
 			continue
 		}
 
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+
+		// Attempt to parse first field as IP
 		ipStr := fields[0]
 		ip := net.ParseIP(ipStr)
-		if ip == nil {
-			continue
-		}
 
-		// Check if IP is blocked (0.0.0.0, ::, 127.0.0.1, ::1)
-		isBlocked := isBlockedIP(ip)
-
-		ipKey := ip.String()
-		// Only add to reverse map if it's NOT a blocked address
-		// This ensures PTR queries for blocked IPs return NXDOMAIN (via lookup failure or explicit check)
-		if !isBlocked {
-			if _, exists := reverse[ipKey]; !exists {
-				addedIPs++
+		if ip != nil {
+			// --- HOSTS FORMAT: IP domain1 [domain2...] ---
+			if len(fields) < 2 {
+				continue // Valid IP but no domain? Skip.
 			}
-		}
-
-		for _, host := range fields[1:] {
-			host = strings.ToLower(strings.TrimSuffix(host, "."))
-			forward[host] = append(forward[host], ip)
 			
+			hostsCount++
+			
+			isBlocked := isBlockedIP(ip)
+			ipKey := ip.String()
+			
+			// Only add to reverse lookup if NOT a blocked IP
 			if !isBlocked {
-				reverse[ipKey] = append(reverse[ipKey], host)
+				if _, exists := reverse[ipKey]; !exists {
+					addedIPs++
+				}
 			}
-			addedNames++
+
+			// Process domains (fields[1:])
+			for _, originalHost := range fields[1:] {
+				// Normalize: lowercase and trim ALL leading/trailing dots
+				host := strings.ToLower(strings.Trim(originalHost, "."))
+				if host == "" {
+					continue
+				}
+
+				if host != strings.ToLower(originalHost) {
+					LogDebug("[HOSTS] [%s] Sanitized hostname: '%s' -> '%s'", sourceName, originalHost, host)
+				}
+
+				// Skip if the hostname is actually an IP address
+				if net.ParseIP(host) != nil {
+					LogDebug("[HOSTS] [%s] Skipped hostname '%s' because it is a valid IP address", sourceName, host)
+					continue
+				}
+				
+				forward[host] = append(forward[host], ip)
+				
+				if !isBlocked {
+					reverse[ipKey] = append(reverse[ipKey], host)
+				}
+				addedNames++
+			}
+
+		} else {
+			// --- DOMAIN LIST FORMAT: domain ---
+			// Line starts with something that is NOT an IP. Treat as domain to block.
+			
+			domainsCount++
+			// Only process the first field as the domain
+			originalHost := fields[0]
+			// Normalize: lowercase and trim ALL leading/trailing dots
+			host := strings.ToLower(strings.Trim(originalHost, "."))
+			
+			if host != "" {
+				if host != strings.ToLower(originalHost) {
+					LogDebug("[HOSTS] [%s] Sanitized domain list entry: '%s' -> '%s'", sourceName, originalHost, host)
+				}
+
+				// Skip if the hostname is actually an IP address
+				if net.ParseIP(host) != nil {
+					LogDebug("[HOSTS] [%s] Skipped domain list entry '%s' because it is a valid IP address", sourceName, host)
+					continue
+				}
+
+				// Store as 0.0.0.0 (Blocked)
+				forward[host] = append(forward[host], zeroIP)
+				addedNames++
+			}
 		}
 	}
-	return addedNames, addedIPs
+
+	// Determine format string
+	format := "UNKNOWN"
+	if hostsCount > 0 && domainsCount == 0 {
+		format = "HOSTS"
+	} else if domainsCount > 0 && hostsCount == 0 {
+		format = "DOMAINS"
+	} else if hostsCount > 0 && domainsCount > 0 {
+		format = "MIXED"
+	} else if addedNames == 0 {
+		format = "EMPTY"
+	}
+
+	return addedNames, addedIPs, format
 }
 
 func (hc *HostsCache) loadFile(path string, fwd map[string][]net.IP, rev map[string][]string) (int, int, time.Time) {
@@ -338,9 +419,9 @@ func (hc *HostsCache) loadFile(path string, fwd map[string][]net.IP, rev map[str
 		mtime = info.ModTime()
 	}
 
-	names, ips := parseReader(file, fwd, rev)
-	LogDebug("[HOSTS] Parsed file %s: %d names", path, names)
-	return names, ips, mtime
+	names, _, format := parseReader(path, file, fwd, rev)
+	LogDebug("[HOSTS] Parsed file %s (%s): %d names", path, format, names)
+	return names, 0, mtime
 }
 
 func (hc *HostsCache) loadURL(url string, fwd map[string][]net.IP, rev map[string][]string) (int, int, urlMeta) {
@@ -391,9 +472,9 @@ func (hc *HostsCache) loadURL(url string, fwd map[string][]net.IP, rev map[strin
 		lastModified: resp.Header.Get("Last-Modified"),
 	}
 
-	names, ips := parseReader(resp.Body, fwd, rev)
-	LogDebug("[HOSTS] Parsed URL %s: %d names", url, names)
-	return names, ips, meta
+	names, _, format := parseReader(url, resp.Body, fwd, rev)
+	LogDebug("[HOSTS] Parsed URL %s (%s): %d names", url, format, names)
+	return names, 0, meta
 }
 
 func (hc *HostsCache) StartAutoRefresh(ctx context.Context, checkInterval time.Duration) {
