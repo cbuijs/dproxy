@@ -1,8 +1,7 @@
 /*
 File: main.go
 Description: Entry point for the dproxy application. Initializes globals, parses flags, and starts the system.
-             UPDATED: Enhanced shutdown logging to show specific server details (Protocol, Addr).
-             UPDATED: Collects all listener IPs for TLS generation.
+             UPDATED: Starts auto-refresh routines for all configured HOSTS files.
 */
 
 package main
@@ -106,15 +105,10 @@ Usage: %s -config <config.yaml>
 	}
 
 	// Load configuration
-	// Note: LoadConfig now handles InitLogger internally to ensure startup logs 
-	// respect the configured logging level/output immediately.
 	if err := LoadConfig(*configFile); err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
 
-	// Initialize Logger call REMOVED - it is now done inside LoadConfig
-
-	// Log configuration summary after logger is ready
 	LogInfo("Configuration loaded successfully from %s", *configFile)
 
 	// Initialize shutdown context
@@ -126,6 +120,27 @@ Usage: %s -config <config.yaml>
 
 	// Start background maintenance routines
 	startBackgroundTasks()
+
+	// --- START HOSTS FILE REFRESHERS ---
+	// Check Default Rule
+	if config.Routing.DefaultRule.parsedHosts != nil {
+		shutdownWg.Add(1)
+		go func() {
+			defer shutdownWg.Done()
+			config.Routing.DefaultRule.parsedHosts.StartAutoRefresh(shutdownContext, 30*time.Second)
+		}()
+	}
+	// Check specific Routing Rules
+	for i := range config.Routing.RoutingRules {
+		rule := &config.Routing.RoutingRules[i]
+		if rule.parsedHosts != nil {
+			shutdownWg.Add(1)
+			go func(hc *HostsCache) {
+				defer shutdownWg.Done()
+				hc.StartAutoRefresh(shutdownContext, 30*time.Second)
+			}(rule.parsedHosts)
+		}
+	}
 
 	// Collect all listener IPs for TLS certificate generation
 	var listenIPs []string

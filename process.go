@@ -1,8 +1,8 @@
 /*
 File: process.go
 Description: Handles the core processing logic for DNS requests, including Singleflight, EDNS0 extraction,
-             logging, response cleaning, and forwarding to upstreams with specific strategies.
-             UPDATED: Improved error handling to reduce log noise on timeouts and ensure client response.
+             logging, response cleaning, HOSTS file checking, and forwarding to upstreams.
+             UPDATED: HOSTS check added BEFORE internal cache for immediate blocklist effect.
 */
 
 package main
@@ -58,8 +58,6 @@ var reqCtxPool = sync.Pool{
 	},
 }
 
-// UPDATED: Increased limiter size to 4096 to accommodate multi-upstream racing
-// and encrypted handshake latencies without starving new requests.
 var raceLimiter = make(chan struct{}, 4096)
 
 type queryResult struct {
@@ -142,7 +140,8 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		sb.Reset()
 	}
 
-	selectedUpstreams, selectedStrategy, ruleName := SelectUpstreams(reqCtx)
+	// UPDATED: SelectUpstreams now returns Hosts info
+	selectedUpstreams, selectedStrategy, ruleName, hostsCache, hostsWildcard := SelectUpstreams(reqCtx)
 
 	if len(r.Question) > 0 {
 		q := r.Question[0]
@@ -157,6 +156,31 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		sb.WriteString("|")
 		sb.WriteString(routingKey)
 		cacheKey = sb.String()
+	}
+
+	// --- HOSTS FILE CHECK ---
+	// Checked BEFORE internal cache so updates (e.g. blocklists) take effect immediately
+	if hostsCache != nil && len(r.Question) > 0 {
+		var answers []dns.RR
+		qName := r.Question[0].Name
+
+		if qType == dns.TypePTR {
+			answers = hostsCache.LookupPTR(qName)
+		} else {
+			answers = hostsCache.Lookup(qName, qType, hostsWildcard)
+		}
+
+		if len(answers) > 0 {
+			resp := new(dns.Msg)
+			resp.SetReply(r)
+			resp.Answer = answers
+			
+			// Log match details
+			LogDebug("[PROCESS] Serving from HOSTS file (Rule: %s)", ruleName)
+			logRequest(r.Id, reqCtx, qInfo, "", "NOERROR (HOSTS)", "HOSTS", 0, time.Since(start), resp)
+			w.WriteMsg(resp)
+			return
+		}
 	}
 
 	// Check cache
@@ -197,7 +221,7 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	})
 
 	if err != nil {
-		// UPDATED: Distinguish between timeout (load shedding) and actual errors
+		// Distinguish between timeout (load shedding) and actual errors
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 			LogWarn("Query timeout for %s from %s (Upstreams busy/slow)", qInfo, ip)
 		} else {

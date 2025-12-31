@@ -4,6 +4,7 @@ Description: Defines configuration structures and handles YAML parsing and valid
 UPDATED: Added prefetch configuration (cross-fetch and stale refresh).
 UPDATED: Support for multiple values per match condition type (arrays).
 UPDATED: Added Listeners configuration for multiple bind addresses/ports.
+UPDATED: Added HOSTS file configuration to RoutingRule and DefaultRule.
 */
 
 package main
@@ -133,18 +134,25 @@ type RoutingConfig struct {
 }
 
 type DefaultRule struct {
-	Upstreams interface{} `yaml:"upstreams"`
-	Strategy  string      `yaml:"strategy"`
+	Upstreams     interface{} `yaml:"upstreams"`
+	Strategy      string      `yaml:"strategy"`
+	HostsFiles    []string    `yaml:"hosts_files"`    // New: List of hosts files
+	HostsWildcard bool        `yaml:"hosts_wildcard"` // New: Subdomain matching
 
 	parsedUpstreams []*Upstream
+	parsedHosts     *HostsCache // New: Parsed cache
 }
 
 type RoutingRule struct {
-	Name            string          `yaml:"name"`
-	Match           MatchConditions `yaml:"match"`
-	Upstreams       interface{}     `yaml:"upstreams"`
-	Strategy        string          `yaml:"strategy"`
+	Name          string          `yaml:"name"`
+	Match         MatchConditions `yaml:"match"`
+	Upstreams     interface{}     `yaml:"upstreams"`
+	Strategy      string          `yaml:"strategy"`
+	HostsFiles    []string        `yaml:"hosts_files"`    // New: List of hosts files
+	HostsWildcard bool            `yaml:"hosts_wildcard"` // New: Subdomain matching
+
 	parsedUpstreams []*Upstream
+	parsedHosts     *HostsCache // New: Parsed cache
 }
 
 // StringOrSlice is a custom type that accepts either a single string or a list of strings
@@ -420,6 +428,14 @@ func LoadConfig(path string) error {
 			rule.Strategy = "failover"
 		}
 
+		// Load Hosts Files for this rule
+		if len(rule.HostsFiles) > 0 {
+			hc := NewHostsCache()
+			hc.Load(rule.HostsFiles)
+			rule.parsedHosts = hc
+			LogInfo("[RULE] Loaded %d hosts files for '%s'", len(rule.HostsFiles), rule.Name)
+		}
+
 		// Log loaded rule with all match conditions
 		LogInfo("[RULE] Loaded '%s' (Strategy: %s)", rule.Name, rule.Strategy)
 		logMatchConditions(&rule.Match)
@@ -453,6 +469,14 @@ func LoadConfig(path string) error {
 
 	if cfg.Routing.DefaultRule.Strategy == "" {
 		cfg.Routing.DefaultRule.Strategy = "failover"
+	}
+
+	// Load Hosts Files for default rule
+	if len(cfg.Routing.DefaultRule.HostsFiles) > 0 {
+		hc := NewHostsCache()
+		hc.Load(cfg.Routing.DefaultRule.HostsFiles)
+		cfg.Routing.DefaultRule.parsedHosts = hc
+		LogInfo("[RULE] Loaded %d hosts files for 'DEFAULT'", len(cfg.Routing.DefaultRule.HostsFiles))
 	}
 
 	LogInfo("[RULE] Loaded 'DEFAULT' (Strategy: %s)", cfg.Routing.DefaultRule.Strategy)

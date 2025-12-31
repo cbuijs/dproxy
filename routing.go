@@ -3,6 +3,7 @@ File: routing.go
 Description: High-performance routing logic using Domain Trie (Radix-style) for rapid lookups.
 OPTIMIZED: Uses lazy map initialization to save memory on sparse nodes.
 UPDATED: Support for multiple values per match condition type.
+UPDATED: SelectUpstreams now returns Hosts configuration alongside upstreams.
 */
 
 package main
@@ -186,18 +187,19 @@ func resolveUpstreams(upstreams interface{}, groups map[string][]string) ([]stri
 	}
 }
 
-// SelectUpstreams optimized with Trie lookup
-func SelectUpstreams(ctx *RequestContext) ([]*Upstream, string, string) {
+// SelectUpstreams optimized with Trie lookup.
+// Returns: Upstreams, Strategy, RuleName, HostsCache, HostsWildcardBool
+func SelectUpstreams(ctx *RequestContext) ([]*Upstream, string, string, *HostsCache, bool) {
 	if config == nil {
 		log.Fatal("Config not loaded")
-		return nil, "", ""
+		return nil, "", "", nil, false
 	}
 
 	// 1. Fast Path: Domain Trie Lookup
 	if domainRouter != nil && ctx.QueryName != "" {
 		if rule := domainRouter.Search(ctx.QueryName); rule != nil {
 			LogDebug("[ROUTING] HIT Trie Rule: '%s' | Domain: %s", rule.Name, ctx.QueryName)
-			return rule.parsedUpstreams, rule.Strategy, rule.Name
+			return rule.parsedUpstreams, rule.Strategy, rule.Name, rule.parsedHosts, rule.HostsWildcard
 		}
 	}
 
@@ -206,11 +208,15 @@ func SelectUpstreams(ctx *RequestContext) ([]*Upstream, string, string) {
 		matched, reason := matchRule(&rule.Match, ctx)
 		if matched {
 			LogDebug("[ROUTING] HIT Generic Rule: '%s' | Trigger: %s", rule.Name, reason)
-			return rule.parsedUpstreams, rule.Strategy, rule.Name
+			return rule.parsedUpstreams, rule.Strategy, rule.Name, rule.parsedHosts, rule.HostsWildcard
 		}
 	}
 
-	return config.Routing.DefaultRule.parsedUpstreams, config.Routing.DefaultRule.Strategy, "DEFAULT"
+	return config.Routing.DefaultRule.parsedUpstreams, 
+	       config.Routing.DefaultRule.Strategy, 
+	       "DEFAULT", 
+	       config.Routing.DefaultRule.parsedHosts, 
+	       config.Routing.DefaultRule.HostsWildcard
 }
 
 // matchRule checks if any condition matches (OR logic across all conditions)
