@@ -2,7 +2,13 @@
 File: upstream.go
 Description: Defines the Upstream struct and handles downstream connection logic, pooling, and protocol-specific exchanges.
              Includes Circuit Breaker logic to handle failing upstreams efficiently.
-             UPDATED: Increased connection pool size and enabled TLS Session Resumption for high performance.
+             UPDATED: Implemented Multi-Session DoQ Pool (up to 8 conns) to prevent QUIC stream exhaustion.
+             UPDATED: Increased TCP idle connection pool size to 512 to prevent churn.
+             UPDATED: Circuit Breaker no longer trips on context.DeadlineExceeded OR net.Error timeouts OR closed connections.
+             UPDATED: DoH (HTTP/2) Transport optimized: MaxIdleConnsPerHost increased from 2 to 512.
+             UPDATED: DoH3 (HTTP/3) Transport optimized with explicit QuicConfig.
+             UPDATED: UDP Client uses UDPSize=4096 to prevent truncation retries.
+             UPDATED: DoT/TCP Dialer enables TCP KeepAlive (30s) to prevent zombie connections.
 */
 
 package main
@@ -19,6 +25,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -34,6 +41,8 @@ import (
 const (
 	cbFailureThreshold = 3                // Number of failures before opening circuit
 	cbProbeInterval    = 30 * time.Second // Time to wait before probing an open circuit
+	maxDoQSessions     = 8                // Allow up to 8 concurrent QUIC sessions per upstream to prevent stream exhaustion
+	tcpIdlePoolSize    = 512              // Max idle TCP connections to hold per upstream
 )
 
 // Global TLS Session Cache to enable Session Resumption (Fast Handshakes)
@@ -226,8 +235,8 @@ func (p *TCPConnPool) Put(key string, conn *dns.Conn) {
 	defer p.mu.Unlock()
 
 	// Limit pool size per upstream to prevent leaks
-	// UPDATED: Increased from 5 to 128 to prevent connection churn under high load
-	if len(p.conns[key]) >= 128 {
+	// UPDATED: Increased to 512 to prevent connection churn under high load
+	if len(p.conns[key]) >= tcpIdlePoolSize {
 		conn.Close()
 		return
 	}
@@ -238,7 +247,8 @@ func (p *TCPConnPool) Put(key string, conn *dns.Conn) {
 
 type DoQPool struct {
 	mu       sync.RWMutex
-	sessions map[string]*doqSession
+	sessions map[string][]*doqSession // Slice of sessions per key (Multi-Session)
+	nextIdx  map[string]int           // Round-robin index for load balancing
 }
 
 type doqSession struct {
@@ -247,44 +257,72 @@ type doqSession struct {
 	mu       sync.Mutex
 }
 
-var doqPool = &DoQPool{sessions: make(map[string]*doqSession)}
+var doqPool = &DoQPool{
+	sessions: make(map[string][]*doqSession),
+	nextIdx:  make(map[string]int),
+}
 
 func (p *DoQPool) Get(ctx context.Context, addr string, tlsConf *tls.Config) (quic.Connection, error) {
-	// UPDATED: Include SNI in key to separate sessions for different client IDs
 	poolKey := fmt.Sprintf("%s|%s", addr, tlsConf.ServerName)
 
-	p.mu.RLock()
-	sess, exists := p.sessions[poolKey]
-	p.mu.RUnlock()
-
-	if exists {
-		sess.mu.Lock()
+	p.mu.Lock()
+	// Clean up closed sessions for this key immediately
+	sessions := p.sessions[poolKey]
+	validSessions := make([]*doqSession, 0, len(sessions))
+	for _, s := range sessions {
 		select {
-		case <-sess.conn.Context().Done():
-			sess.mu.Unlock()
-			p.mu.Lock()
-			delete(p.sessions, poolKey)
-			p.mu.Unlock()
+		case <-s.conn.Context().Done():
+			// Closed
 		default:
-			sess.lastUsed = time.Now()
-			sess.mu.Unlock()
-			return sess.conn, nil
+			validSessions = append(validSessions, s)
 		}
 	}
+	p.sessions[poolKey] = validSessions
 
-	conn, err := quic.DialAddr(ctx, addr, tlsConf, &quic.Config{
-		KeepAlivePeriod: 30 * time.Second,
-		MaxIdleTimeout:  60 * time.Second,
-	})
-	if err != nil {
-		return nil, err
+	// Check if we need to dial a new connection (Depletion Check)
+	// If we have fewer than maxDoQSessions, we allow dialing a new one.
+	if len(validSessions) < maxDoQSessions {
+		// Unlock to dial to avoid blocking other readers
+		p.mu.Unlock()
+
+		conn, err := quic.DialAddr(ctx, addr, tlsConf, &quic.Config{
+			KeepAlivePeriod:    30 * time.Second,
+			MaxIdleTimeout:     60 * time.Second,
+			MaxIncomingStreams: 1000, // Request high limits
+		})
+
+		if err != nil {
+			// If dial fails, try to fallback to an existing valid session
+			p.mu.Lock()
+			if len(p.sessions[poolKey]) > 0 {
+				idx := p.nextIdx[poolKey] % len(p.sessions[poolKey])
+				p.nextIdx[poolKey]++
+				s := p.sessions[poolKey][idx]
+				s.lastUsed = time.Now()
+				p.mu.Unlock()
+				return s.conn, nil
+			}
+			p.mu.Unlock()
+			return nil, err
+		}
+
+		// Dial success, append to pool
+		p.mu.Lock()
+		newSess := &doqSession{conn: conn, lastUsed: time.Now()}
+		p.sessions[poolKey] = append(p.sessions[poolKey], newSess)
+		p.mu.Unlock()
+
+		return conn, nil
 	}
 
-	p.mu.Lock()
-	p.sessions[poolKey] = &doqSession{conn: conn, lastUsed: time.Now()}
+	// We have max sessions, load balance via Round Robin
+	idx := p.nextIdx[poolKey] % len(validSessions)
+	p.nextIdx[poolKey]++
+	sess := validSessions[idx]
+	sess.lastUsed = time.Now()
 	p.mu.Unlock()
 
-	return conn, nil
+	return sess.conn, nil
 }
 
 func (p *DoQPool) cleanup(ctx context.Context) {
@@ -298,26 +336,39 @@ func (p *DoQPool) cleanup(ctx context.Context) {
 			// Close all connections on shutdown
 			p.mu.Lock()
 			count := 0
-			for _, sess := range p.sessions {
-				sess.conn.CloseWithError(0, "shutdown")
-				count++
+			for _, sessions := range p.sessions {
+				for _, sess := range sessions {
+					sess.conn.CloseWithError(0, "shutdown")
+					count++
+				}
 			}
-			p.sessions = make(map[string]*doqSession)
+			p.sessions = make(map[string][]*doqSession)
+			p.nextIdx = make(map[string]int)
 			p.mu.Unlock()
 			LogInfo("[DOQ] Closed %d connections on shutdown", count)
 			return
 		case <-ticker.C:
 			p.mu.Lock()
 			closedCount := 0
-			for addr, sess := range p.sessions {
-				sess.mu.Lock()
-				// Idle time limit: 2 minutes
-				if time.Since(sess.lastUsed) > 2*time.Minute {
-					sess.conn.CloseWithError(0, "idle timeout")
-					delete(p.sessions, addr)
-					closedCount++
+			for addr, sessions := range p.sessions {
+				var active []*doqSession
+				for _, sess := range sessions {
+					sess.mu.Lock()
+					// Idle time limit: 2 minutes
+					if time.Since(sess.lastUsed) > 2*time.Minute {
+						sess.conn.CloseWithError(0, "idle timeout")
+						closedCount++
+					} else {
+						active = append(active, sess)
+					}
+					sess.mu.Unlock()
 				}
-				sess.mu.Unlock()
+				if len(active) == 0 {
+					delete(p.sessions, addr)
+					delete(p.nextIdx, addr)
+				} else {
+					p.sessions[addr] = active
+				}
 			}
 			p.mu.Unlock()
 			if closedCount > 0 {
@@ -445,11 +496,16 @@ func parseUpstream(raw string, ipVersion string, insecure bool, timeout string) 
 	}
 
 	if proto == "doh" {
+		// UPDATED: Optimized HTTP/2 Transport for high concurrency
 		up.httpClient = &http.Client{
 			Timeout: timeoutDuration,
 			Transport: &http.Transport{
 				TLSClientConfig:   &tls.Config{InsecureSkipVerify: insecure},
 				ForceAttemptHTTP2: true,
+				// Increase connection pool limits drastically (default is only 2 per host!)
+				MaxIdleConns:        1000,
+				MaxIdleConnsPerHost: 512, // Critical for avoiding connection churn to same upstream
+				IdleConnTimeout:     90 * time.Second,
 				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 					if len(up.ResolvedIPs) > 0 {
 						ip := up.ResolvedIPs[rand.IntN(len(up.ResolvedIPs))]
@@ -465,10 +521,15 @@ func parseUpstream(raw string, ipVersion string, insecure bool, timeout string) 
 	}
 
 	if proto == "doh3" {
+		// UPDATED: Optimized HTTP/3 Transport
 		up.h3Client = &http.Client{
 			Timeout: timeoutDuration,
 			Transport: &http3.RoundTripper{
 				TLSClientConfig: &tls.Config{InsecureSkipVerify: insecure},
+				QuicConfig: &quic.Config{
+					KeepAlivePeriod: 30 * time.Second,
+					MaxIdleTimeout:  60 * time.Second,
+				},
 				Dial: func(ctx context.Context, addr string, tlsConf *tls.Config, cfg *quic.Config) (quic.EarlyConnection, error) {
 					if len(up.ResolvedIPs) > 0 {
 						ip := up.ResolvedIPs[rand.IntN(len(up.ResolvedIPs))]
@@ -606,7 +667,34 @@ func (u *Upstream) executeExchange(ctx context.Context, req *dns.Msg, reqCtx *Re
 			u.recordSuccess()
 			u.updateRTT(rtt, r.resp.Rcode)
 		} else {
-			u.recordFailure()
+			// UPDATED: Prevent Circuit Breaker from tripping on timeouts or context cancellations.
+			// This prevents upstream "death" spiral under heavy load when the proxy itself times out.
+			shouldRecordFailure := true
+
+			// Check 1: Context errors
+			if errors.Is(r.err, context.DeadlineExceeded) || errors.Is(r.err, context.Canceled) {
+				shouldRecordFailure = false
+			}
+
+			// Check 2: Network timeouts (net.Error)
+			var netErr net.Error
+			if shouldRecordFailure && errors.As(r.err, &netErr) && netErr.Timeout() {
+				shouldRecordFailure = false
+			}
+
+			// Check 3: OS level timeouts (redundant but safe)
+			if shouldRecordFailure && os.IsTimeout(r.err) {
+				shouldRecordFailure = false
+			}
+
+			// Check 4: Connection closed errors (race condition with context cancel)
+			if shouldRecordFailure && (errors.Is(r.err, net.ErrClosed) || strings.Contains(r.err.Error(), "use of closed network connection")) {
+				shouldRecordFailure = false
+			}
+
+			if shouldRecordFailure {
+				u.recordFailure()
+			}
 		}
 
 		return r.resp, rtt, r.err
@@ -619,7 +707,13 @@ func (u *Upstream) doExchange(ctx context.Context, req *dns.Msg, targetAddr stri
 
 	switch u.Proto {
 	case "udp":
-		c := &dns.Client{Net: "udp", Timeout: timeout}
+		// UPDATED: Set UDPSize to 4096 to advise upstream we can handle EDNS0
+		// This prevents truncation responses (TC=1) which force expensive TCP retries.
+		c := &dns.Client{
+			Net:     "udp",
+			Timeout: timeout,
+			UDPSize: 4096,
+		}
 		resp, _, err := c.ExchangeContext(ctx, req, targetAddr)
 		return resp, err
 
@@ -709,8 +803,10 @@ func (u *Upstream) exchangeTCPPool(ctx context.Context, req *dns.Msg, addr strin
 
 func (u *Upstream) dialTCP(ctx context.Context, addr string, useTLS bool, insecure bool, sniHost string) (*dns.Conn, error) {
 	timeout := getTimeout()
+	// UPDATED: Enable TCP KeepAlive to detect dead connections in the pool
 	dialer := &net.Dialer{
-		Timeout: timeout,
+		Timeout:   timeout,
+		KeepAlive: 30 * time.Second,
 	}
 
 	// Use DialContext so the handshake can be aborted if the context is cancelled
