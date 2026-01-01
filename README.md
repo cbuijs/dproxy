@@ -15,6 +15,8 @@ NOTE: Better documentation is in the making :-). Check the `config_example.yaml`
 
 ==== LINUX PERFORMANCE TWEAKS ===
 
+ulimit -n 65535
+
 net.ipv4.ip_local_port_range = 1025 65535
 
 net.core.rmem_default = 4194304
@@ -29,5 +31,4 @@ net.core.netdev_max_backlog = 10000
 net.core.somaxconn = 65535
 
 kernel.pid_max = 4194304
-
 
