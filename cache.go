@@ -3,6 +3,7 @@ File: cache.go
 Description: Thread-safe in-memory DNS cache using Sharded LRU eviction.
 OPTIMIZED: Switched from a single global mutex to a Sharded Cache (256 shards).
            This significantly reduces lock contention in high-concurrency scenarios (e.g., dnsperf).
+UPDATED: Implemented Min/Max TTL for NOERROR and MinNegTTL for Negative responses.
 */
 
 package main
@@ -80,6 +81,12 @@ func maintainDNSCache(ctx context.Context) {
 	dnsCache.enabled = config.Cache.Enabled
 
 	LogInfo("[CACHE] Starting maintenance (Capacity: %d, Type: Sharded LRU [%d shards])", totalCap, shardCount)
+	
+	// Log TTL configuration
+	if config.Cache.MinTTL > 0 || config.Cache.MaxTTL > 0 || config.Cache.MinNegTTL > 0 {
+		LogInfo("[CACHE] TTL Control: MinTTL=%ds, MaxTTL=%ds, MinNegTTL=%ds", 
+			config.Cache.MinTTL, config.Cache.MaxTTL, config.Cache.MinNegTTL)
+	}
 
 	// Initialize prefetch subsystem
 	initPrefetch()
@@ -176,6 +183,8 @@ func addToCache(key string, msg *dns.Msg) {
 		return
 	}
 
+	// Only cache Success and NXDOMAIN
+	// (Unless we want to allow REFUSED/SERVFAIL caching in future, but currently sticking to standard)
 	if msg.Rcode != dns.RcodeSuccess && msg.Rcode != dns.RcodeNameError {
 		return
 	}
@@ -183,7 +192,7 @@ func addToCache(key string, msg *dns.Msg) {
 		return
 	}
 
-	// Calculate MinTTL logic
+	// 1. Determine natural minTTL from records
 	minTTL := uint32(3600)
 	foundTTL := false
 	checkRR := func(rrs []dns.RR) {
@@ -205,9 +214,25 @@ func addToCache(key string, msg *dns.Msg) {
 		return
 	}
 	if !foundTTL && msg.Rcode == dns.RcodeNameError {
-		minTTL = 60
+		minTTL = 60 // Default negative TTL if no SOA provided
 	} else if !foundTTL {
 		return
+	}
+
+	// 2. Apply configured TTL clamping logic
+	if msg.Rcode == dns.RcodeSuccess {
+		// Positive Caching
+		if config.Cache.MinTTL > 0 && minTTL < uint32(config.Cache.MinTTL) {
+			minTTL = uint32(config.Cache.MinTTL)
+		}
+		if config.Cache.MaxTTL > 0 && minTTL > uint32(config.Cache.MaxTTL) {
+			minTTL = uint32(config.Cache.MaxTTL)
+		}
+	} else {
+		// Negative Caching (NXDOMAIN, etc)
+		if config.Cache.MinNegTTL > 0 && minTTL < uint32(config.Cache.MinNegTTL) {
+			minTTL = uint32(config.Cache.MinNegTTL)
+		}
 	}
 
 	// PACK the message before locking
@@ -313,11 +338,6 @@ func pruneExpired() {
 }
 
 // scanAndRefreshStale updated to handle sharding (used by prefetch.go)
-// NOTE: This modifies prefetch logic slightly. Since scanAndRefreshStale was in prefetch.go,
-// we need to update it there OR expose a method here.
-// Since we are editing cache.go, we must ensure the `dnsCache.items` iteration in prefetch.go doesn't break.
-// The previous implementation accessed `dnsCache.items` directly.
-// We should expose a safe scanner here.
 func ScanCacheForStale(thresholdPct, minHits int, callback func(entry *CacheItem, hitCount int64)) {
 	now := time.Now()
 	

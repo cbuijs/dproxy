@@ -2,12 +2,7 @@
 File: process.go
 Description: Handles the core processing logic for DNS requests, including Singleflight, EDNS0 extraction,
              logging, response cleaning, HOSTS file checking, and forwarding to upstreams.
-             UPDATED: Fixed HOSTS Lookup call to handle the 2 return values (answers, found).
-             UPDATED: Updated HOSTS LookupPTR call to handle the 2 return values (answers, found).
-             UPDATED: Integrated IsValidARPCandidate check before ARP lookup.
-             OPTIMIZED: Switched singleflight to DoChan with detached context to prevent leader-context-cancellation
-                        from failing all shared requests and to allow waiters to respect their own timeouts.
-             OPTIMIZED: Replaced unbounded 'go TriggerCrossFetch' with non-blocking send to bounded worker pool to fix context deadlines.
+             UPDATED: Implemented DropOnFailure logic (drop query vs SERVFAIL).
 */
 
 package main
@@ -276,8 +271,14 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 			LogError("Error forwarding %s from %s: %v", qInfo, ip, result.Err)
 		}
 		
-		// Ensure client always gets an answer (SERVFAIL)
-		dns.HandleFailed(w, r)
+		// UPDATED: Check configuration to see if we should DROP or SERVFAIL
+		if config.Server.DropOnFailure {
+			LogDebug("[PROCESS] Dropping query %s due to upstream failure (drop_on_failure=true)", qInfo)
+			// Do nothing -> Drop
+		} else {
+			// Standard behavior: Return SERVFAIL
+			dns.HandleFailed(w, r)
+		}
 		return
 	}
 

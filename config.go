@@ -5,6 +5,8 @@ UPDATED: Restored bootstrap server logic to fix "unused import" error.
 UPDATED: Added hosts_urls support to configuration.
 UPDATED: Updated Load call to pass wildcard bool and optimize bool.
 UPDATED: Added ARP configuration section.
+UPDATED: Added Min/Max TTL and MinNegTTL to CacheConfig.
+UPDATED: Added DropOnFailure to ServerConfig.
 */
 
 package main
@@ -27,7 +29,7 @@ type Config struct {
 	Bootstrap BootstrapConfig `yaml:"bootstrap"`
 	Cache     CacheConfig     `yaml:"cache"`
 	Routing   RoutingConfig   `yaml:"routing"`
-	ARP       ARPConfig       `yaml:"arp"` // New ARP configuration
+	ARP       ARPConfig       `yaml:"arp"`
 }
 
 type ARPConfig struct {
@@ -94,6 +96,7 @@ type ServerConfig struct {
 	} `yaml:"edns0"`
 	Timeout          string `yaml:"timeout"`
 	InsecureUpstream bool   `yaml:"insecure_upstream"`
+	DropOnFailure    bool   `yaml:"drop_on_failure"` // New: Drop query instead of SERVFAIL on failure
 }
 
 type BootstrapConfig struct {
@@ -102,9 +105,12 @@ type BootstrapConfig struct {
 }
 
 type CacheConfig struct {
-	Enabled  bool           `yaml:"enabled"`
-	Size     int            `yaml:"size"`
-	Prefetch PrefetchConfig `yaml:"prefetch"`
+	Enabled   bool           `yaml:"enabled"`
+	Size      int            `yaml:"size"`
+	MinTTL    int            `yaml:"min_ttl"`     // New: Minimum TTL for NOERROR
+	MaxTTL    int            `yaml:"max_ttl"`     // New: Maximum TTL for NOERROR
+	MinNegTTL int            `yaml:"min_neg_ttl"` // New: Minimum TTL for Negatives (NXDOMAIN, etc)
+	Prefetch  PrefetchConfig `yaml:"prefetch"`
 }
 
 type PrefetchConfig struct {
@@ -372,6 +378,7 @@ func LoadConfig(path string) error {
 	if cfg.Cache.Size == 0 {
 		cfg.Cache.Size = 10000
 	}
+	// Note: MinTTL, MaxTTL, MinNegTTL default to 0 (disabled) which is correct Go behavior
 
 	// Prefetch Configuration
 	if err := parsePrefetchConfig(&cfg.Cache.Prefetch); err != nil {

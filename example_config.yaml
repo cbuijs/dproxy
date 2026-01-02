@@ -71,6 +71,11 @@ server:
 
   timeout: "5s"
   insecure_upstream: false
+  
+  # Drop DropOnFailure: If true, the proxy drops the client query instead of sending SERVFAIL
+  # when upstreams time out or fail. This forces the client to handle the timeout.
+  # Default: false (send SERVFAIL)
+  drop_on_failure: false
 
 # --- ARP/NDP Configuration (NEW) ---
 arp:
@@ -95,6 +100,13 @@ bootstrap:
 cache:
   enabled: true
   size: 10000
+  
+  # TTL Management (in seconds)
+  # 0 = Disabled (use upstream TTL)
+  min_ttl: 60       # Minimum TTL for successful responses (NOERROR)
+  max_ttl: 3600     # Maximum TTL for successful responses
+  min_neg_ttl: 10   # Minimum TTL for negative responses (NXDOMAIN, etc)
+
   prefetch:
     cross_fetch:
       enabled: false
