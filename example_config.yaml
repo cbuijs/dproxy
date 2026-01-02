@@ -1,9 +1,9 @@
 # ------------------------------------------------------------------------------
-# dproxy Configuration File (v3.0.0)
+# dproxy Configuration File (v3.1.0)
 # ------------------------------------------------------------------------------
 # This configuration file controls all aspects of the dproxy server, including
 # network listeners, DoH path validation, TLS settings, caching behavior,
-# prefetching, and advanced routing logic.
+# prefetching, TTL strategies, and advanced routing logic.
 # ------------------------------------------------------------------------------
 
 # --- Logging Configuration ---
@@ -77,7 +77,7 @@ server:
   # Default: false (send SERVFAIL)
   drop_on_failure: false
 
-# --- ARP/NDP Configuration (NEW) ---
+# --- ARP/NDP Configuration ---
 arp:
   # Mode: "both", "v4", "v6", "none"
   # - both: Maintain both ARP (IPv4) and NDP (IPv6) tables
@@ -106,6 +106,22 @@ cache:
   min_ttl: 60       # Minimum TTL for successful responses (NOERROR)
   max_ttl: 3600     # Maximum TTL for successful responses
   min_neg_ttl: 10   # Minimum TTL for negative responses (NXDOMAIN, etc)
+
+  # TTL Strategy (NEW in v3.1.0)
+  # Normalizes all TTLs in a response to be the same value across all sections
+  # (Answer, Authority, Additional). This can help with cache consistency and
+  # client-side caching behavior.
+  #
+  # Available modes:
+  # - none    : No normalization, keep original TTLs as-is (default)
+  # - first   : Use TTL of the first record in the response
+  # - last    : Use TTL of the last record in the response
+  # - lowest  : Use the lowest TTL among all records
+  # - highest : Use the highest TTL among all records
+  # - average : Use the average TTL of all records (rounded down)
+  #
+  # Note: OPT (EDNS0) records are excluded from TTL normalization.
+  ttl_strategy: "none"
 
   prefetch:
     cross_fetch:

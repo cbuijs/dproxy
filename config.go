@@ -1,5 +1,6 @@
 /*
 File: config.go
+Version: 2.1.0
 Description: Defines configuration structures and handles YAML parsing and validation.
 UPDATED: Restored bootstrap server logic to fix "unused import" error.
 UPDATED: Added hosts_urls support to configuration.
@@ -7,6 +8,7 @@ UPDATED: Updated Load call to pass wildcard bool and optimize bool.
 UPDATED: Added ARP configuration section.
 UPDATED: Added Min/Max TTL and MinNegTTL to CacheConfig.
 UPDATED: Added DropOnFailure to ServerConfig.
+UPDATED: Added TTLStrategy to CacheConfig for TTL normalization across response records.
 */
 
 package main
@@ -105,12 +107,13 @@ type BootstrapConfig struct {
 }
 
 type CacheConfig struct {
-	Enabled   bool           `yaml:"enabled"`
-	Size      int            `yaml:"size"`
-	MinTTL    int            `yaml:"min_ttl"`     // New: Minimum TTL for NOERROR
-	MaxTTL    int            `yaml:"max_ttl"`     // New: Maximum TTL for NOERROR
-	MinNegTTL int            `yaml:"min_neg_ttl"` // New: Minimum TTL for Negatives (NXDOMAIN, etc)
-	Prefetch  PrefetchConfig `yaml:"prefetch"`
+	Enabled     bool           `yaml:"enabled"`
+	Size        int            `yaml:"size"`
+	MinTTL      int            `yaml:"min_ttl"`      // Minimum TTL for NOERROR
+	MaxTTL      int            `yaml:"max_ttl"`      // Maximum TTL for NOERROR
+	MinNegTTL   int            `yaml:"min_neg_ttl"`  // Minimum TTL for Negatives (NXDOMAIN, etc)
+	TTLStrategy string         `yaml:"ttl_strategy"` // TTL normalization: none, first, last, lowest, highest, average
+	Prefetch    PrefetchConfig `yaml:"prefetch"`
 }
 
 type PrefetchConfig struct {
@@ -378,6 +381,20 @@ func LoadConfig(path string) error {
 	if cfg.Cache.Size == 0 {
 		cfg.Cache.Size = 10000
 	}
+	// TTLStrategy defaults to "none" if not specified
+	if cfg.Cache.TTLStrategy == "" {
+		cfg.Cache.TTLStrategy = "none"
+	}
+	// Validate TTL Strategy
+	validStrategies := map[string]bool{
+		"none": true, "first": true, "last": true,
+		"lowest": true, "highest": true, "average": true,
+	}
+	if !validStrategies[strings.ToLower(cfg.Cache.TTLStrategy)] {
+		return fmt.Errorf("invalid ttl_strategy: %s (must be: none, first, last, lowest, highest, average)", cfg.Cache.TTLStrategy)
+	}
+	cfg.Cache.TTLStrategy = strings.ToLower(cfg.Cache.TTLStrategy)
+
 	// Note: MinTTL, MaxTTL, MinNegTTL default to 0 (disabled) which is correct Go behavior
 
 	// Prefetch Configuration

@@ -1,9 +1,15 @@
 /*
 File: process.go
+Version: 2.1.3
 Description: Handles the core processing logic for DNS requests, including Singleflight, EDNS0 extraction,
              logging, response cleaning, HOSTS file checking, and forwarding to upstreams.
              UPDATED: Implemented DropOnFailure logic (drop query vs SERVFAIL).
              FIXED: Added RequestContext.Clone() to prevent race conditions in singleflight.
+             UPDATED: Cache hit logging now shows actual remaining TTL in seconds.
+             UPDATED: Added TTL strategy support for normalizing TTLs in responses.
+             UPDATED: Enhanced TTL strategy logging with detailed debug output.
+             UPDATED: TTL strategy only applies when there are more than 1 record.
+             UPDATED: TTL clamping (min/max/neg) now applies to first response, not just cached.
 */
 
 package main
@@ -216,10 +222,8 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		qName := r.Question[0].Name
 
 		if qType == dns.TypePTR {
-			// Updated signature handling
 			answers, found = hostsCache.LookupPTR(qName)
 		} else {
-			// Updated signature handling
 			answers, found = hostsCache.Lookup(qName, qType, hostsWildcard)
 		}
 
@@ -232,9 +236,6 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 				LogDebug("[PROCESS] Serving from HOSTS file (Rule: %s)", ruleName)
 				logRequest(r.Id, reqCtx, qInfo, "", "NOERROR (HOSTS)", "HOSTS", 0, time.Since(start), resp)
 			} else {
-				// Found name in hosts, but not for this type (e.g. AAAA query but only IPv4 in hosts)
-				// OR it's a BLOCKED PTR query (0.0.0.0) where answers is nil
-				// Return NXDOMAIN as requested to stop further resolution
 				resp.Rcode = dns.RcodeNameError
 				LogDebug("[PROCESS] Serving NXDOMAIN from HOSTS file (Rule: %s, Type mismatch or Blocked PTR)", ruleName)
 				logRequest(r.Id, reqCtx, qInfo, "", "NXDOMAIN (HOSTS)", "HOSTS", 0, time.Since(start), resp)
@@ -247,17 +248,17 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 
 	// Check cache
 	if config.Cache.Enabled && cacheKey != "" {
-		if cachedResp := getFromCache(cacheKey, r.Id); cachedResp != nil {
-			var ttl uint32
-			if len(cachedResp.Answer) > 0 {
-				ttl = cachedResp.Answer[0].Header().Ttl
-			} else if len(cachedResp.Ns) > 0 {
-				ttl = cachedResp.Ns[0].Header().Ttl
-			} else if len(cachedResp.Extra) > 0 {
-				ttl = cachedResp.Extra[0].Header().Ttl
+		if cachedResp, remainingTTL := getFromCacheWithTTL(cacheKey, r.Id); cachedResp != nil {
+			// Determine if this is a negative cache entry
+			isNegative := cachedResp.Rcode == dns.RcodeNameError || len(cachedResp.Answer) == 0
+
+			var status string
+			if isNegative {
+				status = fmt.Sprintf("CACHE_HIT (%s, NEG, TTL:%ds)", ruleName, remainingTTL)
+			} else {
+				status = fmt.Sprintf("CACHE_HIT (%s, TTL:%ds)", ruleName, remainingTTL)
 			}
 
-			status := fmt.Sprintf("CACHE_HIT (%s, TTL:%d)", ruleName, ttl)
 			logRequest(r.Id, reqCtx, qInfo, "", status, "CACHE", 0, time.Since(start), cachedResp)
 			w.WriteMsg(cachedResp)
 			return
@@ -283,18 +284,9 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	}
 
 	// --- Singleflight Optimization (DoChan + Detached Context) ---
-	// Using DoChan allows waiters to abort if their own context deadline is exceeded.
-	// Using a detached context inside the closure ensures the upstream request completes
-	// even if the leader (original requestor) disconnects or times out.
-
-	// CRITICAL FIX: Create a safe clone for the singleflight goroutine.
-	// The original reqCtx will be returned to the pool when this function exits,
-	// but the singleflight job might continue running. Cloning prevents a race condition.
 	safeReqCtx := reqCtx.Clone()
 
 	ch := requestGroup.DoChan(cacheKey, func() (interface{}, error) {
-		// Use a fresh context for the upstream work, decoupled from the leader's ctx.
-		// This guarantees that a slow client disconnect doesn't kill the job for everyone else.
 		upstreamTimeout := getTimeout()
 		if upstreamTimeout == 0 {
 			upstreamTimeout = 5 * time.Second
@@ -302,7 +294,6 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		uCtx, cancel := context.WithTimeout(context.Background(), upstreamTimeout)
 		defer cancel()
 
-		// Pass safeReqCtx instead of reqCtx
 		resp, upstreamStr, rtt, err := forwardToUpstreams(uCtx, msg, selectedUpstreams, selectedStrategy, safeReqCtx)
 		if err != nil {
 			return nil, err
@@ -314,31 +305,22 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 
 	select {
 	case <-ctx.Done():
-		// The client (waiter) gave up. We log and exit.
-		// The singleflight job continues in the background for others.
-		// reqCtx is implicitly returned to pool here via defer.
 		LogDebug("Query %s cancelled or timed out while waiting for singleflight", qInfo)
-		return // Connection likely closed or deadline exceeded
+		return
 	case res := <-ch:
 		result = res
 	}
 
 	if result.Err != nil {
-		// Distinguish between timeout (load shedding) and actual errors
 		if errors.Is(result.Err, context.DeadlineExceeded) || errors.Is(result.Err, context.Canceled) {
 			LogWarn("Query timeout for %s from %s (Upstreams busy/slow)", qInfo, ip)
 		} else {
 			LogError("Error forwarding %s from %s: %v", qInfo, ip, result.Err)
 		}
 
-		// UPDATED: Check configuration to see if we should DROP or SERVFAIL
 		if config.Server.DropOnFailure {
-			LogDebug("[PROCESS] Dropping query %s due to upstream failure (drop_on_failure=true). Resources cleaned up.", qInfo)
-			// Do nothing -> Drop
-			// Note: The singleflight job has already finished (returned error), so its context (uCtx) is cancelled.
-			// The downstream context (ctx) will be cancelled when we return from this handler.
+			LogDebug("[PROCESS] Dropping query %s due to upstream failure (drop_on_failure=true).", qInfo)
 		} else {
-			// Standard behavior: Return SERVFAIL
 			dns.HandleFailed(w, r)
 		}
 		return
@@ -354,16 +336,16 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 
 	if resp != nil {
 		cleanResponse(resp)
+		// Apply TTL clamping (min_ttl, max_ttl, min_neg_ttl) to response
+		applyTTLClamping(resp)
+		// Apply TTL strategy to normalize TTLs across the response
+		applyTTLStrategy(resp)
 	}
 
 	if config.Cache.Enabled && resp != nil {
 		addToCache(cacheKey, resp)
 
-		// --- CROSS-FETCH TRIGGER ---
-		// After successful upstream response, trigger background prefetch for related types
-		// FIXED: Check enabled flag first and use bounded worker pool
 		if config.Cache.Prefetch.CrossFetch.Enabled && resp.Rcode == dns.RcodeSuccess && len(resp.Answer) > 0 {
-			// Extract data needed for prefetch
 			req := prefetchReq{
 				qName:      reqCtx.QueryName,
 				qType:      qType,
@@ -372,8 +354,6 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 				strategy:   selectedStrategy,
 			}
 
-			// Deep copy slices (IP/MAC) to avoid holding pooled RequestContext logic
-			// (Already safe because we allocate new memory in the req struct)
 			if len(reqCtx.ClientIP) > 0 {
 				req.clientIP = make(net.IP, len(reqCtx.ClientIP))
 				copy(req.clientIP, reqCtx.ClientIP)
@@ -383,7 +363,6 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 				copy(req.clientMAC, reqCtx.ClientMAC)
 			}
 
-			// Hand off to the worker pool (non-blocking)
 			AttemptCrossFetch(req)
 		}
 	}
@@ -397,6 +376,173 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 
 	resp.Id = r.Id
 	w.WriteMsg(resp)
+}
+
+// --- TTL Clamping Logic ---
+
+// applyTTLClamping applies min_ttl, max_ttl and min_neg_ttl configuration to a DNS response.
+// This ensures TTL bounds are enforced on the first response to the client, not just cached responses.
+func applyTTLClamping(msg *dns.Msg) {
+	if msg == nil || config == nil {
+		return
+	}
+
+	// Skip if no TTL clamping is configured
+	if config.Cache.MinTTL == 0 && config.Cache.MaxTTL == 0 && config.Cache.MinNegTTL == 0 {
+		return
+	}
+
+	isNegative := msg.Rcode == dns.RcodeNameError
+
+	// Helper to clamp TTLs in a slice of RRs
+	clampTTLs := func(rrs []dns.RR) {
+		for _, rr := range rrs {
+			if _, ok := rr.(*dns.OPT); ok {
+				continue
+			}
+
+			originalTTL := rr.Header().Ttl
+			newTTL := originalTTL
+
+			if isNegative {
+				// Negative response (NXDOMAIN)
+				if config.Cache.MinNegTTL > 0 && newTTL < uint32(config.Cache.MinNegTTL) {
+					newTTL = uint32(config.Cache.MinNegTTL)
+				}
+			} else {
+				// Positive response (NOERROR)
+				if config.Cache.MinTTL > 0 && newTTL < uint32(config.Cache.MinTTL) {
+					newTTL = uint32(config.Cache.MinTTL)
+				}
+				if config.Cache.MaxTTL > 0 && newTTL > uint32(config.Cache.MaxTTL) {
+					newTTL = uint32(config.Cache.MaxTTL)
+				}
+			}
+
+			if newTTL != originalTTL {
+				LogDebug("[TTL-CLAMP] %s: %d -> %d (neg=%v)", rr.Header().Name, originalTTL, newTTL, isNegative)
+				rr.Header().Ttl = newTTL
+			}
+		}
+	}
+
+	clampTTLs(msg.Answer)
+	clampTTLs(msg.Ns)
+	clampTTLs(msg.Extra)
+}
+
+// --- TTL Strategy Logic ---
+
+// applyTTLStrategy normalizes all TTLs in a DNS response based on the configured strategy.
+// This ensures all records in Answer, Ns and Extra sections have the same TTL.
+// Only applies when there are more than 1 record (no point normalizing a single record).
+func applyTTLStrategy(msg *dns.Msg) {
+	if msg == nil || config == nil {
+		return
+	}
+
+	strategy := strings.ToLower(config.Cache.TTLStrategy)
+	if strategy == "" || strategy == "none" {
+		return // No normalization needed
+	}
+
+	// Collect all TTLs from all sections (excluding OPT records)
+	var ttls []uint32
+	collectTTLs := func(rrs []dns.RR) {
+		for _, rr := range rrs {
+			if _, ok := rr.(*dns.OPT); ok {
+				continue
+			}
+			ttls = append(ttls, rr.Header().Ttl)
+		}
+	}
+
+	collectTTLs(msg.Answer)
+	collectTTLs(msg.Ns)
+	collectTTLs(msg.Extra)
+
+	// Skip if 0 or 1 records - nothing to normalize
+	if len(ttls) <= 1 {
+		LogDebug("[TTL] Skipping normalization: only %d record(s) in response", len(ttls))
+		return
+	}
+
+	// Log the original TTLs before normalization
+	LogDebug("[TTL] Strategy '%s' - Original TTLs: %v (%d records)", strategy, ttls, len(ttls))
+
+	// Determine the target TTL based on strategy
+	var targetTTL uint32
+
+	switch strategy {
+	case "first":
+		targetTTL = ttls[0]
+		LogDebug("[TTL] Strategy 'first' - Using TTL from first record: %d", targetTTL)
+
+	case "last":
+		targetTTL = ttls[len(ttls)-1]
+		LogDebug("[TTL] Strategy 'last' - Using TTL from last record: %d", targetTTL)
+
+	case "lowest":
+		targetTTL = ttls[0]
+		for _, t := range ttls[1:] {
+			if t < targetTTL {
+				targetTTL = t
+			}
+		}
+		LogDebug("[TTL] Strategy 'lowest' - Minimum TTL found: %d", targetTTL)
+
+	case "highest":
+		targetTTL = ttls[0]
+		for _, t := range ttls[1:] {
+			if t > targetTTL {
+				targetTTL = t
+			}
+		}
+		LogDebug("[TTL] Strategy 'highest' - Maximum TTL found: %d", targetTTL)
+
+	case "average":
+		var sum uint64
+		for _, t := range ttls {
+			sum += uint64(t)
+		}
+		targetTTL = uint32(sum / uint64(len(ttls)))
+		LogDebug("[TTL] Strategy 'average' - Sum=%d, Count=%d, Average TTL: %d", sum, len(ttls), targetTTL)
+
+	default:
+		// Unknown strategy, log warning and skip
+		LogWarn("[TTL] Unknown TTL strategy '%s', skipping normalization", strategy)
+		return
+	}
+
+	// Check if normalization is actually needed (all TTLs might already be the same)
+	allSame := true
+	for _, t := range ttls {
+		if t != targetTTL {
+			allSame = false
+			break
+		}
+	}
+
+	if allSame {
+		LogDebug("[TTL] All %d records already have TTL=%d, no normalization needed", len(ttls), targetTTL)
+		return
+	}
+
+	// Apply the target TTL to all records
+	applyTTL := func(rrs []dns.RR) {
+		for _, rr := range rrs {
+			if _, ok := rr.(*dns.OPT); ok {
+				continue
+			}
+			rr.Header().Ttl = targetTTL
+		}
+	}
+
+	applyTTL(msg.Answer)
+	applyTTL(msg.Ns)
+	applyTTL(msg.Extra)
+
+	LogInfo("[TTL] Normalized %d records to TTL=%d (strategy: %s)", len(ttls), targetTTL, strategy)
 }
 
 // --- Strategies ---

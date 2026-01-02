@@ -1,9 +1,12 @@
 /*
 File: cache.go
+Version: 2.1.2
 Description: Thread-safe in-memory DNS cache using Sharded LRU eviction.
 OPTIMIZED: Switched from a single global mutex to a Sharded Cache (256 shards).
            This significantly reduces lock contention in high-concurrency scenarios (e.g., dnsperf).
 UPDATED: Implemented Min/Max TTL for NOERROR and MinNegTTL for Negative responses.
+UPDATED: Added getFromCacheWithTTL() to return actual remaining TTL for logging purposes.
+UPDATED: TTL clamping moved to process.go so it applies to first response AND cached responses.
 */
 
 package main
@@ -88,6 +91,11 @@ func maintainDNSCache(ctx context.Context) {
 			config.Cache.MinTTL, config.Cache.MaxTTL, config.Cache.MinNegTTL)
 	}
 
+	// Log TTL Strategy if enabled
+	if config.Cache.TTLStrategy != "" && config.Cache.TTLStrategy != "none" {
+		LogInfo("[CACHE] TTL Strategy: %s", config.Cache.TTLStrategy)
+	}
+
 	// Initialize prefetch subsystem
 	initPrefetch()
 
@@ -115,9 +123,18 @@ func maintainDNSCache(ctx context.Context) {
 	}
 }
 
+// getFromCache retrieves a cached response and updates the TTLs to reflect remaining time.
+// This is the legacy function for backwards compatibility.
 func getFromCache(key string, reqID uint16) *dns.Msg {
+	msg, _ := getFromCacheWithTTL(key, reqID)
+	return msg
+}
+
+// getFromCacheWithTTL retrieves a cached response and returns both the message and
+// the actual remaining TTL in seconds. This is used for more detailed cache hit logging.
+func getFromCacheWithTTL(key string, reqID uint16) (*dns.Msg, uint32) {
 	if !dnsCache.enabled {
-		return nil
+		return nil, 0
 	}
 
 	shard := dnsCache.getShard(key)
@@ -126,7 +143,7 @@ func getFromCache(key string, reqID uint16) *dns.Msg {
 
 	elem, found := shard.items[key]
 	if !found {
-		return nil
+		return nil, 0
 	}
 
 	entry := elem.Value.(*CacheItem)
@@ -138,7 +155,7 @@ func getFromCache(key string, reqID uint16) *dns.Msg {
 		shard.lruList.Remove(elem)
 		delete(shard.items, key)
 		resetCacheHitCount(key) // Clean up hit counter
-		return nil
+		return nil, 0
 	}
 
 	// Move to front (Mark as recently used)
@@ -155,27 +172,29 @@ func getFromCache(key string, reqID uint16) *dns.Msg {
 		delete(shard.items, key)
 		resetCacheHitCount(key)
 		putMsg(msg)
-		return nil
+		return nil, 0
 	}
 
 	msg.Id = reqID
 
-	// Adjust TTLs
-	ttlDiff := uint32(entry.Expiration.Sub(now).Seconds())
-	if ttlDiff <= 0 {
+	// Calculate the actual remaining TTL (time left in cache)
+	remainingSeconds := uint32(entry.Expiration.Sub(now).Seconds())
+	if remainingSeconds <= 0 {
 		putMsg(msg) // Should have been caught by expiration check, but safety first
-		return nil
+		return nil, 0
 	}
 
+	// Adjust TTLs in the response to reflect remaining time
 	updateTTL := func(rrs []dns.RR) {
 		for _, rr := range rrs {
-			rr.Header().Ttl = ttlDiff
+			rr.Header().Ttl = remainingSeconds
 		}
 	}
 	updateTTL(msg.Answer)
 	updateTTL(msg.Ns)
 	updateTTL(msg.Extra)
-	return msg
+
+	return msg, remainingSeconds
 }
 
 func addToCache(key string, msg *dns.Msg) {
@@ -192,7 +211,7 @@ func addToCache(key string, msg *dns.Msg) {
 		return
 	}
 
-	// 1. Determine natural minTTL from records
+	// Determine minTTL from records (TTL clamping already applied in process.go)
 	minTTL := uint32(3600)
 	foundTTL := false
 	checkRR := func(rrs []dns.RR) {
@@ -217,22 +236,6 @@ func addToCache(key string, msg *dns.Msg) {
 		minTTL = 60 // Default negative TTL if no SOA provided
 	} else if !foundTTL {
 		return
-	}
-
-	// 2. Apply configured TTL clamping logic
-	if msg.Rcode == dns.RcodeSuccess {
-		// Positive Caching
-		if config.Cache.MinTTL > 0 && minTTL < uint32(config.Cache.MinTTL) {
-			minTTL = uint32(config.Cache.MinTTL)
-		}
-		if config.Cache.MaxTTL > 0 && minTTL > uint32(config.Cache.MaxTTL) {
-			minTTL = uint32(config.Cache.MaxTTL)
-		}
-	} else {
-		// Negative Caching (NXDOMAIN, etc)
-		if config.Cache.MinNegTTL > 0 && minTTL < uint32(config.Cache.MinNegTTL) {
-			minTTL = uint32(config.Cache.MinNegTTL)
-		}
 	}
 
 	// PACK the message before locking
