@@ -3,6 +3,7 @@ File: process.go
 Description: Handles the core processing logic for DNS requests, including Singleflight, EDNS0 extraction,
              logging, response cleaning, HOSTS file checking, and forwarding to upstreams.
              UPDATED: Implemented DropOnFailure logic (drop query vs SERVFAIL).
+             FIXED: Added RequestContext.Clone() to prevent race conditions in singleflight.
 */
 
 package main
@@ -53,6 +54,49 @@ func (rc *RequestContext) Reset() {
 	rc.Protocol = ""
 }
 
+// Clone creates a deep copy of the RequestContext.
+// This is essential for detached goroutines (like singleflight) that might
+// outlive the original request lifecycle.
+func (rc *RequestContext) Clone() *RequestContext {
+	newRC := &RequestContext{
+		ServerPort:     rc.ServerPort,
+		ServerHostname: rc.ServerHostname,
+		ServerPath:     rc.ServerPath,
+		QueryName:      rc.QueryName,
+		Protocol:       rc.Protocol,
+	}
+
+	if len(rc.ClientIP) > 0 {
+		newRC.ClientIP = make(net.IP, len(rc.ClientIP))
+		copy(newRC.ClientIP, rc.ClientIP)
+	}
+	if len(rc.ClientMAC) > 0 {
+		newRC.ClientMAC = make(net.HardwareAddr, len(rc.ClientMAC))
+		copy(newRC.ClientMAC, rc.ClientMAC)
+	}
+	if len(rc.ClientECS) > 0 {
+		newRC.ClientECS = make(net.IP, len(rc.ClientECS))
+		copy(newRC.ClientECS, rc.ClientECS)
+	}
+	if rc.ClientECSNet != nil {
+		mask := make(net.IPMask, len(rc.ClientECSNet.Mask))
+		copy(mask, rc.ClientECSNet.Mask)
+		ip := make(net.IP, len(rc.ClientECSNet.IP))
+		copy(ip, rc.ClientECSNet.IP)
+		newRC.ClientECSNet = &net.IPNet{IP: ip, Mask: mask}
+	}
+	if len(rc.ClientEDNSMAC) > 0 {
+		newRC.ClientEDNSMAC = make(net.HardwareAddr, len(rc.ClientEDNSMAC))
+		copy(newRC.ClientEDNSMAC, rc.ClientEDNSMAC)
+	}
+	if len(rc.ServerIP) > 0 {
+		newRC.ServerIP = make(net.IP, len(rc.ServerIP))
+		copy(newRC.ServerIP, rc.ServerIP)
+	}
+
+	return newRC
+}
+
 var reqCtxPool = sync.Pool{
 	New: func() any {
 		return &RequestContext{}
@@ -82,7 +126,7 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 
 	remoteAddr := w.RemoteAddr()
 	ip := getIPFromAddr(remoteAddr)
-	
+
 	// OPTIMIZATION: Check valid candidate BEFORE calling ARP cache logic
 	var mac net.HardwareAddr
 	if IsValidARPCandidate(ip) {
@@ -182,7 +226,7 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		if found {
 			resp := new(dns.Msg)
 			resp.SetReply(r)
-			
+
 			if len(answers) > 0 {
 				resp.Answer = answers
 				LogDebug("[PROCESS] Serving from HOSTS file (Rule: %s)", ruleName)
@@ -195,7 +239,7 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 				LogDebug("[PROCESS] Serving NXDOMAIN from HOSTS file (Rule: %s, Type mismatch or Blocked PTR)", ruleName)
 				logRequest(r.Id, reqCtx, qInfo, "", "NXDOMAIN (HOSTS)", "HOSTS", 0, time.Since(start), resp)
 			}
-			
+
 			w.WriteMsg(resp)
 			return
 		}
@@ -204,7 +248,16 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	// Check cache
 	if config.Cache.Enabled && cacheKey != "" {
 		if cachedResp := getFromCache(cacheKey, r.Id); cachedResp != nil {
-			status := fmt.Sprintf("CACHE_HIT (%s)", ruleName)
+			var ttl uint32
+			if len(cachedResp.Answer) > 0 {
+				ttl = cachedResp.Answer[0].Header().Ttl
+			} else if len(cachedResp.Ns) > 0 {
+				ttl = cachedResp.Ns[0].Header().Ttl
+			} else if len(cachedResp.Extra) > 0 {
+				ttl = cachedResp.Extra[0].Header().Ttl
+			}
+
+			status := fmt.Sprintf("CACHE_HIT (%s, TTL:%d)", ruleName, ttl)
 			logRequest(r.Id, reqCtx, qInfo, "", status, "CACHE", 0, time.Since(start), cachedResp)
 			w.WriteMsg(cachedResp)
 			return
@@ -233,7 +286,12 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	// Using DoChan allows waiters to abort if their own context deadline is exceeded.
 	// Using a detached context inside the closure ensures the upstream request completes
 	// even if the leader (original requestor) disconnects or times out.
-	
+
+	// CRITICAL FIX: Create a safe clone for the singleflight goroutine.
+	// The original reqCtx will be returned to the pool when this function exits,
+	// but the singleflight job might continue running. Cloning prevents a race condition.
+	safeReqCtx := reqCtx.Clone()
+
 	ch := requestGroup.DoChan(cacheKey, func() (interface{}, error) {
 		// Use a fresh context for the upstream work, decoupled from the leader's ctx.
 		// This guarantees that a slow client disconnect doesn't kill the job for everyone else.
@@ -244,7 +302,8 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		uCtx, cancel := context.WithTimeout(context.Background(), upstreamTimeout)
 		defer cancel()
 
-		resp, upstreamStr, rtt, err := forwardToUpstreams(uCtx, msg, selectedUpstreams, selectedStrategy, reqCtx)
+		// Pass safeReqCtx instead of reqCtx
+		resp, upstreamStr, rtt, err := forwardToUpstreams(uCtx, msg, selectedUpstreams, selectedStrategy, safeReqCtx)
 		if err != nil {
 			return nil, err
 		}
@@ -257,6 +316,7 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	case <-ctx.Done():
 		// The client (waiter) gave up. We log and exit.
 		// The singleflight job continues in the background for others.
+		// reqCtx is implicitly returned to pool here via defer.
 		LogDebug("Query %s cancelled or timed out while waiting for singleflight", qInfo)
 		return // Connection likely closed or deadline exceeded
 	case res := <-ch:
@@ -270,11 +330,13 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		} else {
 			LogError("Error forwarding %s from %s: %v", qInfo, ip, result.Err)
 		}
-		
+
 		// UPDATED: Check configuration to see if we should DROP or SERVFAIL
 		if config.Server.DropOnFailure {
-			LogDebug("[PROCESS] Dropping query %s due to upstream failure (drop_on_failure=true)", qInfo)
+			LogDebug("[PROCESS] Dropping query %s due to upstream failure (drop_on_failure=true). Resources cleaned up.", qInfo)
 			// Do nothing -> Drop
+			// Note: The singleflight job has already finished (returned error), so its context (uCtx) is cancelled.
+			// The downstream context (ctx) will be cancelled when we return from this handler.
 		} else {
 			// Standard behavior: Return SERVFAIL
 			dns.HandleFailed(w, r)
@@ -309,8 +371,9 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 				upstreams:  selectedUpstreams,
 				strategy:   selectedStrategy,
 			}
-			
+
 			// Deep copy slices (IP/MAC) to avoid holding pooled RequestContext logic
+			// (Already safe because we allocate new memory in the req struct)
 			if len(reqCtx.ClientIP) > 0 {
 				req.clientIP = make(net.IP, len(reqCtx.ClientIP))
 				copy(req.clientIP, reqCtx.ClientIP)
