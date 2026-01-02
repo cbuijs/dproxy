@@ -3,6 +3,7 @@ File: prefetch.go
 Description: Implements cache prefetching and cross-record fetching for DNS queries.
              - Cross-fetch: When querying A, also fetch AAAA/HTTPS in background (and vice versa)
              - Stale refresh: Proactively refresh popular cache entries before they expire
+             UPDATED: Fixed compilation errors by using ScanCacheForStale helper instead of accessing private cache fields.
 */
 
 package main
@@ -234,44 +235,25 @@ func scanAndRefreshStale(ctx context.Context) {
 		minHits = 2
 	}
 
-	now := time.Now()
 	var toRefresh []staleRefreshCandidate
 
-	dnsCache.Lock()
-	for key, elem := range dnsCache.items {
-		entry := elem.Value.(*CacheItem)
-
-		// Calculate remaining TTL percentage
-		remainingTTL := entry.Expiration.Sub(now)
-		if remainingTTL <= 0 {
-			continue // Already expired, will be cleaned by pruneExpired
-		}
-
-		originalTTL := entry.OriginalTTL
-		if originalTTL == 0 {
-			continue // Can't calculate percentage without original TTL
-		}
-
-		remainingPct := int((remainingTTL.Seconds() / float64(originalTTL)) * 100)
-
-		// Check if below threshold
-		if remainingPct > thresholdPct {
-			continue
-		}
-
-		// Check popularity (hit count)
-		hitCount := getCacheHitCount(key)
-		if hitCount < int64(minHits) {
-			continue
-		}
-
+	// Use ScanCacheForStale helper from cache.go to iterate the sharded cache safely
+	ScanCacheForStale(thresholdPct, minHits, func(entry *CacheItem, hitCount int64) {
 		// Check if already being refreshed
-		if _, inFlight := inFlightPrefetch.Load(key); inFlight {
-			continue
+		if _, inFlight := inFlightPrefetch.Load(entry.Key); inFlight {
+			return
+		}
+
+		// Recalculate remainingPct for logging purposes
+		// (ScanCacheForStale already verified it's below threshold)
+		remainingPct := 0
+		if entry.OriginalTTL > 0 {
+			remaining := entry.Expiration.Sub(time.Now())
+			remainingPct = int((remaining.Seconds() / float64(entry.OriginalTTL)) * 100)
 		}
 
 		toRefresh = append(toRefresh, staleRefreshCandidate{
-			key:          key,
+			key:          entry.Key,
 			qName:        entry.QName,
 			qType:        entry.QType,
 			qClass:       entry.QClass,
@@ -279,8 +261,7 @@ func scanAndRefreshStale(ctx context.Context) {
 			remainingPct: remainingPct,
 			hitCount:     hitCount,
 		})
-	}
-	dnsCache.Unlock()
+	})
 
 	if len(toRefresh) == 0 {
 		return

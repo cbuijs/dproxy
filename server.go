@@ -4,6 +4,8 @@ Description: Implements the protocol listeners (UDP, TCP, DoT, DoQ, DoH/DoH3) an
              UPDATED: Enhanced logging for failed connection attempts and protocol errors.
              UPDATED: Added String() method to ServerShutdowner for verbose shutdown logging.
              UPDATED: Support for multiple listeners via configuration.
+             OPTIMIZED: DoT (DNS over TLS) now supports pipelining. Requests are processed concurrently
+                        instead of serially, preventing Head-of-Line blocking.
 */
 
 package main
@@ -365,7 +367,6 @@ func handleDoTConnection(conn net.Conn) {
 	// Handshake timeout
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
 	if err := tlsConn.Handshake(); err != nil {
-		// UPDATED: LogWarn for visibility
 		LogWarn("DoT Handshake failed from %v: %v", remoteAddr, err)
 		return
 	}
@@ -384,27 +385,36 @@ func handleDoTConnection(conn net.Conn) {
 	dconn := new(dns.Conn)
 	dconn.Conn = iconn
 
+	// Mutex to serialize writes to the socket while allowing concurrent processing
+	var writeMu sync.Mutex
+
 	for {
 		req, err := dconn.ReadMsg()
 		if err != nil {
 			if err != io.EOF {
-				// UPDATED: LogWarn for read errors (protocol violations, early closes)
 				LogWarn("DoT Read error from %v: %v", remoteAddr, err)
 			}
 			return
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), getTimeout())
-		reqCtx := &RequestContext{
-			ServerIP:       getLocalIP(conn.LocalAddr()),
-			ServerPort:     getLocalPort(conn.LocalAddr()),
-			ServerHostname: sni, // SNI captured here
-			Protocol:       "DoT",
-		}
+		// OPTIMIZATION: Launch request in goroutine to allow pipelining
+		// This prevents head-of-line blocking where a slow upstream query
+		// stops the server from reading the next query on the same connection.
+		go func(reqMsg *dns.Msg) {
+			ctx, cancel := context.WithTimeout(context.Background(), getTimeout())
+			defer cancel()
+			
+			reqCtx := &RequestContext{
+				ServerIP:       getLocalIP(conn.LocalAddr()),
+				ServerPort:     getLocalPort(conn.LocalAddr()),
+				ServerHostname: sni, // SNI captured here
+				Protocol:       "DoT",
+			}
 
-		w := &dotResponseWriter{Conn: dconn}
-		processDNSRequest(ctx, w, req, reqCtx)
-		cancel()
+			// Pass the write mutex to the writer
+			w := &dotResponseWriter{Conn: dconn, writeMu: &writeMu}
+			processDNSRequest(ctx, w, reqMsg, reqCtx)
+		}(req)
 	}
 }
 
@@ -551,8 +561,16 @@ func handleDoQSession(sess quic.Connection) {
 // --- Response Writers ---
 
 // dotResponseWriter adapts dns.Conn to dns.ResponseWriter
+// UPDATED: Includes a mutex to prevent concurrent writes on the shared connection
 type dotResponseWriter struct {
 	*dns.Conn
+	writeMu *sync.Mutex
+}
+
+func (w *dotResponseWriter) WriteMsg(msg *dns.Msg) error {
+	w.writeMu.Lock()
+	defer w.writeMu.Unlock()
+	return w.Conn.WriteMsg(msg)
 }
 
 func (w *dotResponseWriter) Hijack() {

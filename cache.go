@@ -1,8 +1,8 @@
 /*
 File: cache.go
-Description: Thread-safe in-memory DNS cache using O(1) LRU eviction.
-OPTIMIZED: Stores packed []byte instead of *dns.Msg to reduce GC pressure and memory usage.
-UPDATED: Added support for prefetch (cross-fetch and stale refresh) with metadata tracking.
+Description: Thread-safe in-memory DNS cache using Sharded LRU eviction.
+OPTIMIZED: Switched from a single global mutex to a Sharded Cache (256 shards).
+           This significantly reduces lock contention in high-concurrency scenarios (e.g., dnsperf).
 */
 
 package main
@@ -10,13 +10,15 @@ package main
 import (
 	"container/list"
 	"context"
-	"strconv"
+	"hash/fnv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/miekg/dns"
 )
+
+const shardCount = 256
 
 type CacheItem struct {
 	Key         string
@@ -29,29 +31,55 @@ type CacheItem struct {
 	RoutingKey  string // Routing key for refresh
 }
 
-type DNSCache struct {
+type CacheShard struct {
 	sync.Mutex
-	capacity int
-	items    map[string]*list.Element
-	lruList  *list.List
+	items   map[string]*list.Element
+	lruList *list.List
 }
 
-// Initialize with a default size; capacity is updated in maintainDNSCache based on config
-var dnsCache = &DNSCache{
-	capacity: 10000,
-	items:    make(map[string]*list.Element),
-	lruList:  list.New(),
+type DNSCache struct {
+	shards    [shardCount]*CacheShard
+	capacity  int // Total capacity
+	shardCap  int // Capacity per shard
+	enabled   bool
+}
+
+// Global cache instance
+var dnsCache = newDNSCache()
+
+func newDNSCache() *DNSCache {
+	c := &DNSCache{
+		enabled: true,
+	}
+	for i := 0; i < shardCount; i++ {
+		c.shards[i] = &CacheShard{
+			items:   make(map[string]*list.Element),
+			lruList: list.New(),
+		}
+	}
+	return c
+}
+
+func (c *DNSCache) getShard(key string) *CacheShard {
+	h := fnv.New32a()
+	h.Write([]byte(key))
+	return c.shards[h.Sum32()%uint32(shardCount)]
 }
 
 func maintainDNSCache(ctx context.Context) {
 	// Update capacity from config
-	dnsCache.Lock()
+	totalCap := 10000
 	if config.Cache.Size > 0 {
-		dnsCache.capacity = config.Cache.Size
+		totalCap = config.Cache.Size
 	}
-	dnsCache.Unlock()
+	dnsCache.capacity = totalCap
+	dnsCache.shardCap = totalCap / shardCount
+	if dnsCache.shardCap < 1 {
+		dnsCache.shardCap = 1
+	}
+	dnsCache.enabled = config.Cache.Enabled
 
-	LogInfo("[CACHE] Starting maintenance (Capacity: %d, Type: LRU)", config.Cache.Size)
+	LogInfo("[CACHE] Starting maintenance (Capacity: %d, Type: Sharded LRU [%d shards])", totalCap, shardCount)
 
 	// Initialize prefetch subsystem
 	initPrefetch()
@@ -81,14 +109,15 @@ func maintainDNSCache(ctx context.Context) {
 }
 
 func getFromCache(key string, reqID uint16) *dns.Msg {
-	if !config.Cache.Enabled {
+	if !dnsCache.enabled {
 		return nil
 	}
 
-	dnsCache.Lock()
-	defer dnsCache.Unlock()
+	shard := dnsCache.getShard(key)
+	shard.Lock()
+	defer shard.Unlock()
 
-	elem, found := dnsCache.items[key]
+	elem, found := shard.items[key]
 	if !found {
 		return nil
 	}
@@ -99,14 +128,14 @@ func getFromCache(key string, reqID uint16) *dns.Msg {
 	now := time.Now()
 	if now.After(entry.Expiration) {
 		// Lazy eviction
-		dnsCache.lruList.Remove(elem)
-		delete(dnsCache.items, key)
+		shard.lruList.Remove(elem)
+		delete(shard.items, key)
 		resetCacheHitCount(key) // Clean up hit counter
 		return nil
 	}
 
 	// Move to front (Mark as recently used)
-	dnsCache.lruList.MoveToFront(elem)
+	shard.lruList.MoveToFront(elem)
 
 	// Record hit for stale refresh popularity tracking
 	recordCacheHit(key)
@@ -115,8 +144,8 @@ func getFromCache(key string, reqID uint16) *dns.Msg {
 	msg := getMsg()
 	if err := msg.Unpack(entry.MsgBytes); err != nil {
 		// If unpack fails (corruption?), invalidate entry
-		dnsCache.lruList.Remove(elem)
-		delete(dnsCache.items, key)
+		shard.lruList.Remove(elem)
+		delete(shard.items, key)
 		resetCacheHitCount(key)
 		putMsg(msg)
 		return nil
@@ -143,7 +172,7 @@ func getFromCache(key string, reqID uint16) *dns.Msg {
 }
 
 func addToCache(key string, msg *dns.Msg) {
-	if !config.Cache.Enabled {
+	if !dnsCache.enabled {
 		return
 	}
 
@@ -207,14 +236,15 @@ func addToCache(key string, msg *dns.Msg) {
 		routingKey = parts[3]
 	}
 
-	dnsCache.Lock()
-	defer dnsCache.Unlock()
-
 	expiration := time.Now().Add(time.Duration(minTTL) * time.Second)
 
+	shard := dnsCache.getShard(key)
+	shard.Lock()
+	defer shard.Unlock()
+
 	// Check if update or new
-	if elem, found := dnsCache.items[key]; found {
-		dnsCache.lruList.MoveToFront(elem)
+	if elem, found := shard.items[key]; found {
+		shard.lruList.MoveToFront(elem)
 		entry := elem.Value.(*CacheItem)
 		entry.MsgBytes = finalBytes
 		entry.Expiration = expiration
@@ -227,11 +257,11 @@ func addToCache(key string, msg *dns.Msg) {
 	}
 
 	// Evict if full
-	if dnsCache.lruList.Len() >= dnsCache.capacity {
-		if oldest := dnsCache.lruList.Back(); oldest != nil {
-			dnsCache.lruList.Remove(oldest)
+	if shard.lruList.Len() >= dnsCache.shardCap {
+		if oldest := shard.lruList.Back(); oldest != nil {
+			shard.lruList.Remove(oldest)
 			oldestEntry := oldest.Value.(*CacheItem)
-			delete(dnsCache.items, oldestEntry.Key)
+			delete(shard.items, oldestEntry.Key)
 			resetCacheHitCount(oldestEntry.Key) // Clean up hit counter
 		}
 	}
@@ -247,144 +277,93 @@ func addToCache(key string, msg *dns.Msg) {
 		QClass:      qClass,
 		RoutingKey:  routingKey,
 	}
-	elem := dnsCache.lruList.PushFront(item)
-	dnsCache.items[key] = elem
-}
-
-// addToCacheWithMeta is used by prefetch to add entries with explicit metadata
-func addToCacheWithMeta(key string, msg *dns.Msg, qName string, qType, qClass uint16, routingKey string) {
-	if !config.Cache.Enabled {
-		return
-	}
-
-	if msg.Rcode != dns.RcodeSuccess && msg.Rcode != dns.RcodeNameError {
-		return
-	}
-	if msg.Truncated {
-		return
-	}
-
-	// Calculate MinTTL logic
-	minTTL := uint32(3600)
-	foundTTL := false
-	checkRR := func(rrs []dns.RR) {
-		for _, rr := range rrs {
-			if _, ok := rr.(*dns.OPT); ok {
-				continue
-			}
-			foundTTL = true
-			if rr.Header().Ttl < minTTL {
-				minTTL = rr.Header().Ttl
-			}
-		}
-	}
-	checkRR(msg.Answer)
-	checkRR(msg.Ns)
-	checkRR(msg.Extra)
-
-	if minTTL == 0 {
-		return
-	}
-	if !foundTTL && msg.Rcode == dns.RcodeNameError {
-		minTTL = 60
-	} else if !foundTTL {
-		return
-	}
-
-	packed, err := msg.Pack()
-	if err != nil {
-		return
-	}
-
-	finalBytes := make([]byte, len(packed))
-	copy(finalBytes, packed)
-
-	dnsCache.Lock()
-	defer dnsCache.Unlock()
-
-	expiration := time.Now().Add(time.Duration(minTTL) * time.Second)
-
-	if elem, found := dnsCache.items[key]; found {
-		dnsCache.lruList.MoveToFront(elem)
-		entry := elem.Value.(*CacheItem)
-		entry.MsgBytes = finalBytes
-		entry.Expiration = expiration
-		entry.OriginalTTL = minTTL
-		entry.QName = qName
-		entry.QType = qType
-		entry.QClass = qClass
-		entry.RoutingKey = routingKey
-		return
-	}
-
-	if dnsCache.lruList.Len() >= dnsCache.capacity {
-		if oldest := dnsCache.lruList.Back(); oldest != nil {
-			dnsCache.lruList.Remove(oldest)
-			oldestEntry := oldest.Value.(*CacheItem)
-			delete(dnsCache.items, oldestEntry.Key)
-			resetCacheHitCount(oldestEntry.Key)
-		}
-	}
-
-	item := &CacheItem{
-		Key:         key,
-		MsgBytes:    finalBytes,
-		Expiration:  expiration,
-		OriginalTTL: minTTL,
-		QName:       qName,
-		QType:       qType,
-		QClass:      qClass,
-		RoutingKey:  routingKey,
-	}
-	elem := dnsCache.lruList.PushFront(item)
-	dnsCache.items[key] = elem
+	elem := shard.lruList.PushFront(item)
+	shard.items[key] = elem
 }
 
 func pruneExpired() {
-	dnsCache.Lock()
-	defer dnsCache.Unlock()
-
+	// Prune a small batch from every shard
 	now := time.Now()
 	cleaned := 0
 
-	// Check the oldest 50 items from the tail
-	for i := 0; i < 50; i++ {
-		elem := dnsCache.lruList.Back()
-		if elem == nil {
-			break
+	for _, shard := range dnsCache.shards {
+		shard.Lock()
+		for i := 0; i < 5; i++ { // Check oldest 5 items per shard
+			elem := shard.lruList.Back()
+			if elem == nil {
+				break
+			}
+			entry := elem.Value.(*CacheItem)
+			if now.After(entry.Expiration) {
+				shard.lruList.Remove(elem)
+				delete(shard.items, entry.Key)
+				resetCacheHitCount(entry.Key)
+				cleaned++
+			} else {
+				// LRU list is ordered, so if tail isn't expired, nothing else is (mostly)
+				break
+			}
 		}
-		entry := elem.Value.(*CacheItem)
-		if now.After(entry.Expiration) {
-			dnsCache.lruList.Remove(elem)
-			delete(dnsCache.items, entry.Key)
-			resetCacheHitCount(entry.Key) // Clean up hit counter
-			cleaned++
-		} else {
-			break
-		}
+		shard.Unlock()
 	}
+
 	if cleaned > 0 {
-		LogDebug("[CACHE] Pruned %d expired items from tail", cleaned)
+		LogDebug("[CACHE] Pruned %d expired items across shards", cleaned)
+	}
+}
+
+// scanAndRefreshStale updated to handle sharding (used by prefetch.go)
+// NOTE: This modifies prefetch logic slightly. Since scanAndRefreshStale was in prefetch.go,
+// we need to update it there OR expose a method here.
+// Since we are editing cache.go, we must ensure the `dnsCache.items` iteration in prefetch.go doesn't break.
+// The previous implementation accessed `dnsCache.items` directly.
+// We should expose a safe scanner here.
+func ScanCacheForStale(thresholdPct, minHits int, callback func(entry *CacheItem, hitCount int64)) {
+	now := time.Now()
+	
+	for _, shard := range dnsCache.shards {
+		// Lock each shard individually to avoid blocking the whole world
+		shard.Lock()
+		// Iterate over items
+		for key, elem := range shard.items {
+			entry := elem.Value.(*CacheItem)
+			
+			// Calculate remaining TTL percentage
+			remainingTTL := entry.Expiration.Sub(now)
+			if remainingTTL <= 0 {
+				continue 
+			}
+
+			originalTTL := entry.OriginalTTL
+			if originalTTL == 0 {
+				continue 
+			}
+
+			remainingPct := int((remainingTTL.Seconds() / float64(originalTTL)) * 100)
+
+			if remainingPct > thresholdPct {
+				continue
+			}
+
+			hitCount := getCacheHitCount(key)
+			if hitCount < int64(minHits) {
+				continue
+			}
+			
+			callback(entry, hitCount)
+		}
+		shard.Unlock()
 	}
 }
 
 // getCacheStats returns current cache statistics
 func getCacheStats() (size int, capacity int) {
-	dnsCache.Lock()
-	defer dnsCache.Unlock()
-	return dnsCache.lruList.Len(), dnsCache.capacity
-}
-
-// buildCacheKeyFromQuery constructs a cache key from query parameters
-func buildCacheKeyFromQuery(qName string, qType, qClass uint16, routingKey string) string {
-	var sb strings.Builder
-	sb.WriteString(qName)
-	sb.WriteString("|")
-	sb.WriteString(strconv.Itoa(int(qType)))
-	sb.WriteString("|")
-	sb.WriteString(strconv.Itoa(int(qClass)))
-	sb.WriteString("|")
-	sb.WriteString(routingKey)
-	return sb.String()
+	size = 0
+	for _, shard := range dnsCache.shards {
+		shard.Lock()
+		size += shard.lruList.Len()
+		shard.Unlock()
+	}
+	return size, dnsCache.capacity
 }
 

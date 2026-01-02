@@ -5,6 +5,8 @@ Description: Handles the core processing logic for DNS requests, including Singl
              UPDATED: Fixed HOSTS Lookup call to handle the 2 return values (answers, found).
              UPDATED: Updated HOSTS LookupPTR call to handle the 2 return values (answers, found).
              UPDATED: Integrated IsValidARPCandidate check before ARP lookup.
+             OPTIMIZED: Switched singleflight to DoChan with detached context to prevent leader-context-cancellation
+                        from failing all shared requests and to allow waiters to respect their own timeouts.
 */
 
 package main
@@ -22,6 +24,7 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+	"golang.org/x/sync/singleflight"
 )
 
 const EDNS0_OPTION_MAC = 65001
@@ -230,21 +233,46 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		}
 	}
 
-	// Singleflight
-	result, err, shared := requestGroup.Do(cacheKey, func() (interface{}, error) {
-		resp, upstreamStr, rtt, err := forwardToUpstreams(ctx, msg, selectedUpstreams, selectedStrategy, reqCtx)
+	// --- Singleflight Optimization (DoChan + Detached Context) ---
+	// Using DoChan allows waiters to abort if their own context deadline is exceeded.
+	// Using a detached context inside the closure ensures the upstream request completes
+	// even if the leader (original requestor) disconnects or times out.
+	
+	ch := requestGroup.DoChan(cacheKey, func() (interface{}, error) {
+		// Use a fresh context for the upstream work, decoupled from the leader's ctx.
+		// This guarantees that a slow client disconnect doesn't kill the job for everyone else.
+		upstreamTimeout := getTimeout()
+		if upstreamTimeout == 0 {
+			upstreamTimeout = 5 * time.Second
+		}
+		uCtx, cancel := context.WithTimeout(context.Background(), upstreamTimeout)
+		defer cancel()
+
+		resp, upstreamStr, rtt, err := forwardToUpstreams(uCtx, msg, selectedUpstreams, selectedStrategy, reqCtx)
 		if err != nil {
 			return nil, err
 		}
 		return queryResult{msg: resp, upstreamStr: upstreamStr, rtt: rtt}, nil
 	})
 
-	if err != nil {
+	var result singleflight.Result
+
+	select {
+	case <-ctx.Done():
+		// The client (waiter) gave up. We log and exit.
+		// The singleflight job continues in the background for others.
+		LogDebug("Query %s cancelled or timed out while waiting for singleflight", qInfo)
+		return // Connection likely closed or deadline exceeded
+	case res := <-ch:
+		result = res
+	}
+
+	if result.Err != nil {
 		// Distinguish between timeout (load shedding) and actual errors
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		if errors.Is(result.Err, context.DeadlineExceeded) || errors.Is(result.Err, context.Canceled) {
 			LogWarn("Query timeout for %s from %s (Upstreams busy/slow)", qInfo, ip)
 		} else {
-			LogError("Error forwarding %s from %s: %v", qInfo, ip, err)
+			LogError("Error forwarding %s from %s: %v", qInfo, ip, result.Err)
 		}
 		
 		// Ensure client always gets an answer (SERVFAIL)
@@ -252,8 +280,9 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		return
 	}
 
-	qr := result.(queryResult)
+	qr := result.Val.(queryResult)
 	resp := qr.msg
+	shared := result.Shared
 
 	if shared && resp != nil {
 		resp = resp.Copy()
