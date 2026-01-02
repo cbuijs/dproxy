@@ -3,7 +3,9 @@ File: prefetch.go
 Description: Implements cache prefetching and cross-record fetching for DNS queries.
              - Cross-fetch: When querying A, also fetch AAAA/HTTPS in background (and vice versa)
              - Stale refresh: Proactively refresh popular cache entries before they expire
-             UPDATED: Fixed compilation errors by using ScanCacheForStale helper instead of accessing private cache fields.
+             UPDATED: Implemented bounded worker pool for cross-fetch to prevent goroutine explosions.
+             UPDATED: Added backpressure mechanism (dropping requests when pool is full).
+             OPTIMIZED: Checks in-flight status before cache locking to reduce lock contention.
 */
 
 package main
@@ -11,6 +13,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,11 +24,14 @@ import (
 // --- Global State ---
 
 var (
-	// Semaphore for cross-fetch goroutines
+	// Semaphore for cross-fetch goroutines (network limiter)
 	crossFetchLimiter chan struct{}
 
 	// Semaphore for stale refresh goroutines
 	staleRefreshLimiter chan struct{}
+
+	// Worker pool for cross-fetch requests
+	prefetchCh chan prefetchReq
 
 	// Track in-flight prefetch operations to avoid duplicates
 	inFlightPrefetch sync.Map // key: cacheKey, value: struct{}
@@ -34,17 +40,44 @@ var (
 	cacheHitCounter sync.Map // key: cacheKey, value: *atomic.Int64
 )
 
+// prefetchReq holds the data needed to perform a cross-fetch
+type prefetchReq struct {
+	qName      string
+	qType      uint16
+	routingKey string
+	upstreams  []*Upstream
+	strategy   string
+	clientIP   net.IP
+	clientMAC  net.HardwareAddr
+}
+
 // --- Initialization ---
 
 func initPrefetch() {
 	cfg := config.Cache.Prefetch
 
-	// Initialize cross-fetch limiter
+	// Initialize cross-fetch limiter (concurrent network requests)
 	maxCross := cfg.CrossFetch.MaxConcurrent
 	if maxCross <= 0 {
 		maxCross = 10
 	}
+	// Sanity cap for workers
+	if maxCross > 256 {
+		maxCross = 256
+	}
+
 	crossFetchLimiter = make(chan struct{}, maxCross)
+
+	// Initialize worker pool channel (buffer for bursts)
+	prefetchCh = make(chan prefetchReq, 4096)
+
+	// Start worker pool
+	if cfg.CrossFetch.Enabled && cfg.CrossFetch.Mode != "off" {
+		LogInfo("[PREFETCH] Starting %d cross-fetch workers", maxCross)
+		for i := 0; i < maxCross; i++ {
+			go prefetchWorker()
+		}
+	}
 
 	// Initialize stale refresh limiter
 	maxStale := cfg.StaleRefresh.MaxConcurrent
@@ -71,33 +104,32 @@ func initPrefetch() {
 
 // --- Cross-Fetch Logic ---
 
-// TriggerCrossFetch is called after a successful DNS response to prefetch related records
-func TriggerCrossFetch(qName string, qType uint16, routingKey string, upstreams []*Upstream, strategy string, reqCtx *RequestContext) {
+// AttemptCrossFetch queues a prefetch request non-blocking.
+// If the queue is full, the request is dropped to save resources.
+func AttemptCrossFetch(req prefetchReq) {
+	select {
+	case prefetchCh <- req:
+		// Queued successfully
+	default:
+		// Queue full - backpressure
+		LogDebug("[PREFETCH] Queue full, dropping cross-fetch for %s", req.qName)
+	}
+}
+
+// prefetchWorker consumes requests from the channel and processes them
+func prefetchWorker() {
+	for req := range prefetchCh {
+		processCrossFetch(req)
+	}
+}
+
+func processCrossFetch(req prefetchReq) {
 	cfg := config.Cache.Prefetch.CrossFetch
-
-	if !cfg.Enabled || cfg.Mode == "off" {
-		return
-	}
-
-	// Check if we should trigger based on query type and mode
-	shouldTrigger := false
-	switch cfg.Mode {
-	case "on_a":
-		shouldTrigger = (qType == dns.TypeA)
-	case "on_aaaa":
-		shouldTrigger = (qType == dns.TypeAAAA)
-	case "both":
-		shouldTrigger = (qType == dns.TypeA || qType == dns.TypeAAAA)
-	}
-
-	if !shouldTrigger {
-		return
-	}
 
 	// Determine which types to fetch (excluding the type we just queried)
 	typesToFetch := make([]uint16, 0, len(cfg.parsedFetchTypes))
 	for _, t := range cfg.parsedFetchTypes {
-		if t != qType {
+		if t != req.qType {
 			typesToFetch = append(typesToFetch, t)
 		}
 	}
@@ -106,46 +138,74 @@ func TriggerCrossFetch(qName string, qType uint16, routingKey string, upstreams 
 		return
 	}
 
-	LogDebug("[PREFETCH] Cross-fetch triggered by %s query for %s, will fetch: %v",
-		dns.TypeToString[qType], qName, typeListToStrings(typesToFetch))
+	LogDebug("[PREFETCH] Cross-fetch processing for %s (triggered by %s), will fetch: %v",
+		req.qName, dns.TypeToString[req.qType], typeListToStrings(typesToFetch))
 
-	// Launch background fetches
 	for _, fetchType := range typesToFetch {
-		ft := fetchType // capture for goroutine
-
 		// Build cache key to check if already cached
-		cacheKey := buildPrefetchCacheKey(qName, ft, dns.ClassINET, routingKey)
+		cacheKey := buildPrefetchCacheKey(req.qName, fetchType, dns.ClassINET, req.routingKey)
 
-		// Check if already in cache
-		if cachedResp := getFromCache(cacheKey, 0); cachedResp != nil {
-			LogDebug("[PREFETCH] Skipping %s %s - already cached", qName, dns.TypeToString[ft])
-			putMsg(cachedResp)
-			continue
-		}
-
-		// Check if already in-flight
+		// OPTIMIZATION: Check in-flight FIRST to avoid cache locking if we are already working on it
 		if _, loaded := inFlightPrefetch.LoadOrStore(cacheKey, struct{}{}); loaded {
-			LogDebug("[PREFETCH] Skipping %s %s - already in-flight", qName, dns.TypeToString[ft])
+			LogDebug("[PREFETCH] Skipping %s %s - already in-flight", req.qName, dns.TypeToString[fetchType])
 			continue
 		}
 
-		// Try to acquire semaphore (non-blocking)
+		// Check if already in cache (requires RLock)
+		if cachedResp := getFromCache(cacheKey, 0); cachedResp != nil {
+			LogDebug("[PREFETCH] Skipping %s %s - already cached", req.qName, dns.TypeToString[fetchType])
+			putMsg(cachedResp)
+			inFlightPrefetch.Delete(cacheKey)
+			continue
+		}
+
+		// Try to acquire semaphore (network limiter)
 		select {
 		case crossFetchLimiter <- struct{}{}:
-			go func(fetchType uint16, cacheKey string) {
+			// Execute synchronously in the worker (the worker pool size limits concurrency anyway)
+			// We keep the limiter pattern in case we want different sizing for CPU vs Network later
+			func(ft uint16, key string) {
 				defer func() {
 					<-crossFetchLimiter
-					inFlightPrefetch.Delete(cacheKey)
+					inFlightPrefetch.Delete(key)
 				}()
 
-				doCrossFetch(qName, fetchType, routingKey, cacheKey, upstreams, strategy, reqCtx)
-			}(ft, cacheKey)
+				// Reconstruct context from struct
+				// Note: RequestContext here is partial, only IP/MAC are preserved
+				reqCtx := &RequestContext{
+					ClientIP:  req.clientIP,
+					ClientMAC: req.clientMAC,
+				}
+				doCrossFetch(req.qName, ft, req.routingKey, key, req.upstreams, req.strategy, reqCtx)
+			}(fetchType, cacheKey)
 		default:
-			// Limiter full, skip this prefetch
+			// Limiter full, skip this specific type
 			inFlightPrefetch.Delete(cacheKey)
-			LogDebug("[PREFETCH] Cross-fetch queue full, skipping %s %s", qName, dns.TypeToString[ft])
+			LogDebug("[PREFETCH] Network limiter full, skipping %s %s", req.qName, dns.TypeToString[fetchType])
 		}
 	}
+}
+
+// TriggerCrossFetch is DEPRECATED in favor of AttemptCrossFetch + Worker Pool.
+// Kept only if needed by legacy code, but effectively replaced by AttemptCrossFetch.
+func TriggerCrossFetch(qName string, qType uint16, routingKey string, upstreams []*Upstream, strategy string, reqCtx *RequestContext) {
+	// Wrapper for compatibility, though process.go now calls AttemptCrossFetch directly
+	req := prefetchReq{
+		qName:      qName,
+		qType:      qType,
+		routingKey: routingKey,
+		upstreams:  upstreams,
+		strategy:   strategy,
+	}
+	if reqCtx.ClientIP != nil {
+		req.clientIP = make(net.IP, len(reqCtx.ClientIP))
+		copy(req.clientIP, reqCtx.ClientIP)
+	}
+	if reqCtx.ClientMAC != nil {
+		req.clientMAC = make(net.HardwareAddr, len(reqCtx.ClientMAC))
+		copy(req.clientMAC, reqCtx.ClientMAC)
+	}
+	AttemptCrossFetch(req)
 }
 
 func doCrossFetch(qName string, qType uint16, routingKey, cacheKey string, upstreams []*Upstream, strategy string, reqCtx *RequestContext) {

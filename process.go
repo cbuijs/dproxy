@@ -7,6 +7,7 @@ Description: Handles the core processing logic for DNS requests, including Singl
              UPDATED: Integrated IsValidARPCandidate check before ARP lookup.
              OPTIMIZED: Switched singleflight to DoChan with detached context to prevent leader-context-cancellation
                         from failing all shared requests and to allow waiters to respect their own timeouts.
+             OPTIMIZED: Replaced unbounded 'go TriggerCrossFetch' with non-blocking send to bounded worker pool to fix context deadlines.
 */
 
 package main
@@ -297,13 +298,29 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 
 		// --- CROSS-FETCH TRIGGER ---
 		// After successful upstream response, trigger background prefetch for related types
-		if resp.Rcode == dns.RcodeSuccess && len(resp.Answer) > 0 {
-			// Create a copy of request context for background goroutine
-			prefetchCtx := &RequestContext{
-				ClientIP:  reqCtx.ClientIP,
-				ClientMAC: reqCtx.ClientMAC,
+		// FIXED: Check enabled flag first and use bounded worker pool
+		if config.Cache.Prefetch.CrossFetch.Enabled && resp.Rcode == dns.RcodeSuccess && len(resp.Answer) > 0 {
+			// Extract data needed for prefetch
+			req := prefetchReq{
+				qName:      reqCtx.QueryName,
+				qType:      qType,
+				routingKey: ruleName,
+				upstreams:  selectedUpstreams,
+				strategy:   selectedStrategy,
 			}
-			go TriggerCrossFetch(reqCtx.QueryName, qType, ruleName, selectedUpstreams, selectedStrategy, prefetchCtx)
+			
+			// Deep copy slices (IP/MAC) to avoid holding pooled RequestContext logic
+			if len(reqCtx.ClientIP) > 0 {
+				req.clientIP = make(net.IP, len(reqCtx.ClientIP))
+				copy(req.clientIP, reqCtx.ClientIP)
+			}
+			if len(reqCtx.ClientMAC) > 0 {
+				req.clientMAC = make(net.HardwareAddr, len(reqCtx.ClientMAC))
+				copy(req.clientMAC, reqCtx.ClientMAC)
+			}
+
+			// Hand off to the worker pool (non-blocking)
+			AttemptCrossFetch(req)
 		}
 	}
 
