@@ -72,6 +72,18 @@ server:
   timeout: "5s"
   insecure_upstream: false
 
+# --- ARP/NDP Configuration (NEW) ---
+arp:
+  # Mode: "both", "v4", "v6", "none"
+  # - both: Maintain both ARP (IPv4) and NDP (IPv6) tables
+  # - v4:   Only maintain ARP table
+  # - v6:   Only maintain NDP table
+  # - none: Disable ARP/NDP maintenance entirely
+  mode: "both"
+  
+  # Timeout for system commands (e.g. 'ip neigh', 'arp -a')
+  timeout: "2s"
+
 # --- Bootstrap DNS Configuration ---
 bootstrap:
   servers:

@@ -4,6 +4,7 @@ Description: Defines configuration structures and handles YAML parsing and valid
 UPDATED: Restored bootstrap server logic to fix "unused import" error.
 UPDATED: Added hosts_urls support to configuration.
 UPDATED: Updated Load call to pass wildcard bool and optimize bool.
+UPDATED: Added ARP configuration section.
 */
 
 package main
@@ -26,6 +27,12 @@ type Config struct {
 	Bootstrap BootstrapConfig `yaml:"bootstrap"`
 	Cache     CacheConfig     `yaml:"cache"`
 	Routing   RoutingConfig   `yaml:"routing"`
+	ARP       ARPConfig       `yaml:"arp"` // New ARP configuration
+}
+
+type ARPConfig struct {
+	Mode    string `yaml:"mode"`    // v4, v6, both, none
+	Timeout string `yaml:"timeout"` // Timeout for system commands
 }
 
 type LoggingConfig struct {
@@ -138,7 +145,7 @@ type DefaultRule struct {
 	HostsFiles    []string    `yaml:"hosts_files"`
 	HostsURLs     []string    `yaml:"hosts_urls"`
 	HostsWildcard bool        `yaml:"hosts_wildcard"`
-	HostsOptimize bool        `yaml:"hosts_optimize"` // New field
+	HostsOptimize bool        `yaml:"hosts_optimize"`
 
 	parsedUpstreams []*Upstream
 	parsedHosts     *HostsCache
@@ -152,7 +159,7 @@ type RoutingRule struct {
 	HostsFiles    []string        `yaml:"hosts_files"`
 	HostsURLs     []string        `yaml:"hosts_urls"`
 	HostsWildcard bool            `yaml:"hosts_wildcard"`
-	HostsOptimize bool            `yaml:"hosts_optimize"` // New field
+	HostsOptimize bool            `yaml:"hosts_optimize"`
 
 	parsedUpstreams []*Upstream
 	parsedHosts     *HostsCache
@@ -326,6 +333,14 @@ func LoadConfig(path string) error {
 	}
 	if cfg.Server.EDNS0.MAC.Source == "" {
 		cfg.Server.EDNS0.MAC.Source = "arp"
+	}
+
+	// ARP Defaults
+	if cfg.ARP.Mode == "" {
+		cfg.ARP.Mode = "both"
+	}
+	if cfg.ARP.Timeout == "" {
+		cfg.ARP.Timeout = "2s"
 	}
 
 	// Validate EDNS0 settings (removed for brevity but assumed kept)

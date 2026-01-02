@@ -2,6 +2,7 @@
 File: main.go
 Description: Entry point for the dproxy application. Initializes globals, parses flags, and starts the system.
              UPDATED: Starts auto-refresh routines for all configured HOSTS files.
+             UPDATED: Smart ARP maintenance (skips if configured "none" or not required by any rules).
 */
 
 package main
@@ -196,11 +197,15 @@ Usage: %s -config <config.yaml>
 // startBackgroundTasks starts all background maintenance routines
 func startBackgroundTasks() {
 	// ARP cache maintenance
-	shutdownWg.Add(1)
-	go func() {
-		defer shutdownWg.Done()
-		maintainARPCache(shutdownContext)
-	}()
+	if isARPRequired() {
+		shutdownWg.Add(1)
+		go func() {
+			defer shutdownWg.Done()
+			maintainARPCache(shutdownContext)
+		}()
+	} else {
+		LogInfo("[ARP] Maintenance disabled (Mode: %s or not required by rules)", config.ARP.Mode)
+	}
 
 	// DoQ connection pool cleanup
 	shutdownWg.Add(1)
@@ -220,6 +225,39 @@ func startBackgroundTasks() {
 	} else {
 		LogInfo("Caching: Disabled")
 	}
+}
+
+// isARPRequired checks if ARP is actually needed by the configuration.
+// It returns true if ARP is enabled AND at least one rule uses MAC matching
+// OR if EDNS0 MAC addition is enabled.
+func isARPRequired() bool {
+	if config.ARP.Mode == "none" {
+		return false
+	}
+
+	// Check EDNS0 MAC settings
+	// If mode is 'add', 'replace', or 'prefer-arp', we need ARP data to add it to the packet.
+	macMode := config.Server.EDNS0.MAC.Mode
+	if macMode == "add" || macMode == "replace" || macMode == "prefer-arp" {
+		return true
+	}
+
+	// Check Routing Rules
+	for _, rule := range config.Routing.RoutingRules {
+		if len(rule.Match.ClientMAC) > 0 {
+			return true
+		}
+		if len(rule.Match.ClientEDNSMAC) > 0 {
+			// EDNS0 MAC is inside the packet, but we might want ARP to verify? 
+			// Actually ClientEDNSMAC matching relies on the packet, not ARP.
+			// But for safety, let's assume strict ARP isn't needed *just* for EDNS0 MAC matching
+			// unless we are validating it against ARP (which we don't do explicitly here).
+			// So this case alone doesn't strictly require ARP.
+		}
+	}
+
+	// Default to false if no specific need found
+	return false
 }
 
 // gracefulShutdown performs graceful shutdown of all servers

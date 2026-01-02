@@ -4,6 +4,7 @@ Description: Handles the core processing logic for DNS requests, including Singl
              logging, response cleaning, HOSTS file checking, and forwarding to upstreams.
              UPDATED: Fixed HOSTS Lookup call to handle the 2 return values (answers, found).
              UPDATED: Updated HOSTS LookupPTR call to handle the 2 return values (answers, found).
+             UPDATED: Integrated IsValidARPCandidate check before ARP lookup.
 */
 
 package main
@@ -82,7 +83,12 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 
 	remoteAddr := w.RemoteAddr()
 	ip := getIPFromAddr(remoteAddr)
-	mac := getMacFromCache(ip)
+	
+	// OPTIMIZATION: Check valid candidate BEFORE calling ARP cache logic
+	var mac net.HardwareAddr
+	if IsValidARPCandidate(ip) {
+		mac = getMacFromCache(ip)
+	}
 
 	reqCtx.ClientIP = ip
 	reqCtx.ClientMAC = mac

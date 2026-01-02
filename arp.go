@@ -1,9 +1,11 @@
 /*
 File: arp.go
-Version: 2.7.3
+Version: 2.7.4
 Description: Thread-safe, non-blocking ARP and NDP table manager.
              Handles resolving IPv4 and IPv6 addresses to MAC addresses by parsing system command output.
              Uses concurrent execution for separate IPv4/IPv6 commands and enforces timeouts.
+             UPDATED: Configurable IP versions (v4/v6/both/none).
+             OPTIMIZED: Skips lookups for invalid ARP candidates (localhost, multicast, etc).
 */
 
 package main
@@ -23,10 +25,6 @@ import (
 )
 
 // --- Constants & Regex ---
-
-const (
-	cmdTimeout = 2 * time.Second // Max time allowed for system commands
-)
 
 var (
 	// Windows: 192.168.1.1   00-11-22-33-44-55   dynamic
@@ -55,10 +53,20 @@ var (
 // maintainARPCache runs the background loop to keep the ARP table fresh.
 // It uses a "smart refresh" strategy to avoid wasting CPU when the proxy is idle.
 func maintainARPCache(ctx context.Context) {
-	LogInfo("[ARP] Starting background ARP/NDP table maintenance (Timeout: %v)", cmdTimeout)
+	// Parse timeout from config
+	timeoutStr := config.ARP.Timeout
+	if timeoutStr == "" {
+		timeoutStr = "2s"
+	}
+	timeout, err := time.ParseDuration(timeoutStr)
+	if err != nil {
+		timeout = 2 * time.Second
+	}
+
+	LogInfo("[ARP] Starting background ARP/NDP maintenance (Mode: %s, Timeout: %v)", config.ARP.Mode, timeout)
 	
 	// Initial population
-	refreshARP(ctx)
+	refreshARP(ctx, timeout)
 	lastRefresh := time.Now()
 
 	ticker := time.NewTicker(30 * time.Second)
@@ -74,7 +82,7 @@ func maintainARPCache(ctx context.Context) {
 			lastAccess := time.Unix(0, lastARPAccess.Load())
 			
 			if lastAccess.After(lastRefresh) {
-				refreshARP(ctx)
+				refreshARP(ctx, timeout)
 				lastRefresh = time.Now()
 			} else {
 				LogDebug("[ARP] Skipping refresh - Idle (Last access: %v)", lastAccess.Format(time.TimeOnly))
@@ -85,8 +93,14 @@ func maintainARPCache(ctx context.Context) {
 
 // getMacFromCache retrieves the MAC address for a given IP from the cache.
 // It is thread-safe and non-blocking (RLock only).
+// OPTIMIZED: Returns nil immediately for invalid candidates (localhost, etc).
 func getMacFromCache(ip net.IP) net.HardwareAddr {
 	if ip == nil {
+		return nil
+	}
+
+	// Fast Path: Skip IPs that never have MACs
+	if !IsValidARPCandidate(ip) {
 		return nil
 	}
 
@@ -102,7 +116,11 @@ func getMacFromCache(ip net.IP) net.HardwareAddr {
 
 // refreshARP orchestrates the fetching of ARP/NDP data.
 // It spawns platform-specific collectors and merges their results.
-func refreshARP(ctx context.Context) {
+func refreshARP(ctx context.Context, timeout time.Duration) {
+	if config.ARP.Mode == "none" {
+		return
+	}
+
 	start := time.Now()
 	
 	// Temporary map for collection to avoid locking the main cache during fetch
@@ -117,47 +135,61 @@ func refreshARP(ctx context.Context) {
 		mu.Unlock()
 	}
 
+	doV4 := config.ARP.Mode == "v4" || config.ARP.Mode == "both"
+	doV6 := config.ARP.Mode == "v6" || config.ARP.Mode == "both"
+
 	// Define collectors based on OS
 	switch runtime.GOOS {
 	case "linux":
-		// Linux `ip neigh` handles both IPv4 and IPv6 efficiently in one go
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			collectLinuxNeigh(ctx, addToTable)
-		}()
+		if doV4 || doV6 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				collectLinuxNeigh(ctx, addToTable, timeout, doV4, doV6)
+			}()
+		}
 
 	case "windows":
-		// Windows requires separate commands for ARP (IPv4) and NDP (IPv6)
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			collectWindowsARP(ctx, addToTable)
-		}()
-		go func() {
-			defer wg.Done()
-			collectWindowsNDP(ctx, addToTable)
-		}()
+		if doV4 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				collectWindowsARP(ctx, addToTable, timeout)
+			}()
+		}
+		if doV6 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				collectWindowsNDP(ctx, addToTable, timeout)
+			}()
+		}
 
 	case "darwin":
-		// macOS/BSD also separates them
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			collectDarwinARP(ctx, addToTable)
-		}()
-		go func() {
-			defer wg.Done()
-			collectDarwinNDP(ctx, addToTable)
-		}()
+		if doV4 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				collectDarwinARP(ctx, addToTable, timeout)
+			}()
+		}
+		if doV6 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				collectDarwinNDP(ctx, addToTable, timeout)
+			}()
+		}
 
 	default:
-		// Fallback to basic ARP for unknown *nix
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			collectDarwinARP(ctx, addToTable)
-		}()
+		// Fallback to basic ARP for unknown *nix (usually v4)
+		if doV4 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				collectDarwinARP(ctx, addToTable, timeout)
+			}()
+		}
 	}
 
 	wg.Wait()
@@ -181,11 +213,19 @@ func refreshARP(ctx context.Context) {
 
 // --- Collectors ---
 
-func collectLinuxNeigh(ctx context.Context, addFunc func(string, net.HardwareAddr)) {
-	// "ip neigh show" output:
-	// 10.0.0.1 dev eth0 lladdr 00:00:00:00:00:00 REACHABLE
-	// fe80::1 dev eth0 lladdr 00:00:00:00:00:00 router STALE
-	out, err := runCommand(ctx, "ip", "neigh", "show")
+func collectLinuxNeigh(ctx context.Context, addFunc func(string, net.HardwareAddr), timeout time.Duration, doV4, doV6 bool) {
+	// Linux `ip neigh` can filter by version
+	// but running `ip neigh show` gets both, so we can filter in user space or run twice.
+	// Running once is more efficient.
+	
+	args := []string{"neigh", "show"}
+	if doV4 && !doV6 {
+		args = []string{"-4", "neigh", "show"}
+	} else if doV6 && !doV4 {
+		args = []string{"-6", "neigh", "show"}
+	}
+
+	out, err := runCommand(ctx, timeout, "ip", args...)
 	if err != nil {
 		LogDebug("[ARP] Linux fetch failed: %v", err)
 		return
@@ -204,10 +244,6 @@ func collectLinuxNeigh(ctx context.Context, addFunc func(string, net.HardwareAdd
 				macStr := fields[i+1]
 				ipStr := fields[0]
 
-				// Linux might show state at the end (REACHABLE, STALE, DELAY, etc.)
-				// We generally accept any entry with a MAC, but strictly excluding FAILED might be good.
-				// For now, if it has an lladdr, we take it.
-
 				if mac, err := net.ParseMAC(macStr); err == nil {
 					addFunc(ipStr, mac)
 				}
@@ -217,8 +253,8 @@ func collectLinuxNeigh(ctx context.Context, addFunc func(string, net.HardwareAdd
 	}
 }
 
-func collectWindowsARP(ctx context.Context, addFunc func(string, net.HardwareAddr)) {
-	out, err := runCommand(ctx, "arp", "-a")
+func collectWindowsARP(ctx context.Context, addFunc func(string, net.HardwareAddr), timeout time.Duration) {
+	out, err := runCommand(ctx, timeout, "arp", "-a")
 	if err != nil {
 		LogDebug("[ARP] Windows ARP failed: %v", err)
 		return
@@ -239,9 +275,8 @@ func collectWindowsARP(ctx context.Context, addFunc func(string, net.HardwareAdd
 	}
 }
 
-func collectWindowsNDP(ctx context.Context, addFunc func(string, net.HardwareAddr)) {
-	// "netsh interface ipv6 show neighbors"
-	out, err := runCommand(ctx, "netsh", "interface", "ipv6", "show", "neighbors")
+func collectWindowsNDP(ctx context.Context, addFunc func(string, net.HardwareAddr), timeout time.Duration) {
+	out, err := runCommand(ctx, timeout, "netsh", "interface", "ipv6", "show", "neighbors")
 	if err != nil {
 		LogDebug("[ARP] Windows NDP failed: %v", err)
 		return
@@ -250,14 +285,10 @@ func collectWindowsNDP(ctx context.Context, addFunc func(string, net.HardwareAdd
 	sc := bufio.NewScanner(bytes.NewReader(out))
 	for sc.Scan() {
 		fields := strings.Fields(sc.Text())
-		// Expected format typically: Address - Interface - MAC - Type
-		// But usually roughly: [IP] [MAC] [Type]
 		if len(fields) >= 2 {
-			// Windows sometimes formats MAC as AA-BB-CC...
 			macStr := strings.ReplaceAll(fields[1], "-", ":")
 			if mac, err := net.ParseMAC(macStr); err == nil {
 				ipStr := fields[0]
-				// Validate IP
 				if ip := net.ParseIP(ipStr); ip != nil {
 					addFunc(ip.String(), mac)
 				}
@@ -266,8 +297,8 @@ func collectWindowsNDP(ctx context.Context, addFunc func(string, net.HardwareAdd
 	}
 }
 
-func collectDarwinARP(ctx context.Context, addFunc func(string, net.HardwareAddr)) {
-	out, err := runCommand(ctx, "arp", "-an")
+func collectDarwinARP(ctx context.Context, addFunc func(string, net.HardwareAddr), timeout time.Duration) {
+	out, err := runCommand(ctx, timeout, "arp", "-an")
 	if err != nil {
 		LogDebug("[ARP] Darwin ARP failed: %v", err)
 		return
@@ -281,7 +312,6 @@ func collectDarwinARP(ctx context.Context, addFunc func(string, net.HardwareAddr
 			ipStr := matches[1]
 			macStr := matches[2]
 			
-			// Filter out invalid/broadcast/incomplete
 			if macStr == "ff:ff:ff:ff:ff:ff" || macStr == "(incomplete)" {
 				continue
 			}
@@ -293,18 +323,14 @@ func collectDarwinARP(ctx context.Context, addFunc func(string, net.HardwareAddr
 	}
 }
 
-func collectDarwinNDP(ctx context.Context, addFunc func(string, net.HardwareAddr)) {
-	// "ndp -an" output:
-	// Neighbor                        Linklayer Address  Netif Expire    St Flgs Prbs
-	// fe80::1%lo0                     (incomplete)         lo0 permanent R
-	out, err := runCommand(ctx, "ndp", "-an")
+func collectDarwinNDP(ctx context.Context, addFunc func(string, net.HardwareAddr), timeout time.Duration) {
+	out, err := runCommand(ctx, timeout, "ndp", "-an")
 	if err != nil {
 		LogDebug("[ARP] Darwin NDP failed: %v", err)
 		return
 	}
 
 	sc := bufio.NewScanner(bytes.NewReader(out))
-	// Skip header if present, usually not strictly necessary as ParseMAC will fail
 	for sc.Scan() {
 		fields := strings.Fields(sc.Text())
 		if len(fields) >= 2 {
@@ -315,13 +341,11 @@ func collectDarwinNDP(ctx context.Context, addFunc func(string, net.HardwareAddr
 				continue
 			}
 
-			// Clean interface ID from IPv6 (e.g., fe80::1%en0 -> fe80::1)
 			if idx := strings.Index(ipStr, "%"); idx != -1 {
 				ipStr = ipStr[:idx]
 			}
 
 			if mac, err := net.ParseMAC(macStr); err == nil {
-				// Validate IP
 				if ip := net.ParseIP(ipStr); ip != nil {
 					addFunc(ip.String(), mac)
 				}
@@ -333,8 +357,8 @@ func collectDarwinNDP(ctx context.Context, addFunc func(string, net.HardwareAddr
 // --- Helpers ---
 
 // runCommand executes a command with a strict timeout context
-func runCommand(parentCtx context.Context, name string, args ...string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(parentCtx, cmdTimeout)
+func runCommand(parentCtx context.Context, timeout time.Duration, name string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(parentCtx, timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, name, args...)
