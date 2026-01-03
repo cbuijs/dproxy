@@ -2,11 +2,7 @@
 File: hosts.go
 Description: Handles loading, parsing, and querying of standard HOSTS files AND Domain Lists.
              Supports IPv4, IPv6, PTR (Reverse), and optional wildcard matching for subdomains.
-             UPDATED: Added logic to detect "Domain Lists" (lines without IPs) and treat them as blocked (0.0.0.0).
-             UPDATED: Parser now returns and logs the detected file format (HOSTS/DOMAINS/MIXED).
-             UPDATED: Strict parsing: discarding empty/comment lines, ensuring HOSTS syntax (IP host...), and stripping leading/trailing dots from domains.
-             UPDATED: Filters out domain names that are syntactically valid IP addresses.
-             UPDATED: Added debug logging for hostname sanitation and skipping.
+             UPDATED: Added support for configurable TTL (hosts_ttl) for records served from HOSTS.
 */
 
 package main
@@ -44,6 +40,7 @@ type HostsCache struct {
 	urls       []string
 	wildcard   bool
 	performOpt bool
+	defaultTTL uint32 // Configurable TTL for hosts entries
 	fileMtimes map[string]time.Time
 	urlMetas   map[string]urlMeta
 	client     *http.Client
@@ -59,7 +56,15 @@ func NewHostsCache() *HostsCache {
 		client: &http.Client{
 			Timeout: 10 * time.Second,
 		},
+		defaultTTL: 0, // Default to 0 (no cache) unless set
 	}
+}
+
+// SetTTL sets the default TTL for records served by this HostsCache.
+func (hc *HostsCache) SetTTL(ttl uint32) {
+	hc.Lock()
+	defer hc.Unlock()
+	hc.defaultTTL = ttl
 }
 
 // Load reads multiple hosts files AND URLs, then populates the cache.
@@ -617,22 +622,23 @@ func (hc *HostsCache) Lookup(qName string, qType uint16, wildcard bool) ([]dns.R
 	}
 
 	var answers []dns.RR
+	ttl := hc.defaultTTL // Use the configured TTL
 
 	// If blocked, force return 0.0.0.0 (A) or :: (AAAA) regardless of what's in the file
 	if isBlocked {
 		if qType == dns.TypeA {
 			rr := new(dns.A)
-			rr.Hdr = dns.RR_Header{Name: dns.Fqdn(qName), Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 0}
+			rr.Hdr = dns.RR_Header{Name: dns.Fqdn(qName), Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: ttl}
 			rr.A = net.IPv4(0, 0, 0, 0)
 			answers = append(answers, rr)
 		} else if qType == dns.TypeAAAA {
 			rr := new(dns.AAAA)
-			rr.Hdr = dns.RR_Header{Name: dns.Fqdn(qName), Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 0}
+			rr.Hdr = dns.RR_Header{Name: dns.Fqdn(qName), Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: ttl}
 			rr.AAAA = net.ParseIP("::")
 			answers = append(answers, rr)
 		}
 		// If other types (MX, etc.), return empty answers + found=true -> triggers NXDOMAIN in process.go
-		LogDebug("[HOSTS] Hit (%s): %s -> %s (BLOCKED -> Null Response)", matchType, qName, matchedName)
+		LogDebug("[HOSTS] Hit (%s): %s -> %s (BLOCKED -> Null Response, TTL: %d)", matchType, qName, matchedName, ttl)
 		return answers, true
 	}
 
@@ -640,19 +646,19 @@ func (hc *HostsCache) Lookup(qName string, qType uint16, wildcard bool) ([]dns.R
 	for _, ip := range ips {
 		if qType == dns.TypeA && ip.To4() != nil {
 			rr := new(dns.A)
-			rr.Hdr = dns.RR_Header{Name: dns.Fqdn(qName), Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 0}
+			rr.Hdr = dns.RR_Header{Name: dns.Fqdn(qName), Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: ttl}
 			rr.A = ip.To4()
 			answers = append(answers, rr)
 		} else if qType == dns.TypeAAAA && ip.To4() == nil {
 			rr := new(dns.AAAA)
-			rr.Hdr = dns.RR_Header{Name: dns.Fqdn(qName), Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 0}
+			rr.Hdr = dns.RR_Header{Name: dns.Fqdn(qName), Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: ttl}
 			rr.AAAA = ip
 			answers = append(answers, rr)
 		}
 	}
 
 	if len(answers) > 0 {
-		LogDebug("[HOSTS] Hit (%s): %s -> %s (Matches: %v)", matchType, qName, matchedName, ips)
+		LogDebug("[HOSTS] Hit (%s): %s -> %s (Matches: %v, TTL: %d)", matchType, qName, matchedName, ips, ttl)
 	} else {
 		LogDebug("[HOSTS] Hit (%s): %s -> %s (No %s records found, existing IPs: %v)", matchType, qName, matchedName, dns.TypeToString[qType], ips)
 	}
@@ -681,14 +687,16 @@ func (hc *HostsCache) LookupPTR(qName string) ([]dns.RR, bool) {
 	}
 
 	var answers []dns.RR
+	ttl := hc.defaultTTL // Use the configured TTL
+
 	for _, name := range names {
 		rr := new(dns.PTR)
-		rr.Hdr = dns.RR_Header{Name: qName, Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: 0}
+		rr.Hdr = dns.RR_Header{Name: qName, Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: ttl}
 		rr.Ptr = dns.Fqdn(name)
 		answers = append(answers, rr)
 	}
 
-	LogDebug("[HOSTS] PTR Hit: %s -> %v", qName, names)
+	LogDebug("[HOSTS] PTR Hit: %s -> %v (TTL: %d)", qName, names, ttl)
 	return answers, true
 }
 

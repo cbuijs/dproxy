@@ -1,14 +1,15 @@
 /*
 File: logger.go
 Description: Modern, structured, and multi-output logging implementation using Go 1.21+ log/slog.
-Supports Console, File, and Syslog outputs with Text or JSON formatting.
+Supports Console, File, and Syslog outputs.
+UPDATED: Removed unused 'io' import.
 */
 
 package main
 
 import (
+	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -18,26 +19,29 @@ import (
 )
 
 // Global logger instance
-// FIXED: Initialize with a default stderr logger so calls before InitLogger are not lost.
-// Using Stderr is standard for logs to separate from potential stdout data.
+// Initialize with a default stderr logger so calls before InitLogger are not lost.
 var logger *slog.Logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 	Level: slog.LevelInfo,
 }))
 
 // InitLogger initializes the global logger based on the provided configuration.
 func InitLogger(cfg LoggingConfig) error {
-	var writers []io.Writer
+	var handlers []slog.Handler
 
-	// 1. Setup Console Output
+	// Common Options (Level)
+	opts := &slog.HandlerOptions{
+		Level: parseLogLevel(cfg.Level),
+	}
+
+	// 1. Setup Console Output (Always Text)
 	for _, output := range cfg.Outputs {
 		if strings.EqualFold(output, "console") {
-			// Use Stderr for console logging to allow piping
-			writers = append(writers, os.Stderr)
+			handlers = append(handlers, slog.NewTextHandler(os.Stderr, opts))
 			break
 		}
 	}
 
-	// 2. Setup File Output
+	// 2. Setup File Output (JSON if configured, otherwise Text)
 	for _, output := range cfg.Outputs {
 		if strings.EqualFold(output, "file") {
 			if cfg.File.Path == "" {
@@ -53,12 +57,17 @@ func InitLogger(cfg LoggingConfig) error {
 			if err != nil {
 				return fmt.Errorf("failed to open log file: %w", err)
 			}
-			writers = append(writers, f)
+
+			if strings.EqualFold(cfg.Format, "json") {
+				handlers = append(handlers, slog.NewJSONHandler(f, opts))
+			} else {
+				handlers = append(handlers, slog.NewTextHandler(f, opts))
+			}
 			break
 		}
 	}
 
-	// 3. Setup Syslog Output (Cross-platform implementation)
+	// 3. Setup Syslog Output (Always Text)
 	for _, output := range cfg.Outputs {
 		if strings.EqualFold(output, "syslog") {
 			syslogWriter := &SyslogWriter{
@@ -71,37 +80,30 @@ func InitLogger(cfg LoggingConfig) error {
 			if h, err := os.Hostname(); err == nil {
 				syslogWriter.Hostname = h
 			}
-			writers = append(writers, syslogWriter)
+			// Syslog expects text lines, so we enforce TextHandler
+			handlers = append(handlers, slog.NewTextHandler(syslogWriter, opts))
 			break
 		}
 	}
 
-	if len(writers) == 0 {
+	if len(handlers) == 0 {
 		// Default fallback
-		writers = append(writers, os.Stderr)
+		handlers = append(handlers, slog.NewTextHandler(os.Stderr, opts))
 	}
 
-	// Create MultiWriter
-	multiWriter := io.MultiWriter(writers...)
-
-	// Setup Handler Options (Level)
-	opts := &slog.HandlerOptions{
-		Level: parseLogLevel(cfg.Level),
-	}
-
-	// Setup Handler (Text or JSON)
-	var handler slog.Handler
-	if strings.EqualFold(cfg.Format, "json") {
-		handler = slog.NewJSONHandler(multiWriter, opts)
+	// Create the final logger
+	// If multiple handlers, wrap in MultiHandler
+	var finalHandler slog.Handler
+	if len(handlers) > 1 {
+		finalHandler = &MultiHandler{handlers: handlers}
 	} else {
-		handler = slog.NewTextHandler(multiWriter, opts)
+		finalHandler = handlers[0]
 	}
 
-	// Set global logger
-	logger = slog.New(handler)
+	logger = slog.New(finalHandler)
 	slog.SetDefault(logger) // Hook into standard log package as well
 
-	LogInfo("[SYSTEM] Logger initialized: Level=%s, Format=%s, Outputs=%v", cfg.Level, cfg.Format, cfg.Outputs)
+	LogInfo("[SYSTEM] Logger initialized: Level=%s, FileFormat=%s, Outputs=%v", cfg.Level, cfg.Format, cfg.Outputs)
 	return nil
 }
 
@@ -120,9 +122,54 @@ func parseLogLevel(level string) slog.Level {
 	}
 }
 
+// --- MultiHandler Implementation ---
+// Allows dispatching log records to multiple handlers (e.g. JSON to file, Text to console)
+
+type MultiHandler struct {
+	handlers []slog.Handler
+}
+
+func (m *MultiHandler) Enabled(ctx context.Context, l slog.Level) bool {
+	for _, h := range m.handlers {
+		if h.Enabled(ctx, l) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *MultiHandler) Handle(ctx context.Context, r slog.Record) error {
+	var errs []error
+	for _, h := range m.handlers {
+		if h.Enabled(ctx, r.Level) {
+			if err := h.Handle(ctx, r); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	if len(errs) > 0 {
+		return errs[0] // Return first error, though we try to run all
+	}
+	return nil
+}
+
+func (m *MultiHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	handlers := make([]slog.Handler, len(m.handlers))
+	for i, h := range m.handlers {
+		handlers[i] = h.WithAttrs(attrs)
+	}
+	return &MultiHandler{handlers: handlers}
+}
+
+func (m *MultiHandler) WithGroup(name string) slog.Handler {
+	handlers := make([]slog.Handler, len(m.handlers))
+	for i, h := range m.handlers {
+		handlers[i] = h.WithGroup(name)
+	}
+	return &MultiHandler{handlers: handlers}
+}
+
 // --- Compatibility Wrappers ---
-// These ensure existing code using LogInfo/LogDebug works without changes.
-// We use fmt.Sprintf because the original code passed format strings.
 
 func LogDebug(format string, v ...interface{}) {
 	if logger != nil {
@@ -157,8 +204,6 @@ func LogFatal(format string, v ...interface{}) {
 }
 
 // --- Simple Syslog Writer ---
-// Implements a basic RFC 3164 / RFC 5424 compliant message sender.
-// This avoids the 'log/syslog' package which is not available on Windows.
 
 type SyslogWriter struct {
 	Network  string
@@ -174,6 +219,7 @@ func (w *SyslogWriter) connect() error {
 	if w.conn != nil {
 		return nil
 	}
+	// Support "unixgram" for /dev/log
 	conn, err := net.DialTimeout(w.Network, w.Address, 1*time.Second)
 	if err != nil {
 		return err
@@ -186,19 +232,14 @@ func (w *SyslogWriter) Write(p []byte) (n int, err error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// Parse level from slog output if possible, but slog output is already formatted text/json.
-	// We wrap the whole slog message as the "content" of the syslog packet.
-	// Default to Info severity (6)
-	severity := 6 
+	severity := 6 // Info
 	pri := (w.Facility * 8) + severity
 
 	timestamp := time.Now().Format(time.RFC3339)
 	
-	// Prepare basic syslog header: <PRI>TIMESTAMP HOSTNAME TAG: MESSAGE
-	// Note: We trim the newline from p because slog adds one, and we might not want double newlines in syslog
-	msg := string(p)
+	// Trim newline from slog text handler to avoid double spacing in syslog
+	msg := strings.TrimSuffix(string(p), "\n")
 	
-	// Detect level from string if standard text handler (optional heuristic)
 	if strings.Contains(msg, "level=ERROR") || strings.Contains(msg, "\"level\":\"ERROR\"") {
 		pri = (w.Facility * 8) + 3 // Error
 	} else if strings.Contains(msg, "level=WARN") || strings.Contains(msg, "\"level\":\"WARN\"") {
@@ -209,11 +250,7 @@ func (w *SyslogWriter) Write(p []byte) (n int, err error) {
 
 	syslogMsg := fmt.Sprintf("<%d>%s %s %s: %s", pri, timestamp, w.Hostname, w.Tag, msg)
 	
-	// Ensure connection
 	if err := w.connect(); err != nil {
-		// If we can't connect, we just drop the log to avoid blocking app functionality
-		// or maybe print to stderr as fallback?
-		// For now, return len(p) to pretend success so we don't crash the logger
 		return len(p), nil 
 	}
 
@@ -221,7 +258,6 @@ func (w *SyslogWriter) Write(p []byte) (n int, err error) {
 	if err != nil {
 		w.conn.Close()
 		w.conn = nil
-		// Try to reconnect once
 		if err := w.connect(); err == nil {
 			fmt.Fprint(w.conn, syslogMsg)
 		}

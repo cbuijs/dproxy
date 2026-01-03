@@ -1,11 +1,7 @@
 /*
 File: prefetch.go
 Description: Implements cache prefetching and cross-record fetching for DNS queries.
-             - Cross-fetch: When querying A, also fetch AAAA/HTTPS in background (and vice versa)
-             - Stale refresh: Proactively refresh popular cache entries before they expire
-             UPDATED: Implemented bounded worker pool for cross-fetch to prevent goroutine explosions.
-             UPDATED: Added backpressure mechanism (dropping requests when pool is full).
-             OPTIMIZED: Checks in-flight status before cache locking to reduce lock contention.
+             UPDATED: Applied TTL clamping and strategy to prefetched entries BEFORE caching.
 */
 
 package main
@@ -246,6 +242,12 @@ func doCrossFetch(qName string, qType uint16, routingKey, cacheKey string, upstr
 
 	// Clean and cache the response
 	cleanResponse(resp)
+
+	// FIX: Apply TTL clamping and strategy logic BEFORE adding to cache
+	// This ensures consistency between live responses and prefetched responses
+	applyTTLClamping(resp)
+	applyTTLStrategy(resp)
+	
 	addToCache(cacheKey, resp)
 
 	LogInfo("[PREFETCH] Cross-fetched %s %s from %s (RTT: %v, Total: %v, Answers: %d)",
@@ -411,6 +413,12 @@ func doStaleRefresh(ctx context.Context, c staleRefreshCandidate) {
 
 	// Clean and cache the response
 	cleanResponse(resp)
+
+	// FIX: Apply TTL clamping and strategy logic BEFORE adding to cache
+	// This ensures consistency between live responses and refreshed responses
+	applyTTLClamping(resp)
+	applyTTLStrategy(resp)
+
 	addToCache(c.key, resp)
 
 	LogInfo("[PREFETCH] Stale-refreshed %s %s from %s (RTT: %v, Total: %v, Remaining: %d%%, Hits: %d)",

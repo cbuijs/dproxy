@@ -1,20 +1,14 @@
 /*
 File: process.go
-Version: 2.1.3
-Description: Handles the core processing logic for DNS requests, including Singleflight, EDNS0 extraction,
-             logging, response cleaning, HOSTS file checking, and forwarding to upstreams.
-             UPDATED: Implemented DropOnFailure logic (drop query vs SERVFAIL).
-             FIXED: Added RequestContext.Clone() to prevent race conditions in singleflight.
-             UPDATED: Cache hit logging now shows actual remaining TTL in seconds.
-             UPDATED: Added TTL strategy support for normalizing TTLs in responses.
-             UPDATED: Enhanced TTL strategy logging with detailed debug output.
-             UPDATED: TTL strategy only applies when there are more than 1 record.
-             UPDATED: TTL clamping (min/max/neg) now applies to first response, not just cached.
+Version: 2.3.4
+Description: Handles the core processing logic for DNS requests.
+             UPDATED: Enhanced logging to show "no-op" decisions for TTL/Response logic when enabled.
 */
 
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -258,6 +252,9 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 			} else {
 				status = fmt.Sprintf("CACHE_HIT (%s, TTL:%ds)", ruleName, remainingTTL)
 			}
+			
+			// Sort Cache Response if configured
+			sortResponse(cachedResp)
 
 			logRequest(r.Id, reqCtx, qInfo, "", status, "CACHE", 0, time.Since(start), cachedResp)
 			w.WriteMsg(cachedResp)
@@ -335,8 +332,15 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	}
 
 	if resp != nil {
+		// Minimization (if enabled)
 		cleanResponse(resp)
-		// Apply TTL clamping (min_ttl, max_ttl, min_neg_ttl) to response
+		
+		// CNAME Flattening (if enabled)
+		if config.Server.Response.CNAMEFlattening {
+			flattenCNAMEs(resp)
+		}
+		
+		// Apply TTL clamping (min_ttl, max_ttl, min_neg_ttl, max_neg_ttl) to response
 		applyTTLClamping(resp)
 		// Apply TTL strategy to normalize TTLs across the response
 		applyTTLStrategy(resp)
@@ -378,9 +382,207 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	w.WriteMsg(resp)
 }
 
+// --- Response Manipulation Logic ---
+
+func cleanResponse(msg *dns.Msg) {
+	if msg == nil {
+		return
+	}
+	
+	// Only minimize if explicitly enabled
+	if !config.Server.Response.Minimization {
+		return
+	}
+
+	// Logging removed counts
+	nsCount := len(msg.Ns)
+	extraCount := len(msg.Extra)
+	
+	// Strip Authority and Additional sections
+	msg.Ns = nil
+	msg.Extra = nil
+	
+	// Keep Answer section, but filter out DNSSEC records if present in Answer
+	// (usually DNSSEC is in Authority/Additional, but checking Answer is safe)
+	removedAnswerCount := 0
+	if len(msg.Answer) > 0 {
+		n := 0
+		for _, rr := range msg.Answer {
+			switch rr.Header().Rrtype {
+			case dns.TypeRRSIG, dns.TypeNSEC, dns.TypeNSEC3, dns.TypeNSEC3PARAM, dns.TypeDS, dns.TypeDNSKEY, dns.TypeDLV:
+				removedAnswerCount++
+				continue
+			default:
+				if n != -1 {
+					msg.Answer[n] = rr
+					n++
+				}
+			}
+		}
+		msg.Answer = msg.Answer[:n]
+	}
+
+	// Log always if minimization is enabled to show it's active
+	LogDebug("[RESPONSE] Minimization: Stripped %d Authority, %d Additional, %d DNSSEC Answer records", 
+		nsCount, extraCount, removedAnswerCount)
+}
+
+func flattenCNAMEs(msg *dns.Msg) {
+	if msg == nil || len(msg.Answer) == 0 {
+		return
+	}
+
+	// 1. Identify the query name
+	if len(msg.Question) == 0 {
+		return
+	}
+	qName := msg.Question[0].Name
+	initialCount := len(msg.Answer)
+
+	// 2. Map CNAMEs and find final IP records
+	cnameMap := make(map[string]string)
+	var finalRRs []dns.RR
+	var otherRRs []dns.RR // non-A/AAAA/CNAME records (e.g. TXT, MX)
+
+	// Single pass to categorize
+	for _, rr := range msg.Answer {
+		header := rr.Header()
+		if cname, ok := rr.(*dns.CNAME); ok {
+			cnameMap[header.Name] = cname.Target
+		} else if _, ok := rr.(*dns.A); ok {
+			finalRRs = append(finalRRs, rr)
+		} else if _, ok := rr.(*dns.AAAA); ok {
+			finalRRs = append(finalRRs, rr)
+		} else {
+			otherRRs = append(otherRRs, rr)
+		}
+	}
+	
+	if len(finalRRs) == 0 {
+		// Log that we checked but couldn't flatten
+		LogDebug("[RESPONSE] CNAME Flattening: No final A/AAAA records found to flatten to")
+		return
+	}
+
+	// 3. Trace chain to see if it links back to QName
+	// Helper to check if a name resolves to QName via CNAME chain
+	resolvesToQName := func(targetName string) bool {
+		// Walk forwards from QName.
+		current := qName
+		visited := make(map[string]bool)
+		
+		for {
+			if current == targetName {
+				return true
+			}
+			if visited[current] {
+				return false // Cycle
+			}
+			visited[current] = true
+			
+			next, ok := cnameMap[current]
+			if !ok {
+				return false // End of chain, didn't reach target
+			}
+			current = next
+		}
+	}
+
+	// 4. Rewrite names of final records
+	newAnswers := make([]dns.RR, 0, len(finalRRs)+len(otherRRs))
+	
+	// Add flattened IP records
+	for _, rr := range finalRRs {
+		// If this record's name is the target of the chain starting at qName
+		if resolvesToQName(rr.Header().Name) {
+			// Create a copy to modify
+			newRR := dns.Copy(rr)
+			newRR.Header().Name = qName
+			newAnswers = append(newAnswers, newRR)
+		} else {
+			// Keep as is (maybe it's a separate record)
+			newAnswers = append(newAnswers, rr)
+		}
+	}
+	
+	// Add back other records (TXT, etc)
+	newAnswers = append(newAnswers, otherRRs...)
+
+	msg.Answer = newAnswers
+
+	// Log if we reduced the record count or checked
+	if len(newAnswers) < initialCount {
+		LogDebug("[RESPONSE] CNAME Flattening: Collapsed chain (Records: %d -> %d)", initialCount, len(newAnswers))
+	} else {
+		LogDebug("[RESPONSE] CNAME Flattening: Checked, but no reduction possible (Chain might be direct)")
+	}
+}
+
+func sortResponse(msg *dns.Msg) {
+	if msg == nil || len(msg.Answer) <= 1 {
+		return
+	}
+	
+	strategy := config.Cache.ResponseSorting
+	if strategy == "none" {
+		return
+	}
+
+	// Separate records by type to only sort A/AAAA records
+	var ips []dns.RR
+	var others []dns.RR
+
+	for _, rr := range msg.Answer {
+		if _, ok := rr.(*dns.A); ok {
+			ips = append(ips, rr)
+		} else if _, ok := rr.(*dns.AAAA); ok {
+			ips = append(ips, rr)
+		} else {
+			others = append(others, rr)
+		}
+	}
+
+	if len(ips) <= 1 {
+		// Log skip
+		LogDebug("[RESPONSE] Sorting: Skipped (not enough IP records)")
+		return
+	}
+
+	switch strategy {
+	case "round-robin":
+		rand.Shuffle(len(ips), func(i, j int) {
+			ips[i], ips[j] = ips[j], ips[i]
+		})
+	case "sorted":
+		sort.Slice(ips, func(i, j int) bool {
+			// Sort by Rdata (IP address)
+			var ipI, ipJ net.IP
+			
+			if a, ok := ips[i].(*dns.A); ok {
+				ipI = a.A
+			} else if aaaa, ok := ips[i].(*dns.AAAA); ok {
+				ipI = aaaa.AAAA
+			}
+			
+			if a, ok := ips[j].(*dns.A); ok {
+				ipJ = a.A
+			} else if aaaa, ok := ips[j].(*dns.AAAA); ok {
+				ipJ = aaaa.AAAA
+			}
+			
+			return bytes.Compare(ipI, ipJ) < 0
+		})
+	}
+
+	// Reassemble
+	msg.Answer = append(ips, others...)
+	
+	LogDebug("[RESPONSE] Sorted Answer section (Strategy: %s, Records: %d)", strategy, len(ips))
+}
+
 // --- TTL Clamping Logic ---
 
-// applyTTLClamping applies min_ttl, max_ttl and min_neg_ttl configuration to a DNS response.
+// applyTTLClamping applies min_ttl, max_ttl, min_neg_ttl and max_neg_ttl configuration to a DNS response.
 // This ensures TTL bounds are enforced on the first response to the client, not just cached responses.
 func applyTTLClamping(msg *dns.Msg) {
 	if msg == nil || config == nil {
@@ -388,29 +590,35 @@ func applyTTLClamping(msg *dns.Msg) {
 	}
 
 	// Skip if no TTL clamping is configured
-	if config.Cache.MinTTL == 0 && config.Cache.MaxTTL == 0 && config.Cache.MinNegTTL == 0 {
+	if config.Cache.MinTTL == 0 && config.Cache.MaxTTL == 0 && config.Cache.MinNegTTL == 0 && config.Cache.MaxNegTTL == 0 {
 		return
 	}
 
-	isNegative := msg.Rcode == dns.RcodeNameError
-
+	isNegative := msg.Rcode == dns.RcodeNameError || (msg.Rcode == dns.RcodeSuccess && len(msg.Answer) == 0)
+	clampedCount := 0
+	totalChecked := 0
+	
 	// Helper to clamp TTLs in a slice of RRs
 	clampTTLs := func(rrs []dns.RR) {
 		for _, rr := range rrs {
 			if _, ok := rr.(*dns.OPT); ok {
 				continue
 			}
+			totalChecked++
 
 			originalTTL := rr.Header().Ttl
 			newTTL := originalTTL
 
 			if isNegative {
-				// Negative response (NXDOMAIN)
+				// Negative response (NXDOMAIN or NODATA)
 				if config.Cache.MinNegTTL > 0 && newTTL < uint32(config.Cache.MinNegTTL) {
 					newTTL = uint32(config.Cache.MinNegTTL)
 				}
+				if config.Cache.MaxNegTTL > 0 && newTTL > uint32(config.Cache.MaxNegTTL) {
+					newTTL = uint32(config.Cache.MaxNegTTL)
+				}
 			} else {
-				// Positive response (NOERROR)
+				// Positive response (NOERROR with Answers)
 				if config.Cache.MinTTL > 0 && newTTL < uint32(config.Cache.MinTTL) {
 					newTTL = uint32(config.Cache.MinTTL)
 				}
@@ -420,8 +628,8 @@ func applyTTLClamping(msg *dns.Msg) {
 			}
 
 			if newTTL != originalTTL {
-				LogDebug("[TTL-CLAMP] %s: %d -> %d (neg=%v)", rr.Header().Name, originalTTL, newTTL, isNegative)
 				rr.Header().Ttl = newTTL
+				clampedCount++
 			}
 		}
 	}
@@ -429,6 +637,14 @@ func applyTTLClamping(msg *dns.Msg) {
 	clampTTLs(msg.Answer)
 	clampTTLs(msg.Ns)
 	clampTTLs(msg.Extra)
+
+	// Log unconditionally to prove it ran, even if count is 0
+	respType := "NOERROR"
+	if isNegative {
+		respType = "NEGATIVE"
+	}
+	LogDebug("[TTL-CLAMP] Processed %d records (%s), Clamped: %d. Settings: Min=%d, Max=%d, MinNeg=%d, MaxNeg=%d",
+		totalChecked, respType, clampedCount, config.Cache.MinTTL, config.Cache.MaxTTL, config.Cache.MinNegTTL, config.Cache.MaxNegTTL)
 }
 
 // --- TTL Strategy Logic ---
@@ -463,12 +679,9 @@ func applyTTLStrategy(msg *dns.Msg) {
 
 	// Skip if 0 or 1 records - nothing to normalize
 	if len(ttls) <= 1 {
-		LogDebug("[TTL] Skipping normalization: only %d record(s) in response", len(ttls))
+		LogDebug("[TTL] Strategy '%s': Skipped (not enough records)", strategy)
 		return
 	}
-
-	// Log the original TTLs before normalization
-	LogDebug("[TTL] Strategy '%s' - Original TTLs: %v (%d records)", strategy, ttls, len(ttls))
 
 	// Determine the target TTL based on strategy
 	var targetTTL uint32
@@ -476,11 +689,9 @@ func applyTTLStrategy(msg *dns.Msg) {
 	switch strategy {
 	case "first":
 		targetTTL = ttls[0]
-		LogDebug("[TTL] Strategy 'first' - Using TTL from first record: %d", targetTTL)
 
 	case "last":
 		targetTTL = ttls[len(ttls)-1]
-		LogDebug("[TTL] Strategy 'last' - Using TTL from last record: %d", targetTTL)
 
 	case "lowest":
 		targetTTL = ttls[0]
@@ -489,7 +700,6 @@ func applyTTLStrategy(msg *dns.Msg) {
 				targetTTL = t
 			}
 		}
-		LogDebug("[TTL] Strategy 'lowest' - Minimum TTL found: %d", targetTTL)
 
 	case "highest":
 		targetTTL = ttls[0]
@@ -498,7 +708,6 @@ func applyTTLStrategy(msg *dns.Msg) {
 				targetTTL = t
 			}
 		}
-		LogDebug("[TTL] Strategy 'highest' - Maximum TTL found: %d", targetTTL)
 
 	case "average":
 		var sum uint64
@@ -506,7 +715,6 @@ func applyTTLStrategy(msg *dns.Msg) {
 			sum += uint64(t)
 		}
 		targetTTL = uint32(sum / uint64(len(ttls)))
-		LogDebug("[TTL] Strategy 'average' - Sum=%d, Count=%d, Average TTL: %d", sum, len(ttls), targetTTL)
 
 	default:
 		// Unknown strategy, log warning and skip
@@ -524,7 +732,7 @@ func applyTTLStrategy(msg *dns.Msg) {
 	}
 
 	if allSame {
-		LogDebug("[TTL] All %d records already have TTL=%d, no normalization needed", len(ttls), targetTTL)
+		LogDebug("[TTL] Strategy '%s': Skipped (already normalized to %d)", strategy, targetTTL)
 		return
 	}
 
@@ -542,7 +750,7 @@ func applyTTLStrategy(msg *dns.Msg) {
 	applyTTL(msg.Ns)
 	applyTTL(msg.Extra)
 
-	LogInfo("[TTL] Normalized %d records to TTL=%d (strategy: %s)", len(ttls), targetTTL, strategy)
+	LogDebug("[TTL] Strategy '%s': Normalized %d records to TTL=%d", strategy, len(ttls), targetTTL)
 }
 
 // --- Strategies ---
@@ -863,30 +1071,6 @@ func raceStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, reqC
 
 // --- Helpers ---
 
-func cleanResponse(msg *dns.Msg) {
-	if msg == nil {
-		return
-	}
-	msg.Ns = nil
-	msg.Extra = nil
-	if len(msg.Answer) == 0 {
-		return
-	}
-	n := 0
-	for _, rr := range msg.Answer {
-		switch rr.Header().Rrtype {
-		case dns.TypeRRSIG, dns.TypeNSEC, dns.TypeNSEC3, dns.TypeNSEC3PARAM, dns.TypeDS, dns.TypeDNSKEY, dns.TypeDLV:
-			continue
-		default:
-			if n != -1 {
-				msg.Answer[n] = rr
-				n++
-			}
-		}
-	}
-	msg.Answer = msg.Answer[:n]
-}
-
 func logRequest(qid uint16, reqCtx *RequestContext, qInfo, upstreamQInfo, status, upstream string, upstreamRTT, duration time.Duration, resp *dns.Msg) {
 	macStr := "N/A"
 	if reqCtx.ClientMAC != nil {
@@ -1034,59 +1218,61 @@ func addEDNS0Options(msg *dns.Msg, ip net.IP, mac net.HardwareAddr) {
 	ecsMode := config.Server.EDNS0.ECS.Mode
 	macMode := config.Server.EDNS0.MAC.Mode
 	macSource := config.Server.EDNS0.MAC.Source
-	LogDebug("[EDNS0] Processing options for upstream (ECS mode: %s, MAC mode: %s)", ecsMode, macMode)
-	LogDebug("[EDNS0] Client IP: %v, ARP MAC: %v", ip, mac)
+
+	// Logging variables
+	var ecsLog string = "None"
+	var macLog string = "None"
+
 	for _, opt := range o.Option {
 		if ecs, ok := opt.(*dns.EDNS0_SUBNET); ok {
 			hasECS = true
-			LogDebug("[EDNS0] Found existing ECS from client: %s/%d (family: %d)", ecs.Address, ecs.SourceNetmask, ecs.Family)
+			ecsLog = fmt.Sprintf("Existing(%s/%d)", ecs.Address, ecs.SourceNetmask)
 		} else if local, ok := opt.(*dns.EDNS0_LOCAL); ok && local.Code == EDNS0_OPTION_MAC {
 			hasMAC = true
 			existingMAC = net.HardwareAddr(local.Data)
-			LogDebug("[EDNS0] Found existing MAC from client: %s", existingMAC)
+			macLog = fmt.Sprintf("Existing(%s)", existingMAC)
 		}
 	}
+
 	for _, opt := range o.Option {
 		switch v := opt.(type) {
 		case *dns.EDNS0_SUBNET:
 			switch ecsMode {
 			case "preserve":
 				opts = append(opts, opt)
-				LogDebug("[EDNS0] ECS: Preserving client's ECS: %s/%d", v.Address, v.SourceNetmask)
+				ecsLog = "Preserved"
 			case "add":
-				if !hasECS {
-					LogDebug("[EDNS0] ECS: Client has no ECS, will add client IP")
-				} else {
+				if hasECS {
 					opts = append(opts, opt)
-					LogDebug("[EDNS0] ECS: Client already has ECS, preserving: %s/%d", v.Address, v.SourceNetmask)
+					ecsLog = "Preserved"
 				}
 			case "replace":
-				LogDebug("[EDNS0] ECS: Replacing client's ECS %s/%d with client IP", v.Address, v.SourceNetmask)
+				ecsLog = "Replacing"
 			case "remove":
-				LogDebug("[EDNS0] ECS: Removing client's ECS: %s/%d", v.Address, v.SourceNetmask)
+				ecsLog = "Removed"
 			}
 		case *dns.EDNS0_LOCAL:
 			if v.Code == EDNS0_OPTION_MAC {
 				switch macMode {
 				case "preserve":
 					opts = append(opts, opt)
-					LogDebug("[EDNS0] MAC: Preserving client's MAC: %s", net.HardwareAddr(v.Data))
+					macLog = "Preserved"
 				case "add":
-					if !hasMAC {
-						LogDebug("[EDNS0] MAC: Client has no MAC, will add from source")
-					} else {
+					if hasMAC {
 						opts = append(opts, opt)
-						LogDebug("[EDNS0] MAC: Client already has MAC, preserving: %s", net.HardwareAddr(v.Data))
+						macLog = "Preserved"
 					}
 				case "replace":
-					LogDebug("[EDNS0] MAC: Replacing client's MAC %s with source MAC", net.HardwareAddr(v.Data))
+					macLog = "Replacing"
 				case "remove":
-					LogDebug("[EDNS0] MAC: Removing client's MAC: %s", net.HardwareAddr(v.Data))
+					macLog = "Removed"
 				case "prefer-edns0":
-					opts = append(opts, opt)
-					LogDebug("[EDNS0] MAC: Preferring client's EDNS0 MAC: %s", net.HardwareAddr(v.Data))
+					if hasMAC {
+						opts = append(opts, opt)
+						macLog = "Preserved(Preferred)"
+					}
 				case "prefer-arp":
-					LogDebug("[EDNS0] MAC: Preferring ARP MAC over client's EDNS0 MAC: %s", net.HardwareAddr(v.Data))
+					// Logic below handles fallback/addition
 				}
 			} else {
 				opts = append(opts, opt)
@@ -1095,6 +1281,7 @@ func addEDNS0Options(msg *dns.Msg, ip net.IP, mac net.HardwareAddr) {
 			opts = append(opts, opt)
 		}
 	}
+
 	shouldAddECS := false
 	switch ecsMode {
 	case "preserve":
@@ -1118,12 +1305,8 @@ func addEDNS0Options(msg *dns.Msg, ip net.IP, mac net.HardwareAddr) {
 		if isIPv6 {
 			if config.Server.EDNS0.ECS.IPv6Mask > 0 {
 				mask = uint8(config.Server.EDNS0.ECS.IPv6Mask)
-				LogDebug("[EDNS0] ECS: Using configured IPv6 mask: /%d", mask)
 			} else if config.Server.EDNS0.ECS.SourceMask > 0 {
 				mask = uint8(config.Server.EDNS0.ECS.SourceMask)
-				LogDebug("[EDNS0] ECS: Using configured source mask for IPv6: /%d", mask)
-			} else {
-				LogDebug("[EDNS0] ECS: Using default IPv6 mask: /%d", mask)
 			}
 			if mask > 128 {
 				mask = 128
@@ -1131,12 +1314,8 @@ func addEDNS0Options(msg *dns.Msg, ip net.IP, mac net.HardwareAddr) {
 		} else {
 			if config.Server.EDNS0.ECS.IPv4Mask > 0 {
 				mask = uint8(config.Server.EDNS0.ECS.IPv4Mask)
-				LogDebug("[EDNS0] ECS: Using configured IPv4 mask: /%d", mask)
 			} else if config.Server.EDNS0.ECS.SourceMask > 0 {
 				mask = uint8(config.Server.EDNS0.ECS.SourceMask)
-				LogDebug("[EDNS0] ECS: Using configured source mask for IPv4: /%d", mask)
-			} else {
-				LogDebug("[EDNS0] ECS: Using default IPv4 mask: /%d", mask)
 			}
 			if mask > 32 {
 				mask = 32
@@ -1148,61 +1327,46 @@ func addEDNS0Options(msg *dns.Msg, ip net.IP, mac net.HardwareAddr) {
 			SourceNetmask: mask,
 			Address:       ip,
 		})
-		LogDebug("[EDNS0] ECS: Added to upstream: %s/%d (family: %d)", ip, mask, family)
-	} else if !shouldAddECS && ip != nil {
-		LogDebug("[EDNS0] ECS: Not adding to upstream (mode: %s, hasECS: %v)", ecsMode, hasECS)
+		ecsLog = fmt.Sprintf("Added(%s/%d)", ip, mask)
 	}
+
 	shouldAddMAC := false
 	var macToAdd net.HardwareAddr
 	switch macMode {
 	case "preserve":
 		shouldAddMAC = false
-		LogDebug("[EDNS0] MAC: Preserve mode - not adding new MAC")
 	case "add":
 		shouldAddMAC = !hasMAC
 		macToAdd = determineMAC(mac, existingMAC, macSource)
-		if shouldAddMAC {
-			LogDebug("[EDNS0] MAC: Add mode - will add MAC from source: %s", macSource)
-		} else {
-			LogDebug("[EDNS0] MAC: Add mode - client already has MAC, not adding")
-		}
 	case "replace":
 		shouldAddMAC = true
 		macToAdd = determineMAC(mac, existingMAC, macSource)
-		LogDebug("[EDNS0] MAC: Replace mode - will add MAC from source: %s", macSource)
 	case "remove":
 		shouldAddMAC = false
-		LogDebug("[EDNS0] MAC: Remove mode - not adding MAC")
 	case "prefer-edns0":
 		if hasMAC {
 			shouldAddMAC = false
-			LogDebug("[EDNS0] MAC: Prefer-EDNS0 mode - already kept client's MAC")
 		} else if mac != nil && (macSource == "arp" || macSource == "both") {
 			shouldAddMAC = true
 			macToAdd = mac
-			LogDebug("[EDNS0] MAC: Prefer-EDNS0 mode - no client MAC, adding ARP MAC")
-		} else {
-			LogDebug("[EDNS0] MAC: Prefer-EDNS0 mode - no MAC available")
 		}
 	case "prefer-arp":
 		if mac != nil && (macSource == "arp" || macSource == "both") {
 			shouldAddMAC = true
 			macToAdd = mac
-			LogDebug("[EDNS0] MAC: Prefer-ARP mode - using ARP MAC: %s", mac)
 		} else if hasMAC && (macSource == "edns0" || macSource == "both") {
 			shouldAddMAC = true
 			macToAdd = existingMAC
-			LogDebug("[EDNS0] MAC: Prefer-ARP mode - no ARP MAC, using client's EDNS0 MAC")
-		} else {
-			LogDebug("[EDNS0] MAC: Prefer-ARP mode - no MAC available")
 		}
 	}
 	if shouldAddMAC && macToAdd != nil {
 		opts = append(opts, &dns.EDNS0_LOCAL{Code: EDNS0_OPTION_MAC, Data: macToAdd})
-		LogDebug("[EDNS0] MAC: Added to upstream: %s", macToAdd)
+		macLog = fmt.Sprintf("Added(%s)", macToAdd)
 	}
 	o.Option = opts
-	LogDebug("[EDNS0] Final upstream EDNS0 options count: %d", len(opts))
+
+	LogDebug("[EDNS0] ClientIP=%v | ECS(%s): %s | MAC(%s): %s | Opts: %d", 
+		ip, ecsMode, ecsLog, macMode, macLog, len(opts))
 }
 
 func determineMAC(arpMAC, edns0MAC net.HardwareAddr, source string) net.HardwareAddr {

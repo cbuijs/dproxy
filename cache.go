@@ -1,12 +1,9 @@
 /*
 File: cache.go
-Version: 2.1.2
+Version: 2.2.0
 Description: Thread-safe in-memory DNS cache using Sharded LRU eviction.
-OPTIMIZED: Switched from a single global mutex to a Sharded Cache (256 shards).
-           This significantly reduces lock contention in high-concurrency scenarios (e.g., dnsperf).
-UPDATED: Implemented Min/Max TTL for NOERROR and MinNegTTL for Negative responses.
-UPDATED: Added getFromCacheWithTTL() to return actual remaining TTL for logging purposes.
-UPDATED: TTL clamping moved to process.go so it applies to first response AND cached responses.
+UPDATED: Implemented MinNegTTL in addToCache fallback logic.
+UPDATED: Maintenance logging now shows MaxNegTTL and HostsTTL.
 */
 
 package main
@@ -86,9 +83,13 @@ func maintainDNSCache(ctx context.Context) {
 	LogInfo("[CACHE] Starting maintenance (Capacity: %d, Type: Sharded LRU [%d shards])", totalCap, shardCount)
 	
 	// Log TTL configuration
-	if config.Cache.MinTTL > 0 || config.Cache.MaxTTL > 0 || config.Cache.MinNegTTL > 0 {
-		LogInfo("[CACHE] TTL Control: MinTTL=%ds, MaxTTL=%ds, MinNegTTL=%ds", 
-			config.Cache.MinTTL, config.Cache.MaxTTL, config.Cache.MinNegTTL)
+	if config.Cache.MinTTL > 0 || config.Cache.MaxTTL > 0 || config.Cache.MinNegTTL > 0 || config.Cache.MaxNegTTL > 0 {
+		LogInfo("[CACHE] TTL Control: MinTTL=%ds, MaxTTL=%ds, MinNegTTL=%ds, MaxNegTTL=%ds", 
+			config.Cache.MinTTL, config.Cache.MaxTTL, config.Cache.MinNegTTL, config.Cache.MaxNegTTL)
+	}
+
+	if config.Cache.HostsTTL > 0 {
+		LogInfo("[CACHE] Hosts File TTL: %ds", config.Cache.HostsTTL)
 	}
 
 	// Log TTL Strategy if enabled
@@ -211,7 +212,8 @@ func addToCache(key string, msg *dns.Msg) {
 		return
 	}
 
-	// Determine minTTL from records (TTL clamping already applied in process.go)
+	// Determine minTTL from records (TTL clamping already applied in process.go,
+	// so these values should be within the configured limits)
 	minTTL := uint32(3600)
 	foundTTL := false
 	checkRR := func(rrs []dns.RR) {
@@ -229,12 +231,20 @@ func addToCache(key string, msg *dns.Msg) {
 	checkRR(msg.Ns)
 	checkRR(msg.Extra)
 
-	if minTTL == 0 {
+	// If no records found (e.g. NXDOMAIN with no SOA), we need a default negative TTL.
+	// We use the configured MinNegTTL if available, otherwise default to 60.
+	if !foundTTL && msg.Rcode == dns.RcodeNameError {
+		if config.Cache.MinNegTTL > 0 {
+			minTTL = uint32(config.Cache.MinNegTTL)
+		} else {
+			minTTL = 60
+		}
+	} else if !foundTTL {
+		// Empty response with no RCode error? Don't cache if we can't determine TTL.
 		return
 	}
-	if !foundTTL && msg.Rcode == dns.RcodeNameError {
-		minTTL = 60 // Default negative TTL if no SOA provided
-	} else if !foundTTL {
+
+	if minTTL == 0 {
 		return
 	}
 

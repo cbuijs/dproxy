@@ -1,14 +1,8 @@
 /*
 File: config.go
-Version: 2.1.0
+Version: 2.3.2
 Description: Defines configuration structures and handles YAML parsing and validation.
-UPDATED: Restored bootstrap server logic to fix "unused import" error.
-UPDATED: Added hosts_urls support to configuration.
-UPDATED: Updated Load call to pass wildcard bool and optimize bool.
-UPDATED: Added ARP configuration section.
-UPDATED: Added Min/Max TTL and MinNegTTL to CacheConfig.
-UPDATED: Added DropOnFailure to ServerConfig.
-UPDATED: Added TTLStrategy to CacheConfig for TTL normalization across response records.
+UPDATED: Auto-detect 'unixgram' network for local syslog paths.
 */
 
 package main
@@ -98,7 +92,13 @@ type ServerConfig struct {
 	} `yaml:"edns0"`
 	Timeout          string `yaml:"timeout"`
 	InsecureUpstream bool   `yaml:"insecure_upstream"`
-	DropOnFailure    bool   `yaml:"drop_on_failure"` // New: Drop query instead of SERVFAIL on failure
+	DropOnFailure    bool   `yaml:"drop_on_failure"` // Drop query instead of SERVFAIL on failure
+
+	// Response Manipulation Configuration
+	Response struct {
+		Minimization    bool `yaml:"minimization"`     // Remove Authority/Additional sections
+		CNAMEFlattening bool `yaml:"cname_flattening"` // Flatten CNAME chains to A/AAAA
+	} `yaml:"response"`
 }
 
 type BootstrapConfig struct {
@@ -112,7 +112,14 @@ type CacheConfig struct {
 	MinTTL      int            `yaml:"min_ttl"`      // Minimum TTL for NOERROR
 	MaxTTL      int            `yaml:"max_ttl"`      // Maximum TTL for NOERROR
 	MinNegTTL   int            `yaml:"min_neg_ttl"`  // Minimum TTL for Negatives (NXDOMAIN, etc)
-	TTLStrategy string         `yaml:"ttl_strategy"` // TTL normalization: none, first, last, lowest, highest, average
+	MaxNegTTL   int            `yaml:"max_neg_ttl"`  // Maximum TTL for Negatives
+	HostsTTL    int            `yaml:"hosts_ttl"`    // TTL for records served from HOSTS files
+	TTLStrategy string         `yaml:"ttl_strategy"` // TTL normalization strategy
+	
+	// Response Sorting Strategy for Cache Hits
+	// options: "none", "round-robin", "sorted"
+	ResponseSorting string `yaml:"response_sorting"` 
+
 	Prefetch    PrefetchConfig `yaml:"prefetch"`
 }
 
@@ -310,12 +317,21 @@ func LoadConfig(path string) error {
 	if len(cfg.Logging.Outputs) == 0 {
 		cfg.Logging.Outputs = []string{"console"}
 	}
+	
+	// Syslog Defaults
 	if cfg.Logging.Syslog.Address == "" {
 		cfg.Logging.Syslog.Address = "127.0.0.1:514"
 	}
+	
+	// Auto-detect unixgram for local paths if network not specified or is udp (default assumption from empty)
+	if strings.HasPrefix(cfg.Logging.Syslog.Address, "/") && (cfg.Logging.Syslog.Network == "" || cfg.Logging.Syslog.Network == "udp") {
+		cfg.Logging.Syslog.Network = "unixgram"
+	}
+
 	if cfg.Logging.Syslog.Network == "" {
 		cfg.Logging.Syslog.Network = "udp"
 	}
+	
 	if cfg.Logging.Syslog.Tag == "" {
 		cfg.Logging.Syslog.Tag = "dproxy"
 	}
@@ -351,8 +367,6 @@ func LoadConfig(path string) error {
 	if cfg.ARP.Timeout == "" {
 		cfg.ARP.Timeout = "2s"
 	}
-
-	// Validate EDNS0 settings (removed for brevity but assumed kept)
 
 	LogInfo("=== EDNS0 Configuration ===")
 	LogInfo("ECS Mode: %s", cfg.Server.EDNS0.ECS.Mode)
@@ -395,7 +409,17 @@ func LoadConfig(path string) error {
 	}
 	cfg.Cache.TTLStrategy = strings.ToLower(cfg.Cache.TTLStrategy)
 
-	// Note: MinTTL, MaxTTL, MinNegTTL default to 0 (disabled) which is correct Go behavior
+	// Cache Sorting Default
+	if cfg.Cache.ResponseSorting == "" {
+		cfg.Cache.ResponseSorting = "none"
+	}
+	// Validate Sorting
+	validSorting := map[string]bool{"none": true, "round-robin": true, "sorted": true}
+	if !validSorting[strings.ToLower(cfg.Cache.ResponseSorting)] {
+		return fmt.Errorf("invalid response_sorting: %s (must be: none, round-robin, sorted)", cfg.Cache.ResponseSorting)
+	}
+	cfg.Cache.ResponseSorting = strings.ToLower(cfg.Cache.ResponseSorting)
+
 
 	// Prefetch Configuration
 	if err := parsePrefetchConfig(&cfg.Cache.Prefetch); err != nil {
@@ -435,10 +459,13 @@ func LoadConfig(path string) error {
 		// Load Hosts Files AND URLs for this rule
 		if len(rule.HostsFiles) > 0 || len(rule.HostsURLs) > 0 {
 			hc := NewHostsCache()
+			// Set the default TTL for hosts entries from config
+			hc.SetTTL(uint32(cfg.Cache.HostsTTL))
 			// Pass wildcard AND optimize bools
 			hc.Load(rule.HostsFiles, rule.HostsURLs, rule.HostsWildcard, rule.HostsOptimize)
 			rule.parsedHosts = hc
-			LogInfo("[RULE] Loaded hosts for '%s' (Files: %d, URLs: %d)", rule.Name, len(rule.HostsFiles), len(rule.HostsURLs))
+			LogInfo("[RULE] Loaded hosts for '%s' (Files: %d, URLs: %d, TTL: %d)", 
+				rule.Name, len(rule.HostsFiles), len(rule.HostsURLs), cfg.Cache.HostsTTL)
 		}
 
 		LogInfo("[RULE] Loaded '%s' (Strategy: %s)", rule.Name, rule.Strategy)
@@ -474,10 +501,13 @@ func LoadConfig(path string) error {
 	// Load Hosts Files AND URLs for default rule
 	if len(cfg.Routing.DefaultRule.HostsFiles) > 0 || len(cfg.Routing.DefaultRule.HostsURLs) > 0 {
 		hc := NewHostsCache()
+		// Set the default TTL for hosts entries from config
+		hc.SetTTL(uint32(cfg.Cache.HostsTTL))
 		// Pass wildcard AND optimize bools
 		hc.Load(cfg.Routing.DefaultRule.HostsFiles, cfg.Routing.DefaultRule.HostsURLs, cfg.Routing.DefaultRule.HostsWildcard, cfg.Routing.DefaultRule.HostsOptimize)
 		cfg.Routing.DefaultRule.parsedHosts = hc
-		LogInfo("[RULE] Loaded hosts for 'DEFAULT' (Files: %d, URLs: %d)", len(cfg.Routing.DefaultRule.HostsFiles), len(cfg.Routing.DefaultRule.HostsURLs))
+		LogInfo("[RULE] Loaded hosts for 'DEFAULT' (Files: %d, URLs: %d, TTL: %d)", 
+			len(cfg.Routing.DefaultRule.HostsFiles), len(cfg.Routing.DefaultRule.HostsURLs), cfg.Cache.HostsTTL)
 	}
 
 	LogInfo("[RULE] Loaded 'DEFAULT' (Strategy: %s)", cfg.Routing.DefaultRule.Strategy)
