@@ -1,7 +1,7 @@
 /*
 File: utils.go
 Description: Common utility functions for IP parsing and network address handling.
-UPDATED: IsValidARPCandidate now explicitly ensures all valid IPv6 Unicast types (Global, ULA, Link-Local) are permitted.
+OPTIMIZED: Replaced string parsing with direct type assertions for net.Addr types to avoid allocations.
 */
 
 package main
@@ -12,6 +12,9 @@ import (
 )
 
 func getIPFromAddr(addr net.Addr) net.IP {
+	if addr == nil {
+		return nil
+	}
 	switch v := addr.(type) {
 	case *net.UDPAddr:
 		return v.IP
@@ -20,9 +23,7 @@ func getIPFromAddr(addr net.Addr) net.IP {
 	case *net.IPAddr:
 		return v.IP
 	default:
-		if addr == nil {
-			return nil
-		}
+		// Fallback for custom implementations or unexpected types
 		host, _, err := net.SplitHostPort(addr.String())
 		if err != nil {
 			return net.ParseIP(addr.String())
@@ -35,7 +36,6 @@ func getLocalIP(addr net.Addr) net.IP {
 	if addr == nil {
 		return nil
 	}
-
 	switch v := addr.(type) {
 	case *net.UDPAddr:
 		return v.IP
@@ -54,7 +54,6 @@ func getLocalPort(addr net.Addr) int {
 	if addr == nil {
 		return 0
 	}
-
 	switch v := addr.(type) {
 	case *net.UDPAddr:
 		return v.Port
@@ -87,19 +86,12 @@ func IsValidARPCandidate(ip net.IP) bool {
 		return false
 	}
 
-	// 3. Multicast (224.0.0.0/4 or ff00::/8)
-	// For IPv6, this strictly filters ff00::/8.
-	// It DOES NOT filter:
-	// - Link-Local Unicast (fe80::/10) -> VALID
-	// - Unique Local Address (ULA) (fc00::/7) -> VALID
-	// - Global Unicast (2000::/3) -> VALID
+	// 3. Multicast
 	if ip.IsMulticast() {
 		return false
 	}
 
-	// 4. IPv4 Limited Broadcast (255.255.255.255)
-	// Note: IPv6 does not have a broadcast address (uses multicast instead),
-	// so this check only affects IPv4.
+	// 4. IPv4 Limited Broadcast
 	if ip.Equal(net.IPv4bcast) {
 		return false
 	}

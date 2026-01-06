@@ -1,11 +1,7 @@
 /*
 File: hosts.go
-Description: Handles loading, parsing, and querying of standard HOSTS files AND Domain Lists.
-             Supports IPv4, IPv6, PTR (Reverse), and optional wildcard matching for subdomains.
-             OPTIMIZED: Implements Global Deduplication. Files/URLs are loaded once into a SourceCache,
-             then shared across multiple HostsCache instances to save memory and I/O.
-             UPDATED: Load functions now return statistics for consistent logging.
-             FIXED: LookupPTR now correctly uses FQDN for the Response Header name to ensure client compatibility.
+Description: Handles loading and querying of HOSTS files.
+OPTIMIZED: Wildcard lookup now iterates domain parents using string indexing instead of splitting.
 */
 
 package main
@@ -31,8 +27,6 @@ type urlMeta struct {
 	lastModified string
 }
 
-// SourceData holds the raw parsed data for a single file or URL.
-// This is intended to be shared (read-only) across multiple HostsCache instances.
 type SourceData struct {
 	Forward map[string][]net.IP
 	Reverse map[string][]string
@@ -42,32 +36,25 @@ type SourceData struct {
 	Meta    urlMeta
 }
 
-// SourceCache is a container for deduplicated source data
 type SourceCache map[string]*SourceData
 
-// HostsCache holds the active lookup maps for a specific routing rule.
 type HostsCache struct {
 	sync.RWMutex
-	// forward: hostname -> list of IPs
 	forward map[string][]net.IP
-	// reverse: IP string -> list of hostnames
 	reverse map[string][]string
 
-	// Maintenance fields
 	paths      []string
 	urls       []string
 	wildcard   bool
 	performOpt bool
-	defaultTTL uint32 // Configurable TTL for hosts entries
+	defaultTTL uint32
 
-	// We keep track of file/url metadata to trigger refreshes
 	fileMtimes map[string]time.Time
 	urlMetas   map[string]urlMeta
 
 	client *http.Client
 }
 
-// NewHostsCache creates a new, empty HostsCache.
 func NewHostsCache() *HostsCache {
 	return &HostsCache{
 		forward:    make(map[string][]net.IP),
@@ -81,21 +68,17 @@ func NewHostsCache() *HostsCache {
 	}
 }
 
-// SetTTL sets the default TTL for records served by this HostsCache.
 func (hc *HostsCache) SetTTL(ttl uint32) {
 	hc.Lock()
 	defer hc.Unlock()
 	hc.defaultTTL = ttl
 }
 
-// BatchLoadSources loads all unique paths and URLs concurrently and returns a SourceCache.
-// This is called once during startup to deduplicate I/O and parsing.
 func BatchLoadSources(paths []string, urls []string) SourceCache {
 	cache := make(SourceCache)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
-	// Deduplicate inputs
 	uniquePaths := make(map[string]bool)
 	for _, p := range paths {
 		uniquePaths[p] = true
@@ -106,7 +89,6 @@ func BatchLoadSources(paths []string, urls []string) SourceCache {
 		uniqueUrls[u] = true
 	}
 
-	// Limit concurrency
 	maxConcurrency := runtime.NumCPU() * 2
 	if maxConcurrency < 4 {
 		maxConcurrency = 4
@@ -115,14 +97,12 @@ func BatchLoadSources(paths []string, urls []string) SourceCache {
 
 	LogInfo("[HOSTS] Global Batch Load: %d unique files, %d unique URLs", len(uniquePaths), len(uniqueUrls))
 
-	// Helper to safely add to cache
 	add := func(key string, data *SourceData) {
 		mu.Lock()
 		cache[key] = data
 		mu.Unlock()
 	}
 
-	// Load Files
 	for path := range uniquePaths {
 		wg.Add(1)
 		go func(p string) {
@@ -138,8 +118,6 @@ func BatchLoadSources(paths []string, urls []string) SourceCache {
 		}(path)
 	}
 
-	// Load URLs
-	// We need a temporary client here since this static function runs before any HostsCache is fully ready
 	client := &http.Client{Timeout: 15 * time.Second}
 
 	for url := range uniqueUrls {
@@ -161,13 +139,9 @@ func BatchLoadSources(paths []string, urls []string) SourceCache {
 	return cache
 }
 
-// LoadFromCache populates this HostsCache using data from the provided SourceCache.
-// It merges the data from the requested paths/urls into its own maps.
-// Returns the count of names and IPs loaded.
 func (hc *HostsCache) LoadFromCache(paths []string, urls []string, sourceCache SourceCache, wildcard bool, optimize bool) (int, int) {
 	start := time.Now()
 
-	// 1. Merge Data
 	newForward := make(map[string][]net.IP)
 	newReverse := make(map[string][]string)
 	newFileMtimes := make(map[string]time.Time)
@@ -178,15 +152,12 @@ func (hc *HostsCache) LoadFromCache(paths []string, urls []string, sourceCache S
 	merge := func(key string) {
 		if data, ok := sourceCache[key]; ok {
 			totalSources++
-			// Efficient Merge: Copy slice headers and keys. Underlying arrays are shared.
 			for k, v := range data.Forward {
 				newForward[k] = append(newForward[k], v...)
 			}
 			for k, v := range data.Reverse {
 				newReverse[k] = append(newReverse[k], v...)
 			}
-
-			// Track metadata for future refreshes
 			if !data.MTime.IsZero() {
 				newFileMtimes[key] = data.MTime
 			}
@@ -205,12 +176,10 @@ func (hc *HostsCache) LoadFromCache(paths []string, urls []string, sourceCache S
 		merge(url)
 	}
 
-	// 2. Optimize (if requested)
 	if wildcard && optimize {
 		hc.optimize(newForward, newReverse)
 	}
 
-	// 3. Atomic Swap
 	hc.Lock()
 	hc.forward = newForward
 	hc.reverse = newReverse
@@ -226,15 +195,12 @@ func (hc *HostsCache) LoadFromCache(paths []string, urls []string, sourceCache S
 	return len(newForward), len(newReverse)
 }
 
-// Load (Legacy/Refresh) - Loads directly without external cache.
-// Used by auto-refresh logic which updates specific instances.
 func (hc *HostsCache) Load(paths []string, urls []string, wildcard bool, optimize bool) {
 	cache := BatchLoadSources(paths, urls)
 	names, ips := hc.LoadFromCache(paths, urls, cache, wildcard, optimize)
 	LogInfo("[HOSTS] Refresh complete: %d names, %d IPs", names, ips)
 }
 
-// optimize removes subdomains from the maps if their parent domain exists.
 func (hc *HostsCache) optimize(fwd map[string][]net.IP, rev map[string][]string) {
 	const parallelThreshold = 5000
 	count := len(fwd)
@@ -246,7 +212,6 @@ func (hc *HostsCache) optimize(fwd map[string][]net.IP, rev map[string][]string)
 	if count < parallelThreshold {
 		toDelete = hc.findRedundantKeys(fwd, nil)
 	} else {
-		// Parallel optimization logic
 		keys := make([]string, 0, count)
 		for k := range fwd {
 			keys = append(keys, k)
@@ -287,7 +252,6 @@ func (hc *HostsCache) optimize(fwd map[string][]net.IP, rev map[string][]string)
 	for _, hostname := range toDelete {
 		ips := fwd[hostname]
 		delete(fwd, hostname)
-		// Clean reverse map
 		for _, ip := range ips {
 			ipKey := ip.String()
 			names := rev[ipKey]
@@ -445,7 +409,6 @@ func parseReader(sourceName string, r io.Reader, forward map[string][]net.IP, re
 	return addedNames, addedIPs, format
 }
 
-// loadFileInternal is the standalone loader for files
 func loadFileInternal(path string, fwd map[string][]net.IP, rev map[string][]string) (int, int, time.Time) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -463,7 +426,6 @@ func loadFileInternal(path string, fwd map[string][]net.IP, rev map[string][]str
 	return names, 0, mtime
 }
 
-// loadURLInternal is the standalone loader for URLs
 func loadURLInternal(client *http.Client, url string, fwd map[string][]net.IP, rev map[string][]string, oldMeta urlMeta) (int, int, urlMeta) {
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -486,7 +448,6 @@ func loadURLInternal(client *http.Client, url string, fwd map[string][]net.IP, r
 
 	if resp.StatusCode == http.StatusNotModified {
 		LogDebug("[HOSTS] URL %s not modified (304)", url)
-		// Retry without conditions to populate the new map
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 		req.Header.Del("If-None-Match")
@@ -509,7 +470,6 @@ func loadURLInternal(client *http.Client, url string, fwd map[string][]net.IP, r
 	return names, 0, meta
 }
 
-// Helper methods for auto-refresh using internal logic
 func (hc *HostsCache) loadFile(path string, fwd map[string][]net.IP, rev map[string][]string) (int, int, time.Time) {
 	return loadFileInternal(path, fwd, rev)
 }
@@ -602,6 +562,7 @@ func (hc *HostsCache) checkURLChanged(url string) bool {
 }
 
 // Lookup queries the hosts cache.
+// OPTIMIZED: Avoids strings.Split for wildcard matching
 func (hc *HostsCache) Lookup(qName string, qType uint16, wildcard bool) ([]dns.RR, bool) {
 	hc.RLock()
 	defer hc.RUnlock()
@@ -616,9 +577,20 @@ func (hc *HostsCache) Lookup(qName string, qType uint16, wildcard bool) ([]dns.R
 		matchedName = qName
 		found = true
 	} else if wildcard {
-		parts := strings.Split(qName, ".")
-		for i := 1; i < len(parts); i++ {
-			parent := strings.Join(parts[i:], ".")
+		// Optimization: Walk the domain string finding dots to avoid allocation
+		// qName: sub.example.com -> example.com -> com
+		
+		curr := qName
+		for {
+			idx := strings.IndexByte(curr, '.')
+			if idx == -1 {
+				break
+			}
+			parent := curr[idx+1:]
+			if parent == "" {
+				break
+			}
+			
 			if matches, ok := hc.forward[parent]; ok {
 				ips = matches
 				matchType = "wildcard"
@@ -626,6 +598,7 @@ func (hc *HostsCache) Lookup(qName string, qType uint16, wildcard bool) ([]dns.R
 				found = true
 				break
 			}
+			curr = parent
 		}
 	}
 
@@ -698,7 +671,6 @@ func (hc *HostsCache) LookupPTR(qName string) ([]dns.RR, bool) {
 	var answers []dns.RR
 	ttl := hc.defaultTTL
 	for _, name := range names {
-		// Use dns.Fqdn(qName) to ensure the RR name has a trailing dot, matching the question FQDN.
 		rr := new(dns.PTR)
 		rr.Hdr = dns.RR_Header{Name: dns.Fqdn(qName), Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: ttl}
 		rr.Ptr = dns.Fqdn(name)
@@ -735,5 +707,4 @@ func extractIPFromPTR(qName string) net.IP {
 	}
 	return nil
 }
-
 

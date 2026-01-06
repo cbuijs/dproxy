@@ -1,11 +1,7 @@
 /*
 File: upstream.go
 Description: Defines the Upstream struct and handles downstream connection logic, pooling, and protocol-specific exchanges.
-             Includes Circuit Breaker logic to handle failing upstreams efficiently.
-             OPTIMIZED: Implemented Background Bootstrap Resolution to remove DNS lookups from the hot path.
-             OPTIMIZED: Circuit Breaker now trips on Timeouts to fail-over faster from slow upstreams.
-             OPTIMIZED: TCP/DoT and DoQ Pools are now SHARDED to eliminate global lock contention.
-             OPTIMIZED: HTTP/2 Transport tuned for higher concurrency.
+             OPTIMIZED: DoH client now reuses buffers for request packing to reduce allocation.
 */
 
 package main
@@ -465,9 +461,6 @@ func (u *Upstream) refreshIPs() {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	// FIX: Use u.bootstrapIPVersion instead of global config.Bootstrap.IPVersion
-	// The global config might not be fully initialized when this runs in a goroutine
-	// during startup.
 	ips, err := resolveHostnameWithBootstrap(ctx, u.Host, u.bootstrapIPVersion)
 	if err != nil {
 		LogWarn("[BOOTSTRAP] Failed to resolve %s: %v", u.Host, err)
@@ -549,7 +542,6 @@ func parseUpstream(raw string, ipVersion string, insecure bool, timeout string) 
 		path = "/dns-query"
 	}
 
-	// FIX: Initialize bootstrapIPVersion to avoid nil dereference in refreshIPs
 	up := &Upstream{
 		URL: uUrl, Proto: proto, Host: host,
 		Port: port, BootstrapIP: bootstrap, Path: path,
@@ -681,17 +673,10 @@ func (u *Upstream) executeExchange(ctx context.Context, req *dns.Msg, reqCtx *Re
 		return resp, rtt, nil
 	}
 
-	// OPTIMIZATION: Context Deadline Exceeded implies a slow upstream.
-	// We MUST trip the circuit breaker to force failover/race strategies to pick
-	// a healthier upstream.
 	shouldRecordFailure := true
-
-	// Special case: If the client cancelled, we shouldn't punish the upstream.
 	if errors.Is(ctx.Err(), context.Canceled) {
 		shouldRecordFailure = false
 	} else if errors.Is(err, context.DeadlineExceeded) {
-		// But if it was a DeadlineExceeded, it means the upstream was too slow.
-		// Record it!
 		shouldRecordFailure = true
 	}
 
@@ -737,10 +722,7 @@ func (u *Upstream) exchangeTCPPool(ctx context.Context, req *dns.Msg, addr strin
 		poolKey = fmt.Sprintf("%s|%s|%s", u.Proto, addr, dynamicHost)
 	}
 
-	// Helper to perform the exchange
 	attempt := func(c *dns.Conn) (*dns.Msg, error) {
-		// Set aggressive deadines for the individual operations to fail fast
-		// if the connection is dead, rather than waiting for the global context
 		deadline, ok := ctx.Deadline()
 		if !ok {
 			deadline = time.Now().Add(getTimeout())
@@ -753,7 +735,6 @@ func (u *Upstream) exchangeTCPPool(ctx context.Context, req *dns.Msg, addr strin
 		return c.ReadMsg()
 	}
 
-	// 1. Try pooled connection
 	conn := tcpPool.Get(poolKey)
 	if conn != nil {
 		resp, err := attempt(conn)
@@ -761,12 +742,10 @@ func (u *Upstream) exchangeTCPPool(ctx context.Context, req *dns.Msg, addr strin
 			go tcpPool.Put(poolKey, conn)
 			return resp, nil
 		}
-		// Connection likely dead/closed
 		conn.Close()
 		LogDebug("[UPSTREAM] Cached TCP conn failed, retrying dial: %v", err)
 	}
 
-	// 2. Dial new
 	var err error
 	conn, err = u.dialTCP(ctx, addr, useTLS, insecure, dynamicHost)
 	if err != nil {
@@ -779,7 +758,6 @@ func (u *Upstream) exchangeTCPPool(ctx context.Context, req *dns.Msg, addr strin
 		return nil, err
 	}
 
-	// Only pool if context is not yet expired
 	if ctx.Err() == nil {
 		go tcpPool.Put(poolKey, conn)
 	} else {
@@ -807,7 +785,6 @@ func (u *Upstream) dialTCP(ctx context.Context, addr string, useTLS bool, insecu
 			ClientSessionCache: globalSessionCache,
 		}
 		tlsConn := tls.Client(conn, tlsConfig)
-		// Explicit handshake to catch crypto errors early
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			conn.Close()
 			return nil, err
@@ -848,7 +825,6 @@ func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetAddr str
 	// DoQ Framing
 	fullLen := 2 + len(buf)
 	sendBuf := packBufPool.Get().(*[]byte)
-	// Ensure capacity
 	if cap(*sendBuf) < fullLen {
 		*sendBuf = make([]byte, fullLen)
 	} else {
@@ -859,7 +835,6 @@ func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetAddr str
 	binary.BigEndian.PutUint16(*sendBuf, uint16(len(buf)))
 	copy((*sendBuf)[2:], buf)
 
-	// Set deadline based on context
 	deadline, ok := ctx.Deadline()
 	if !ok {
 		deadline = time.Now().Add(getTimeout())
@@ -870,14 +845,12 @@ func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetAddr str
 		return nil, err
 	}
 
-	// Read Length
 	lBuf := make([]byte, 2)
 	if _, err := io.ReadFull(stream, lBuf); err != nil {
 		return nil, err
 	}
 	length := binary.BigEndian.Uint16(lBuf)
 
-	// Read Body
 	respBuf := packBufPool.Get().(*[]byte)
 	if cap(*respBuf) < int(length) {
 		*respBuf = make([]byte, length)
@@ -904,7 +877,11 @@ func (u *Upstream) exchangeDoH(ctx context.Context, req *dns.Msg, reqCtx *Reques
 		client = u.h3Client
 	}
 
-	buf, err := req.Pack()
+	// OPTIMIZATION: Use bufPool for packing
+	buf := bufPool.Get().([]byte)
+	defer bufPool.Put(buf)
+	
+	packed, err := req.PackBuffer(buf)
 	if err != nil {
 		return nil, err
 	}
@@ -912,7 +889,7 @@ func (u *Upstream) exchangeDoH(ctx context.Context, req *dns.Msg, reqCtx *Reques
 	dynHost, dynPath := u.getDynamicConfig(reqCtx)
 	urlStr := fmt.Sprintf("https://%s:%s%s", dynHost, u.Port, dynPath)
 
-	hReq, err := http.NewRequestWithContext(ctx, "POST", urlStr, bytes.NewReader(buf))
+	hReq, err := http.NewRequestWithContext(ctx, "POST", urlStr, bytes.NewReader(packed))
 	if err != nil {
 		return nil, err
 	}

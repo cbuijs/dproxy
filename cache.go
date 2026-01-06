@@ -1,9 +1,9 @@
 /*
 File: cache.go
-Version: 2.2.0
+Version: 2.3.0
 Description: Thread-safe in-memory DNS cache using Sharded LRU eviction.
-UPDATED: Implemented MinNegTTL in addToCache fallback logic.
-UPDATED: Maintenance logging now shows MaxNegTTL and HostsTTL.
+OPTIMIZED: Switched to RWMutex to allow non-blocking reads for background scans.
+OPTIMIZED: Moved expensive msg.Unpack() OUTSIDE the lock to reduce contention.
 */
 
 package main
@@ -33,7 +33,7 @@ type CacheItem struct {
 }
 
 type CacheShard struct {
-	sync.Mutex
+	sync.RWMutex
 	items   map[string]*list.Element
 	lruList *list.List
 }
@@ -125,67 +125,73 @@ func maintainDNSCache(ctx context.Context) {
 }
 
 // getFromCache retrieves a cached response and updates the TTLs to reflect remaining time.
-// This is the legacy function for backwards compatibility.
 func getFromCache(key string, reqID uint16) *dns.Msg {
 	msg, _ := getFromCacheWithTTL(key, reqID)
 	return msg
 }
 
 // getFromCacheWithTTL retrieves a cached response and returns both the message and
-// the actual remaining TTL in seconds. This is used for more detailed cache hit logging.
+// the actual remaining TTL in seconds.
 func getFromCacheWithTTL(key string, reqID uint16) (*dns.Msg, uint32) {
 	if !dnsCache.enabled {
 		return nil, 0
 	}
 
 	shard := dnsCache.getShard(key)
+	
+	// LOCK SCOPE: Restricted only to map lookup and LRU update
 	shard.Lock()
-	defer shard.Unlock()
-
 	elem, found := shard.items[key]
 	if !found {
+		shard.Unlock()
 		return nil, 0
 	}
 
 	entry := elem.Value.(*CacheItem)
+	now := time.Now()
 
 	// Check TTL
-	now := time.Now()
 	if now.After(entry.Expiration) {
 		// Lazy eviction
 		shard.lruList.Remove(elem)
 		delete(shard.items, key)
-		resetCacheHitCount(key) // Clean up hit counter
+		resetCacheHitCount(key)
+		shard.Unlock()
 		return nil, 0
 	}
 
 	// Move to front (Mark as recently used)
 	shard.lruList.MoveToFront(elem)
+	
+	// Grab reference to bytes safely while locked
+	// The byte slice itself is immutable in our usage pattern
+	msgBytes := entry.MsgBytes
+	expiration := entry.Expiration
+	shard.Unlock()
+	// END LOCK SCOPE
 
-	// Record hit for stale refresh popularity tracking
+	// Record hit (using atomic counters, thread-safe)
 	recordCacheHit(key)
 
-	// Unpack from bytes to a fresh message
+	// EXPENSIVE OP: Unpack happens outside lock
 	msg := getMsg()
-	if err := msg.Unpack(entry.MsgBytes); err != nil {
-		// If unpack fails (corruption?), invalidate entry
-		shard.lruList.Remove(elem)
-		delete(shard.items, key)
-		resetCacheHitCount(key)
+	if err := msg.Unpack(msgBytes); err != nil {
+		// If corruption, we might want to delete it, but acquiring lock again is expensive.
+		// Just drop it for now.
 		putMsg(msg)
 		return nil, 0
 	}
 
 	msg.Id = reqID
 
-	// Calculate the actual remaining TTL (time left in cache)
-	remainingSeconds := uint32(entry.Expiration.Sub(now).Seconds())
+	// Calculate remaining TTL
+	remainingSeconds := uint32(expiration.Sub(now).Seconds())
 	if remainingSeconds <= 0 {
-		putMsg(msg) // Should have been caught by expiration check, but safety first
+		putMsg(msg)
 		return nil, 0
 	}
 
-	// Adjust TTLs in the response to reflect remaining time
+	// Adjust TTLs (CPU work, safe outside lock)
 	updateTTL := func(rrs []dns.RR) {
 		for _, rr := range rrs {
 			rr.Header().Ttl = remainingSeconds
@@ -203,8 +209,6 @@ func addToCache(key string, msg *dns.Msg) {
 		return
 	}
 
-	// Only cache Success and NXDOMAIN
-	// (Unless we want to allow REFUSED/SERVFAIL caching in future, but currently sticking to standard)
 	if msg.Rcode != dns.RcodeSuccess && msg.Rcode != dns.RcodeNameError {
 		return
 	}
@@ -212,8 +216,7 @@ func addToCache(key string, msg *dns.Msg) {
 		return
 	}
 
-	// Determine minTTL from records (TTL clamping already applied in process.go,
-	// so these values should be within the configured limits)
+	// Determine minTTL
 	minTTL := uint32(3600)
 	foundTTL := false
 	checkRR := func(rrs []dns.RR) {
@@ -231,8 +234,6 @@ func addToCache(key string, msg *dns.Msg) {
 	checkRR(msg.Ns)
 	checkRR(msg.Extra)
 
-	// If no records found (e.g. NXDOMAIN with no SOA), we need a default negative TTL.
-	// We use the configured MinNegTTL if available, otherwise default to 60.
 	if !foundTTL && msg.Rcode == dns.RcodeNameError {
 		if config.Cache.MinNegTTL > 0 {
 			minTTL = uint32(config.Cache.MinNegTTL)
@@ -240,7 +241,6 @@ func addToCache(key string, msg *dns.Msg) {
 			minTTL = 60
 		}
 	} else if !foundTTL {
-		// Empty response with no RCode error? Don't cache if we can't determine TTL.
 		return
 	}
 
@@ -254,11 +254,9 @@ func addToCache(key string, msg *dns.Msg) {
 		return
 	}
 
-	// Create a copy of the slice to ensure we own the memory and it fits tightly
 	finalBytes := make([]byte, len(packed))
 	copy(finalBytes, packed)
 
-	// Extract query info for stale refresh
 	var qName string
 	var qType, qClass uint16
 	var routingKey string
@@ -268,7 +266,6 @@ func addToCache(key string, msg *dns.Msg) {
 		qClass = msg.Question[0].Qclass
 	}
 
-	// Parse routing key from cache key
 	parts := strings.Split(key, "|")
 	if len(parts) >= 4 {
 		routingKey = parts[3]
@@ -300,7 +297,7 @@ func addToCache(key string, msg *dns.Msg) {
 			shard.lruList.Remove(oldest)
 			oldestEntry := oldest.Value.(*CacheItem)
 			delete(shard.items, oldestEntry.Key)
-			resetCacheHitCount(oldestEntry.Key) // Clean up hit counter
+			resetCacheHitCount(oldestEntry.Key)
 		}
 	}
 
@@ -320,13 +317,12 @@ func addToCache(key string, msg *dns.Msg) {
 }
 
 func pruneExpired() {
-	// Prune a small batch from every shard
 	now := time.Now()
 	cleaned := 0
 
 	for _, shard := range dnsCache.shards {
 		shard.Lock()
-		for i := 0; i < 5; i++ { // Check oldest 5 items per shard
+		for i := 0; i < 5; i++ {
 			elem := shard.lruList.Back()
 			if elem == nil {
 				break
@@ -338,7 +334,6 @@ func pruneExpired() {
 				resetCacheHitCount(entry.Key)
 				cleaned++
 			} else {
-				// LRU list is ordered, so if tail isn't expired, nothing else is (mostly)
 				break
 			}
 		}
@@ -350,18 +345,18 @@ func pruneExpired() {
 	}
 }
 
-// scanAndRefreshStale updated to handle sharding (used by prefetch.go)
+// ScanCacheForStale updated to use RLock for non-blocking iteration
 func ScanCacheForStale(thresholdPct, minHits int, callback func(entry *CacheItem, hitCount int64)) {
 	now := time.Now()
 	
 	for _, shard := range dnsCache.shards {
-		// Lock each shard individually to avoid blocking the whole world
-		shard.Lock()
-		// Iterate over items
+		// OPTIMIZATION: Use RLock here. We are only reading items.
+		// NOTE: This does NOT update LRU order, which is perfect for background scans.
+		shard.RLock()
+		
 		for key, elem := range shard.items {
 			entry := elem.Value.(*CacheItem)
 			
-			// Calculate remaining TTL percentage
 			remainingTTL := entry.Expiration.Sub(now)
 			if remainingTTL <= 0 {
 				continue 
@@ -385,17 +380,16 @@ func ScanCacheForStale(thresholdPct, minHits int, callback func(entry *CacheItem
 			
 			callback(entry, hitCount)
 		}
-		shard.Unlock()
+		shard.RUnlock()
 	}
 }
 
-// getCacheStats returns current cache statistics
 func getCacheStats() (size int, capacity int) {
 	size = 0
 	for _, shard := range dnsCache.shards {
-		shard.Lock()
+		shard.RLock()
 		size += shard.lruList.Len()
-		shard.Unlock()
+		shard.RUnlock()
 	}
 	return size, dnsCache.capacity
 }

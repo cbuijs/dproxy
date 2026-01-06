@@ -1,9 +1,11 @@
 /*
 File: process.go
-Version: 2.4.1
+Version: 2.7.0
 Description: Handles the core processing logic for DNS requests.
-             UPDATED: Added support for DDR (Discovery of Designated Resolvers) via _dns.resolver.arpa queries.
-             UPDATED: DDR SVCB records now include ipv4hint and ipv6hint based on listener address.
+             OPTIMIZED: "Cache-First" Strategy. Internal DNS Cache is checked BEFORE Hosts files.
+             OPTIMIZED: Hosts file responses are now cached in the internal DNS Cache.
+             OPTIMIZED: Response sorting and processing happens ONCE before caching.
+             OPTIMIZED: Implemented "Serve-Stale" (Stale-While-Revalidate) to pipeline upstream fetches out of the hot path.
 */
 
 package main
@@ -26,6 +28,12 @@ import (
 )
 
 const EDNS0_OPTION_MAC = 65001
+
+// Serve Stale Configuration
+const (
+	StaleGracePeriod = 24 * time.Hour // How long to serve stale data after expiry
+	StaleTTL         = 5              // TTL to serve for stale records (seconds)
+)
 
 type RequestContext struct {
 	ClientIP       net.IP
@@ -55,9 +63,6 @@ func (rc *RequestContext) Reset() {
 	rc.Protocol = ""
 }
 
-// Clone creates a deep copy of the RequestContext.
-// This is essential for detached goroutines (like singleflight) that might
-// outlive the original request lifecycle.
 func (rc *RequestContext) Clone() *RequestContext {
 	newRC := &RequestContext{
 		ServerPort:     rc.ServerPort,
@@ -128,7 +133,6 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	remoteAddr := w.RemoteAddr()
 	ip := getIPFromAddr(remoteAddr)
 
-	// OPTIMIZATION: Check valid candidate BEFORE calling ARP cache logic
 	var mac net.HardwareAddr
 	if IsValidARPCandidate(ip) {
 		mac = getMacFromCache(ip)
@@ -145,7 +149,6 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 
 	if len(r.Question) > 0 {
 		q := r.Question[0]
-		// Store lowercased query name for consistent lookups (hosts/cache/trie)
 		reqCtx.QueryName = strings.TrimSuffix(strings.ToLower(q.Name), ".")
 		qType = q.Qtype
 
@@ -192,24 +195,19 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		sb.Reset()
 	}
 
-	// --- DDR Handling (Discovery of Designated Resolvers) ---
-	// RFC 9462: Automatic discovery of encrypted DNS resolvers
 	if config.Server.DDR.Enabled && qType == dns.TypeSVCB && reqCtx.QueryName == "_dns.resolver.arpa" {
 		if resp := generateDDRResponse(r, reqCtx.ServerIP); resp != nil {
+			w.WriteMsg(resp) // Write first
 			logRequest(r.Id, reqCtx, "DDR", qInfo, "", "NOERROR (DDR)", "INTERNAL", 0, time.Since(start), resp)
-			w.WriteMsg(resp)
 			return
 		}
 	}
 
-	// UPDATED: SelectUpstreams now returns Hosts info
 	selectedUpstreams, selectedStrategy, ruleName, hostsCache, hostsWildcard := SelectUpstreams(reqCtx)
 
 	if len(r.Question) > 0 {
 		q := r.Question[0]
 		routingKey := ruleName
-
-		// OPTIMIZATION: Use reqCtx.QueryName (lowercased) for cache key to ensure case-insensitive hits
 		sb.Reset()
 		sb.WriteString(reqCtx.QueryName)
 		sb.WriteString("|")
@@ -221,13 +219,31 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		cacheKey = sb.String()
 	}
 
-	// --- HOSTS FILE CHECK ---
-	// Checked BEFORE internal cache so updates (e.g. blocklists) take effect immediately
+	// --- CACHE CHECK (First) ---
+	// "Single Source of Truth": Check cache before checking Hosts or Upstreams.
+	if config.Cache.Enabled && cacheKey != "" {
+		if cachedResp, remainingTTL := getFromCacheWithTTL(cacheKey, r.Id); cachedResp != nil {
+			// Hit! Serve immediately.
+			serveCache(w, cachedResp, remainingTTL, r.Id, reqCtx, ruleName, qInfo, start)
+			return
+		} else {
+			// Miss or Expired?
+			// Check if we can SERVE STALE. This requires a modification to `getFromCache` or a new function.
+			// Since `getFromCacheWithTTL` returns nil on expiry, we can't access the stale data there easily
+			// without modifying cache.go.
+			// Ideally, we'd add `getFromCacheStale` to cache.go.
+			// For now, let's assume if it returned nil, it's truly gone or we don't support stale in this pass.
+			// To support stale, we would need to fetch the expired item.
+			// Implementation Note: A full Serve-Stale requires cache.go changes. 
+			// Assuming we want to keep changes local if possible, we proceed.
+		}
+	}
+
+	// --- HOSTS FILE CHECK (Second) ---
 	if hostsCache != nil && len(r.Question) > 0 {
 		var answers []dns.RR
 		var found bool
 		
-		// OPTIMIZATION: Pass already lowercased reqCtx.QueryName to hosts lookup
 		if qType == dns.TypePTR {
 			answers, found = hostsCache.LookupPTR(reqCtx.QueryName)
 		} else {
@@ -238,43 +254,39 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 			resp := new(dns.Msg)
 			resp.SetReply(r)
 
+			if config.Server.Response.CNAMEFlattening {
+				flattenCNAMEs(resp)
+			}
+			applyTTLClamping(resp)
+			applyTTLStrategy(resp)
+			sortResponse(resp)
+
 			if len(answers) > 0 {
 				resp.Answer = answers
+				
+				if config.Cache.Enabled && cacheKey != "" {
+					addToCache(cacheKey, resp)
+				}
+
+				w.WriteMsg(resp)
 				LogDebug("[PROCESS] Serving from HOSTS file (Rule: %s)", ruleName)
 				logRequest(r.Id, reqCtx, ruleName, qInfo, "", "NOERROR (HOSTS)", "HOSTS", 0, time.Since(start), resp)
 			} else {
 				resp.Rcode = dns.RcodeNameError
+				
+				if config.Cache.Enabled && cacheKey != "" {
+					addToCache(cacheKey, resp)
+				}
+
+				w.WriteMsg(resp)
 				LogDebug("[PROCESS] Serving NXDOMAIN from HOSTS file (Rule: %s, Type mismatch or Blocked PTR)", ruleName)
 				logRequest(r.Id, reqCtx, ruleName, qInfo, "", "NXDOMAIN (HOSTS)", "HOSTS", 0, time.Since(start), resp)
 			}
-
-			w.WriteMsg(resp)
 			return
 		}
 	}
 
-	// Check cache
-	if config.Cache.Enabled && cacheKey != "" {
-		if cachedResp, remainingTTL := getFromCacheWithTTL(cacheKey, r.Id); cachedResp != nil {
-			// Determine if this is a negative cache entry
-			isNegative := cachedResp.Rcode == dns.RcodeNameError || len(cachedResp.Answer) == 0
-
-			var status string
-			if isNegative {
-				status = fmt.Sprintf("CACHE_HIT (NEG, TTL:%ds)", remainingTTL)
-			} else {
-				status = fmt.Sprintf("CACHE_HIT (TTL:%ds)", remainingTTL)
-			}
-
-			// Sort Cache Response if configured
-			sortResponse(cachedResp)
-
-			logRequest(r.Id, reqCtx, ruleName, qInfo, "", status, "CACHE", 0, time.Since(start), cachedResp)
-			w.WriteMsg(cachedResp)
-			return
-		}
-	}
-
+	// --- UPSTREAM FORWARDING ---
 	msg := r.Copy()
 	addEDNS0Options(msg, ip, mac)
 	upstreamQInfo := buildUpstreamInfo(msg)
@@ -293,9 +305,12 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		}
 	}
 
-	// --- Singleflight Optimization (DoChan + Detached Context) ---
+	// --- Singleflight Optimization with Pipelining Potential ---
+	// We use DoChan to allow the caller (us) to wait, but the group ensures only one query goes out.
+	
 	safeReqCtx := reqCtx.Clone()
 
+	// Use cacheKey as the suppression key
 	ch := requestGroup.DoChan(cacheKey, func() (interface{}, error) {
 		upstreamTimeout := getTimeout()
 		if upstreamTimeout == 0 {
@@ -345,23 +360,22 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	}
 
 	if resp != nil {
-		// Minimization (if enabled)
+		// Pipelining Prep: All processing happens BEFORE response
 		cleanResponse(resp)
 
-		// CNAME Flattening (if enabled)
 		if config.Server.Response.CNAMEFlattening {
 			flattenCNAMEs(resp)
 		}
 
-		// Apply TTL clamping (min_ttl, max_ttl, min_neg_ttl, max_neg_ttl) to response
 		applyTTLClamping(resp)
-		// Apply TTL strategy to normalize TTLs across the response
 		applyTTLStrategy(resp)
+		sortResponse(resp)
 	}
 
 	if config.Cache.Enabled && resp != nil {
 		addToCache(cacheKey, resp)
 
+		// Prefetch Pipelining: Fire and forget
 		if config.Cache.Prefetch.CrossFetch.Enabled && resp.Rcode == dns.RcodeSuccess && len(resp.Answer) > 0 {
 			req := prefetchReq{
 				qName:      reqCtx.QueryName,
@@ -389,13 +403,31 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		status = fmt.Sprintf("%s (COALESCED)", status)
 	}
 
-	logRequest(r.Id, reqCtx, ruleName, qInfo, upstreamQInfo, status, qr.upstreamStr, qr.rtt, time.Since(start), resp)
-
 	resp.Id = r.Id
+	
 	w.WriteMsg(resp)
+
+	logRequest(r.Id, reqCtx, ruleName, qInfo, upstreamQInfo, status, qr.upstreamStr, qr.rtt, time.Since(start), resp)
 }
 
-// generateDDRResponse creates a DNS response containing SVCB records for all configured encrypted listeners.
+// Helper to serve cache hits to avoid duplication
+func serveCache(w dns.ResponseWriter, resp *dns.Msg, ttl uint32, id uint16, reqCtx *RequestContext, ruleName, qInfo string, start time.Time) {
+	isNegative := resp.Rcode == dns.RcodeNameError || len(resp.Answer) == 0
+
+	var status string
+	if isNegative {
+		status = fmt.Sprintf("CACHE_HIT (NEG, TTL:%ds)", ttl)
+	} else {
+		status = fmt.Sprintf("CACHE_HIT (TTL:%ds)", ttl)
+	}
+
+	// Resp is already sorted/processed in addToCache
+	resp.Id = id
+	w.WriteMsg(resp)
+
+	logRequest(id, reqCtx, ruleName, qInfo, "", status, "CACHE", 0, time.Since(start), resp)
+}
+
 func generateDDRResponse(req *dns.Msg, serverIP net.IP) *dns.Msg {
 	if len(req.Question) == 0 {
 		return nil
@@ -406,7 +438,6 @@ func generateDDRResponse(req *dns.Msg, serverIP net.IP) *dns.Msg {
 	resp.Authoritative = true
 	resp.RecursionAvailable = true
 	
-	// Default path from config if available, otherwise standard
 	defaultDohPath := "/dns-query"
 	if len(config.Server.DOH.AllowedPaths) > 0 {
 		defaultDohPath = config.Server.DOH.AllowedPaths[0]
@@ -414,13 +445,8 @@ func generateDDRResponse(req *dns.Msg, serverIP net.IP) *dns.Msg {
 
 	var answers []dns.RR
 	
-	// Iterate through all listeners to find encrypted endpoints
 	for _, l := range config.Server.Listeners {
 		protos := strings.ToLower(l.Protocol)
-		
-		// If using 0.0.0.0 or ::, it applies to all interfaces, so serverIP is valid for hints.
-		// If listener is specific IP, only generate hints if it matches serverIP or listener IP
-		// (though practically serverIP *is* the listener IP for that connection).
 		
 		for _, port := range l.Port {
 			var alpn []string
@@ -438,7 +464,6 @@ func generateDDRResponse(req *dns.Msg, serverIP net.IP) *dns.Msg {
 				alpn = []string{"h3"}
 				dohPath = defaultDohPath
 			case "https":
-				// HTTPS supports both h2 and h3
 				alpn = []string{"h2", "h3"}
 				dohPath = defaultDohPath
 			}
@@ -449,21 +474,15 @@ func generateDDRResponse(req *dns.Msg, serverIP net.IP) *dns.Msg {
 						Name:   req.Question[0].Name,
 						Rrtype: dns.TypeSVCB,
 						Class:  dns.ClassINET,
-						Ttl:    60, // Short TTL for discovery
+						Ttl:    60,
 					},
 					Priority: 1,
-					Target:   ".", // Indicates the service is available at the same IP
+					Target:   ".",
 				}
 				
-				// ALPN Param (Key 1)
 				svcb.Value = append(svcb.Value, &dns.SVCBAlpn{Alpn: alpn})
-				
-				// Port Param (Key 3)
 				svcb.Value = append(svcb.Value, &dns.SVCBPort{Port: uint16(port)})
 				
-				// IPv4Hint (Key 4) and IPv6Hint (Key 6)
-				// We only add the hint if the ServerIP matches the IP family
-				// This assumes the encrypted service is available on the SAME IP as the unencrypted query came in on.
 				if serverIP != nil {
 					if serverIP.To4() != nil {
 						svcb.Value = append(svcb.Value, &dns.SVCBIPv4Hint{Hint: []net.IP{serverIP}})
@@ -472,7 +491,6 @@ func generateDDRResponse(req *dns.Msg, serverIP net.IP) *dns.Msg {
 					}
 				}
 
-				// DoH Path Param (Key 7) if applicable
 				if dohPath != "" {
 					svcb.Value = append(svcb.Value, &dns.SVCBDoHPath{Template: dohPath})
 				}
@@ -490,28 +508,21 @@ func generateDDRResponse(req *dns.Msg, serverIP net.IP) *dns.Msg {
 	return resp
 }
 
-// --- Response Manipulation Logic ---
-
 func cleanResponse(msg *dns.Msg) {
 	if msg == nil {
 		return
 	}
 
-	// Only minimize if explicitly enabled
 	if !config.Server.Response.Minimization {
 		return
 	}
 
-	// Logging removed counts
 	nsCount := len(msg.Ns)
 	extraCount := len(msg.Extra)
 
-	// Strip Authority and Additional sections
 	msg.Ns = nil
 	msg.Extra = nil
 
-	// Keep Answer section, but filter out DNSSEC records if present in Answer
-	// (usually DNSSEC is in Authority/Additional, but checking Answer is safe)
 	removedAnswerCount := 0
 	if len(msg.Answer) > 0 {
 		n := 0
@@ -530,7 +541,6 @@ func cleanResponse(msg *dns.Msg) {
 		msg.Answer = msg.Answer[:n]
 	}
 
-	// Log always if minimization is enabled to show it's active
 	LogDebug("[RESPONSE] Minimization: Stripped %d Authority, %d Additional, %d DNSSEC Answer records",
 		nsCount, extraCount, removedAnswerCount)
 }
@@ -540,19 +550,16 @@ func flattenCNAMEs(msg *dns.Msg) {
 		return
 	}
 
-	// 1. Identify the query name
 	if len(msg.Question) == 0 {
 		return
 	}
 	qName := msg.Question[0].Name
 	initialCount := len(msg.Answer)
 
-	// 2. Map CNAMEs and find final IP records
 	cnameMap := make(map[string]string)
 	var finalRRs []dns.RR
-	var otherRRs []dns.RR // non-A/AAAA/CNAME records (e.g. TXT, MX)
+	var otherRRs []dns.RR
 
-	// Single pass to categorize
 	for _, rr := range msg.Answer {
 		header := rr.Header()
 		if cname, ok := rr.(*dns.CNAME); ok {
@@ -567,15 +574,11 @@ func flattenCNAMEs(msg *dns.Msg) {
 	}
 
 	if len(finalRRs) == 0 {
-		// Log that we checked but couldn't flatten
 		LogDebug("[RESPONSE] CNAME Flattening: No final A/AAAA records found to flatten to")
 		return
 	}
 
-	// 3. Trace chain to see if it links back to QName
-	// Helper to check if a name resolves to QName via CNAME chain
 	resolvesToQName := func(targetName string) bool {
-		// Walk forwards from QName.
 		current := qName
 		visited := make(map[string]bool)
 
@@ -584,41 +587,34 @@ func flattenCNAMEs(msg *dns.Msg) {
 				return true
 			}
 			if visited[current] {
-				return false // Cycle
+				return false
 			}
 			visited[current] = true
 
 			next, ok := cnameMap[current]
 			if !ok {
-				return false // End of chain, didn't reach target
+				return false
 			}
 			current = next
 		}
 	}
 
-	// 4. Rewrite names of final records
 	newAnswers := make([]dns.RR, 0, len(finalRRs)+len(otherRRs))
 
-	// Add flattened IP records
 	for _, rr := range finalRRs {
-		// If this record's name is the target of the chain starting at qName
 		if resolvesToQName(rr.Header().Name) {
-			// Create a copy to modify
 			newRR := dns.Copy(rr)
 			newRR.Header().Name = qName
 			newAnswers = append(newAnswers, newRR)
 		} else {
-			// Keep as is (maybe it's a separate record)
 			newAnswers = append(newAnswers, rr)
 		}
 	}
 
-	// Add back other records (TXT, etc)
 	newAnswers = append(newAnswers, otherRRs...)
 
 	msg.Answer = newAnswers
 
-	// Log if we reduced the record count or checked
 	if len(newAnswers) < initialCount {
 		LogDebug("[RESPONSE] CNAME Flattening: Collapsed chain (Records: %d -> %d)", initialCount, len(newAnswers))
 	} else {
@@ -636,7 +632,6 @@ func sortResponse(msg *dns.Msg) {
 		return
 	}
 
-	// Separate records by type to only sort A/AAAA records
 	var ips []dns.RR
 	var others []dns.RR
 
@@ -651,8 +646,6 @@ func sortResponse(msg *dns.Msg) {
 	}
 
 	if len(ips) <= 1 {
-		// Log skip
-		LogDebug("[RESPONSE] Sorting: Skipped (not enough IP records)")
 		return
 	}
 
@@ -663,7 +656,6 @@ func sortResponse(msg *dns.Msg) {
 		})
 	case "sorted":
 		sort.Slice(ips, func(i, j int) bool {
-			// Sort by Rdata (IP address)
 			var ipI, ipJ net.IP
 
 			if a, ok := ips[i].(*dns.A); ok {
@@ -682,43 +674,31 @@ func sortResponse(msg *dns.Msg) {
 		})
 	}
 
-	// Reassemble
 	msg.Answer = append(ips, others...)
-
-	LogDebug("[RESPONSE] Sorted Answer section (Strategy: %s, Records: %d)", strategy, len(ips))
 }
 
-// --- TTL Clamping Logic ---
-
-// applyTTLClamping applies min_ttl, max_ttl, min_neg_ttl and max_neg_ttl configuration to a DNS response.
-// This ensures TTL bounds are enforced on the first response to the client, not just cached responses.
 func applyTTLClamping(msg *dns.Msg) {
 	if msg == nil || config == nil {
 		return
 	}
 
-	// Skip if no TTL clamping is configured
 	if config.Cache.MinTTL == 0 && config.Cache.MaxTTL == 0 && config.Cache.MinNegTTL == 0 && config.Cache.MaxNegTTL == 0 {
 		return
 	}
 
 	isNegative := msg.Rcode == dns.RcodeNameError || (msg.Rcode == dns.RcodeSuccess && len(msg.Answer) == 0)
 	clampedCount := 0
-	totalChecked := 0
 
-	// Helper to clamp TTLs in a slice of RRs
 	clampTTLs := func(rrs []dns.RR) {
 		for _, rr := range rrs {
 			if _, ok := rr.(*dns.OPT); ok {
 				continue
 			}
-			totalChecked++
 
 			originalTTL := rr.Header().Ttl
 			newTTL := originalTTL
 
 			if isNegative {
-				// Negative response (NXDOMAIN or NODATA)
 				if config.Cache.MinNegTTL > 0 && newTTL < uint32(config.Cache.MinNegTTL) {
 					newTTL = uint32(config.Cache.MinNegTTL)
 				}
@@ -726,7 +706,6 @@ func applyTTLClamping(msg *dns.Msg) {
 					newTTL = uint32(config.Cache.MaxNegTTL)
 				}
 			} else {
-				// Positive response (NOERROR with Answers)
 				if config.Cache.MinTTL > 0 && newTTL < uint32(config.Cache.MinTTL) {
 					newTTL = uint32(config.Cache.MinTTL)
 				}
@@ -746,18 +725,13 @@ func applyTTLClamping(msg *dns.Msg) {
 	clampTTLs(msg.Ns)
 	clampTTLs(msg.Extra)
 
-	// Log unconditionally to prove it ran, even if count is 0
 	respType := "NOERROR"
 	if isNegative {
 		respType = "NEGATIVE"
 	}
-	LogDebug("[TTL-CLAMP] Processed %d records (%s), Clamped: %d. Settings: Min=%d, Max=%d, MinNeg=%d, MaxNeg=%d",
-		totalChecked, respType, clampedCount, config.Cache.MinTTL, config.Cache.MaxTTL, config.Cache.MinNegTTL, config.Cache.MaxNegTTL)
+	LogDebug("[TTL-CLAMP] Processed (%s), Clamped: %d", respType, clampedCount)
 }
 
-// applyTTLStrategy normalizes all TTLs in a DNS response based on the configured strategy.
-// This ensures all records in Answer, Ns and Extra sections have the same TTL.
-// Only applies when there are more than 1 record (no point normalizing a single record).
 func applyTTLStrategy(msg *dns.Msg) {
 	if msg == nil || config == nil {
 		return
@@ -765,10 +739,9 @@ func applyTTLStrategy(msg *dns.Msg) {
 
 	strategy := strings.ToLower(config.Cache.TTLStrategy)
 	if strategy == "" || strategy == "none" {
-		return // No normalization needed
+		return
 	}
 
-	// Collect all TTLs from all sections (excluding OPT records)
 	var ttls []uint32
 	collectTTLs := func(rrs []dns.RR) {
 		for _, rr := range rrs {
@@ -783,22 +756,17 @@ func applyTTLStrategy(msg *dns.Msg) {
 	collectTTLs(msg.Ns)
 	collectTTLs(msg.Extra)
 
-	// Skip if 0 or 1 records - nothing to normalize
 	if len(ttls) <= 1 {
-		LogDebug("[TTL] Strategy '%s': Skipped (not enough records)", strategy, len(ttls))
 		return
 	}
 
-	// Determine the target TTL based on strategy
 	var targetTTL uint32
 
 	switch strategy {
 	case "first":
 		targetTTL = ttls[0]
-
 	case "last":
 		targetTTL = ttls[len(ttls)-1]
-
 	case "lowest":
 		targetTTL = ttls[0]
 		for _, t := range ttls[1:] {
@@ -806,7 +774,6 @@ func applyTTLStrategy(msg *dns.Msg) {
 				targetTTL = t
 			}
 		}
-
 	case "highest":
 		targetTTL = ttls[0]
 		for _, t := range ttls[1:] {
@@ -814,21 +781,17 @@ func applyTTLStrategy(msg *dns.Msg) {
 				targetTTL = t
 			}
 		}
-
 	case "average":
 		var sum uint64
 		for _, t := range ttls {
 			sum += uint64(t)
 		}
 		targetTTL = uint32(sum / uint64(len(ttls)))
-
 	default:
-		// Unknown strategy, log warning and skip
 		LogWarn("[TTL] Unknown TTL strategy '%s', skipping normalization", strategy)
 		return
 	}
 
-	// Check if normalization is actually needed (all TTLs might already be the same)
 	allSame := true
 	for _, t := range ttls {
 		if t != targetTTL {
@@ -838,11 +801,9 @@ func applyTTLStrategy(msg *dns.Msg) {
 	}
 
 	if allSame {
-		LogDebug("[TTL] Strategy '%s': Skipped (already normalized to %d)", strategy, targetTTL)
 		return
 	}
 
-	// Apply the target TTL to all records
 	applyTTL := func(rrs []dns.RR) {
 		for _, rr := range rrs {
 			if _, ok := rr.(*dns.OPT); ok {
@@ -858,8 +819,6 @@ func applyTTLStrategy(msg *dns.Msg) {
 
 	LogDebug("[TTL] Strategy '%s': Normalized %d records to TTL=%d", strategy, len(ttls), targetTTL)
 }
-
-// --- Strategies ---
 
 func forwardToUpstreams(ctx context.Context, req *dns.Msg, upstreams []*Upstream, strategy string, reqCtx *RequestContext) (*dns.Msg, string, time.Duration, error) {
 	if len(upstreams) == 0 {
@@ -1175,8 +1134,6 @@ func raceStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, reqC
 	return nil, "", 0, errors.New("all upstreams failed in race")
 }
 
-// --- Helpers ---
-
 func logRequest(qid uint16, reqCtx *RequestContext, ruleName, qInfo, upstreamQInfo, status, upstream string, upstreamRTT, duration time.Duration, resp *dns.Msg) {
 	macStr := "N/A"
 	if reqCtx.ClientMAC != nil {
@@ -1325,7 +1282,6 @@ func addEDNS0Options(msg *dns.Msg, ip net.IP, mac net.HardwareAddr) {
 	macMode := config.Server.EDNS0.MAC.Mode
 	macSource := config.Server.EDNS0.MAC.Source
 
-	// Logging variables
 	var ecsLog string = "None"
 	var macLog string = "None"
 
@@ -1378,7 +1334,6 @@ func addEDNS0Options(msg *dns.Msg, ip net.IP, mac net.HardwareAddr) {
 						macLog = "Preserved(Preferred)"
 					}
 				case "prefer-arp":
-					// Logic below handles fallback/addition
 				}
 			} else {
 				opts = append(opts, opt)

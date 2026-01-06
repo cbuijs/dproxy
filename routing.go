@@ -1,9 +1,7 @@
 /*
 File: routing.go
 Description: High-performance routing logic using Domain Trie (Radix-style) for rapid lookups.
-OPTIMIZED: Uses lazy map initialization to save memory on sparse nodes.
-UPDATED: Support for multiple values per match condition type.
-UPDATED: SelectUpstreams now returns Hosts configuration alongside upstreams.
+OPTIMIZED: Trie Search now walks the string from TLD backwards without string splitting or slice allocations.
 */
 
 package main
@@ -76,15 +74,24 @@ func (t *DomainTrie) Insert(domain string, rule *RoutingRule) {
 }
 
 // Search finds the most specific rule for a query name
+// OPTIMIZED: Uses string indices to walk backward from TLD to subdomain without allocation.
 func (t *DomainTrie) Search(qName string) *RoutingRule {
-	parts := strings.Split(qName, ".")
 	node := t.Root
-
 	var lastValidRule *RoutingRule
 
-	for i := len(parts) - 1; i >= 0; i-- {
-		part := parts[i]
+	// We iterate from the end of the string backwards to the beginning
+	// qName: "www.example.com" -> "com", "example", "www"
+	
+	end := len(qName)
+	for end > 0 {
+		// Find the dot preceding the current part
+		start := strings.LastIndexByte(qName[:end], '.')
+		
+		// Extract part: qName[start+1 : end]
+		// If start is -1, it means we are at the first label (e.g. "www" in "www.example.com")
+		part := qName[start+1 : end]
 
+		// Update Wildcard match if present at this node
 		if node.Wildcard != nil {
 			lastValidRule = node.Wildcard
 		}
@@ -98,8 +105,15 @@ func (t *DomainTrie) Search(qName string) *RoutingRule {
 			return lastValidRule
 		}
 		node = next
+		
+		// Move pointers for next iteration
+		if start == -1 {
+			break // We just processed the last part (left-most label)
+		}
+		end = start
 	}
 
+	// Final check at the leaf
 	if node.Rule != nil {
 		return node.Rule
 	}
@@ -127,15 +141,11 @@ func BuildRoutingTable(rules []RoutingRule) {
 	for i := range rules {
 		rule := &rules[i]
 		
-		// Check if rule has any query_domain conditions
 		if len(rule.Match.QueryDomain) > 0 {
-			// Insert each domain into the trie
 			for _, domain := range rule.Match.QueryDomain {
 				trie.Insert(strings.ToLower(domain), rule)
 			}
 			
-			// If rule ONLY has query_domain conditions, don't add to generic
-			// But if it has other conditions too, we need it in generic as well
 			if !hasNonDomainConditions(&rule.Match) {
 				continue
 			}
@@ -149,7 +159,6 @@ func BuildRoutingTable(rules []RoutingRule) {
 	LogInfo("[ROUTING] Built routing table: Domain Trie built, %d generic rules", len(genericRules))
 }
 
-// hasNonDomainConditions checks if match has conditions other than query_domain
 func hasNonDomainConditions(m *MatchConditions) bool {
 	return len(m.ClientIP) > 0 ||
 		len(m.ClientCIDR) > 0 ||
@@ -188,7 +197,6 @@ func resolveUpstreams(upstreams interface{}, groups map[string][]string) ([]stri
 }
 
 // SelectUpstreams optimized with Trie lookup.
-// Returns: Upstreams, Strategy, RuleName, HostsCache, HostsWildcardBool
 func SelectUpstreams(ctx *RequestContext) ([]*Upstream, string, string, *HostsCache, bool) {
 	if config == nil {
 		log.Fatal("Config not loaded")
@@ -203,7 +211,7 @@ func SelectUpstreams(ctx *RequestContext) ([]*Upstream, string, string, *HostsCa
 		}
 	}
 
-	// 2. Slow Path: Linear scan of generic rules (IP, MAC, etc.)
+	// 2. Slow Path: Linear scan of generic rules
 	for _, rule := range genericRules {
 		matched, reason := matchRule(&rule.Match, ctx)
 		if matched {
@@ -219,7 +227,6 @@ func SelectUpstreams(ctx *RequestContext) ([]*Upstream, string, string, *HostsCa
 	       config.Routing.DefaultRule.HostsWildcard
 }
 
-// matchRule checks if any condition matches (OR logic across all conditions)
 func matchRule(m *MatchConditions, ctx *RequestContext) (bool, string) {
 	effectiveIP := ctx.ClientIP
 	if ctx.ClientECS != nil {
@@ -233,9 +240,7 @@ func matchRule(m *MatchConditions, ctx *RequestContext) (bool, string) {
 
 	conditionsChecked := 0
 
-	// --- OR Logic Checks - Multiple values per condition type ---
-
-	// Check Client IPs (any match)
+	// Check Client IPs
 	if len(m.parsedClientIPs) > 0 {
 		conditionsChecked++
 		for _, ip := range m.parsedClientIPs {
@@ -245,7 +250,7 @@ func matchRule(m *MatchConditions, ctx *RequestContext) (bool, string) {
 		}
 	}
 
-	// Check Client CIDRs (any match)
+	// Check Client CIDRs
 	if len(m.parsedClientCIDRs) > 0 {
 		conditionsChecked++
 		for _, cidr := range m.parsedClientCIDRs {
@@ -255,7 +260,7 @@ func matchRule(m *MatchConditions, ctx *RequestContext) (bool, string) {
 		}
 	}
 
-	// Check Client MACs (any match)
+	// Check Client MACs
 	if len(m.parsedClientMACs) > 0 {
 		conditionsChecked++
 		for _, mac := range m.parsedClientMACs {
@@ -265,7 +270,7 @@ func matchRule(m *MatchConditions, ctx *RequestContext) (bool, string) {
 		}
 	}
 
-	// Check Client ECS (any match)
+	// Check Client ECS
 	if len(m.parsedClientECSs) > 0 {
 		conditionsChecked++
 		for _, ecs := range m.parsedClientECSs {
@@ -275,7 +280,7 @@ func matchRule(m *MatchConditions, ctx *RequestContext) (bool, string) {
 		}
 	}
 
-	// Check Client EDNS MACs (any match)
+	// Check Client EDNS MACs
 	if len(m.parsedClientEDNSMACs) > 0 {
 		conditionsChecked++
 		for _, mac := range m.parsedClientEDNSMACs {
@@ -285,7 +290,7 @@ func matchRule(m *MatchConditions, ctx *RequestContext) (bool, string) {
 		}
 	}
 
-	// Check Server IPs (any match)
+	// Check Server IPs
 	if len(m.parsedServerIPs) > 0 {
 		conditionsChecked++
 		for _, ip := range m.parsedServerIPs {
@@ -295,7 +300,7 @@ func matchRule(m *MatchConditions, ctx *RequestContext) (bool, string) {
 		}
 	}
 
-	// Check Server Ports (any match)
+	// Check Server Ports
 	if len(m.ServerPort) > 0 {
 		conditionsChecked++
 		for _, port := range m.ServerPort {
@@ -305,7 +310,7 @@ func matchRule(m *MatchConditions, ctx *RequestContext) (bool, string) {
 		}
 	}
 
-	// Check Server Hostnames (any match, case-insensitive)
+	// Check Server Hostnames
 	if len(m.ServerHostname) > 0 {
 		conditionsChecked++
 		for _, hostname := range m.ServerHostname {
@@ -315,7 +320,7 @@ func matchRule(m *MatchConditions, ctx *RequestContext) (bool, string) {
 		}
 	}
 
-	// Check Server Paths (any match)
+	// Check Server Paths
 	if len(m.ServerPath) > 0 {
 		conditionsChecked++
 		for _, path := range m.ServerPath {
@@ -325,7 +330,6 @@ func matchRule(m *MatchConditions, ctx *RequestContext) (bool, string) {
 		}
 	}
 
-	// QueryDomain is handled by Trie, but check here for rules with mixed conditions
 	if len(m.QueryDomain) > 0 {
 		conditionsChecked++
 		for _, domain := range m.QueryDomain {
@@ -342,32 +346,23 @@ func matchRule(m *MatchConditions, ctx *RequestContext) (bool, string) {
 	return false, ""
 }
 
-// matchDomain checks if queryName matches the domain pattern
 func matchDomain(queryName, pattern string) bool {
-	// Exact match
 	if queryName == pattern {
 		return true
 	}
-
-	// Wildcard match: ".example.com" or "*.example.com" matches "sub.example.com"
 	if strings.HasPrefix(pattern, ".") {
-		suffix := pattern // ".example.com"
-		if strings.HasSuffix(queryName, suffix) {
+		if strings.HasSuffix(queryName, pattern) {
 			return true
 		}
-		// Also match exact domain without the dot
 		if queryName == pattern[1:] {
 			return true
 		}
 	}
-
 	if strings.HasPrefix(pattern, "*.") {
-		suffix := pattern[1:] // ".example.com"
-		if strings.HasSuffix(queryName, suffix) {
+		if strings.HasSuffix(queryName, pattern[1:]) {
 			return true
 		}
 	}
-
 	return false
 }
 
