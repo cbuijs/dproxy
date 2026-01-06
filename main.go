@@ -3,6 +3,7 @@ File: main.go
 Description: Entry point for the dproxy application. Initializes globals, parses flags, and starts the system.
              UPDATED: Starts auto-refresh routines for all configured HOSTS files.
              UPDATED: Smart ARP maintenance (skips if configured "none" or not required by any rules).
+             UPDATED: Correctly flattens multiple listener IPs for TLS certificate generation.
 */
 
 package main
@@ -160,7 +161,8 @@ Usage: %s -config <config.yaml>
 	// Collect all listener IPs for TLS certificate generation
 	var listenIPs []string
 	for _, l := range config.Server.Listeners {
-		listenIPs = append(listenIPs, l.Address)
+		// Flatten the slice of addresses
+		listenIPs = append(listenIPs, l.Address...)
 	}
 
 	// Setup TLS

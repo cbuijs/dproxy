@@ -1,10 +1,9 @@
 /*
 File: process.go
-Version: 2.3.4
+Version: 2.4.1
 Description: Handles the core processing logic for DNS requests.
-             UPDATED: Enhanced logging to show "no-op" decisions for TTL/Response logic when enabled.
-             OPTIMIZED: Use pre-lowercased QueryName for cache keys and hosts lookup to avoid redundant allocations.
-             UPDATED: Included Rule Name in request logging for consistent tracing.
+             UPDATED: Added support for DDR (Discovery of Designated Resolvers) via _dns.resolver.arpa queries.
+             UPDATED: DDR SVCB records now include ipv4hint and ipv6hint based on listener address.
 */
 
 package main
@@ -191,6 +190,16 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 			qInfo = sb.String()
 		}
 		sb.Reset()
+	}
+
+	// --- DDR Handling (Discovery of Designated Resolvers) ---
+	// RFC 9462: Automatic discovery of encrypted DNS resolvers
+	if config.Server.DDR.Enabled && qType == dns.TypeSVCB && reqCtx.QueryName == "_dns.resolver.arpa" {
+		if resp := generateDDRResponse(r, reqCtx.ServerIP); resp != nil {
+			logRequest(r.Id, reqCtx, "DDR", qInfo, "", "NOERROR (DDR)", "INTERNAL", 0, time.Since(start), resp)
+			w.WriteMsg(resp)
+			return
+		}
 	}
 
 	// UPDATED: SelectUpstreams now returns Hosts info
@@ -384,6 +393,101 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 
 	resp.Id = r.Id
 	w.WriteMsg(resp)
+}
+
+// generateDDRResponse creates a DNS response containing SVCB records for all configured encrypted listeners.
+func generateDDRResponse(req *dns.Msg, serverIP net.IP) *dns.Msg {
+	if len(req.Question) == 0 {
+		return nil
+	}
+	
+	resp := new(dns.Msg)
+	resp.SetReply(req)
+	resp.Authoritative = true
+	resp.RecursionAvailable = true
+	
+	// Default path from config if available, otherwise standard
+	defaultDohPath := "/dns-query"
+	if len(config.Server.DOH.AllowedPaths) > 0 {
+		defaultDohPath = config.Server.DOH.AllowedPaths[0]
+	}
+
+	var answers []dns.RR
+	
+	// Iterate through all listeners to find encrypted endpoints
+	for _, l := range config.Server.Listeners {
+		protos := strings.ToLower(l.Protocol)
+		
+		// If using 0.0.0.0 or ::, it applies to all interfaces, so serverIP is valid for hints.
+		// If listener is specific IP, only generate hints if it matches serverIP or listener IP
+		// (though practically serverIP *is* the listener IP for that connection).
+		
+		for _, port := range l.Port {
+			var alpn []string
+			var dohPath string
+			
+			switch protos {
+			case "dot", "tls":
+				alpn = []string{"dot"}
+			case "doq", "quic":
+				alpn = []string{"doq"}
+			case "doh":
+				alpn = []string{"h2"}
+				dohPath = defaultDohPath
+			case "doh3", "h3":
+				alpn = []string{"h3"}
+				dohPath = defaultDohPath
+			case "https":
+				// HTTPS supports both h2 and h3
+				alpn = []string{"h2", "h3"}
+				dohPath = defaultDohPath
+			}
+			
+			if len(alpn) > 0 {
+				svcb := &dns.SVCB{
+					Hdr: dns.RR_Header{
+						Name:   req.Question[0].Name,
+						Rrtype: dns.TypeSVCB,
+						Class:  dns.ClassINET,
+						Ttl:    60, // Short TTL for discovery
+					},
+					Priority: 1,
+					Target:   ".", // Indicates the service is available at the same IP
+				}
+				
+				// ALPN Param (Key 1)
+				svcb.Value = append(svcb.Value, &dns.SVCBAlpn{Alpn: alpn})
+				
+				// Port Param (Key 3)
+				svcb.Value = append(svcb.Value, &dns.SVCBPort{Port: uint16(port)})
+				
+				// IPv4Hint (Key 4) and IPv6Hint (Key 6)
+				// We only add the hint if the ServerIP matches the IP family
+				// This assumes the encrypted service is available on the SAME IP as the unencrypted query came in on.
+				if serverIP != nil {
+					if serverIP.To4() != nil {
+						svcb.Value = append(svcb.Value, &dns.SVCBIPv4Hint{Hint: []net.IP{serverIP}})
+					} else {
+						svcb.Value = append(svcb.Value, &dns.SVCBIPv6Hint{Hint: []net.IP{serverIP}})
+					}
+				}
+
+				// DoH Path Param (Key 7) if applicable
+				if dohPath != "" {
+					svcb.Value = append(svcb.Value, &dns.SVCBDoHPath{Template: dohPath})
+				}
+				
+				answers = append(answers, svcb)
+			}
+		}
+	}
+	
+	if len(answers) == 0 {
+		return nil
+	}
+	
+	resp.Answer = answers
+	return resp
 }
 
 // --- Response Manipulation Logic ---
@@ -650,8 +754,6 @@ func applyTTLClamping(msg *dns.Msg) {
 	LogDebug("[TTL-CLAMP] Processed %d records (%s), Clamped: %d. Settings: Min=%d, Max=%d, MinNeg=%d, MaxNeg=%d",
 		totalChecked, respType, clampedCount, config.Cache.MinTTL, config.Cache.MaxTTL, config.Cache.MinNegTTL, config.Cache.MaxNegTTL)
 }
-
-// --- TTL Strategy Logic ---
 
 // applyTTLStrategy normalizes all TTLs in a DNS response based on the configured strategy.
 // This ensures all records in Answer, Ns and Extra sections have the same TTL.

@@ -1,5 +1,5 @@
 # ------------------------------------------------------------------------------
-# dproxy Configuration File (v2.3.2)
+# dproxy Configuration File (v2.3.4)
 # ------------------------------------------------------------------------------
 # This configuration file controls all aspects of the dproxy server, including
 # network listeners, security settings, caching behavior, prefetching, 
@@ -58,12 +58,15 @@ server:
   # - doh       : DNS over HTTPS (HTTP/1.1, H2) only
   # - h3        : DNS over HTTPS (HTTP/3) only
   listeners:
+    # Public Interface - Standard DNS
     - address: "0.0.0.0"
       port: 53
       protocol: "udp"
     - address: "0.0.0.0"
       port: 53
       protocol: "tcp"
+    
+    # Public Interface - Encrypted DNS
     - address: "0.0.0.0"
       port: 853
       protocol: "dot"
@@ -71,12 +74,29 @@ server:
       port: 443
       protocol: "https"
 
+    # Local Admin Interface (Example of multi-listener)
+    - address: "127.0.0.1"
+      port: 5353
+      protocol: "udp"
+      
+    # IPv6 Specific Listener (Example)
+    - address: "::1"
+      port: 53
+      protocol: "udp"
+
   # TLS Certificate settings (Required for DoT, DoQ, DoH, HTTPS)
   # If left empty, a self-signed certificate will be generated automatically.
+  # Note: Self-signed certs automatically include all Listener IPs in the SANs.
   tls:
     cert_file: ""  # Path to your .crt or .pem file
     key_file: ""   # Path to your .key file
   
+  # DDR (Discovery of Designated Resolvers) - RFC 9462
+  # Enables clients to automatically upgrade from unencrypted UDP/TCP to 
+  # encrypted protocols (DoT, DoQ, DoH) by querying _dns.resolver.arpa.
+  ddr:
+    enabled: true
+
   # DoH (DNS over HTTPS) Specific Settings
   doh:
     # Allowed URL paths for DNS queries. Requests to other paths return 404.

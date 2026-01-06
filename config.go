@@ -1,8 +1,8 @@
 /*
 File: config.go
-Version: 2.3.3
+Version: 2.4.0
 Description: Defines configuration structures and handles YAML parsing and validation.
-UPDATED: Added compatibility for singular 'host_files' and 'host_urls' keys in YAML configuration.
+UPDATED: Added DDR (Discovery of Designated Resolvers) configuration.
 */
 
 package main
@@ -53,9 +53,9 @@ type LoggingConfig struct {
 }
 
 type ListenerConfig struct {
-	Address  string `yaml:"address"`
-	Port     int    `yaml:"port"`
-	Protocol string `yaml:"protocol"` // dns, udp, tcp, dot, doq, doh, doh3, https
+	Address  StringOrSlice `yaml:"address"`
+	Port     IntOrSlice    `yaml:"port"`
+	Protocol string        `yaml:"protocol"` // dns, udp, tcp, dot, doq, doh, doh3, https
 }
 
 type ServerConfig struct {
@@ -74,6 +74,11 @@ type ServerConfig struct {
 	} `yaml:"tls"`
 
 	LogLevel string `yaml:"log_level"` // Deprecated
+
+	// DDR (Discovery of Designated Resolvers) - RFC 9462
+	DDR struct {
+		Enabled bool `yaml:"enabled"`
+	} `yaml:"ddr"`
 
 	DOH struct {
 		AllowedPaths []string `yaml:"allowed_paths"`
@@ -290,26 +295,26 @@ func LoadConfig(path string) error {
 	if len(cfg.Server.Listeners) == 0 {
 		// DNS (UDP & TCP)
 		cfg.Server.Listeners = append(cfg.Server.Listeners, ListenerConfig{
-			Address:  cfg.Server.ListenAddr,
-			Port:     cfg.Server.Ports.UDP,
+			Address:  StringOrSlice{cfg.Server.ListenAddr},
+			Port:     IntOrSlice{cfg.Server.Ports.UDP},
 			Protocol: "dns",
 		})
 		// DoT (TCP)
 		cfg.Server.Listeners = append(cfg.Server.Listeners, ListenerConfig{
-			Address:  cfg.Server.ListenAddr,
-			Port:     cfg.Server.Ports.TLS,
+			Address:  StringOrSlice{cfg.Server.ListenAddr},
+			Port:     IntOrSlice{cfg.Server.Ports.TLS},
 			Protocol: "dot",
 		})
 		// DoQ (UDP)
 		cfg.Server.Listeners = append(cfg.Server.Listeners, ListenerConfig{
-			Address:  cfg.Server.ListenAddr,
-			Port:     cfg.Server.Ports.TLS,
+			Address:  StringOrSlice{cfg.Server.ListenAddr},
+			Port:     IntOrSlice{cfg.Server.Ports.TLS},
 			Protocol: "doq",
 		})
 		// HTTPS (DoH & DoH3)
 		cfg.Server.Listeners = append(cfg.Server.Listeners, ListenerConfig{
-			Address:  cfg.Server.ListenAddr,
-			Port:     cfg.Server.Ports.HTTPS,
+			Address:  StringOrSlice{cfg.Server.ListenAddr},
+			Port:     IntOrSlice{cfg.Server.Ports.HTTPS},
 			Protocol: "https",
 		})
 	}
