@@ -1,8 +1,11 @@
 /*
 File: logger.go
+Version: 1.2.0
+Last Update: 2025-01-27
 Description: Modern, structured, and multi-output logging implementation using Go 1.21+ log/slog.
-Supports Console, File, and Syslog outputs.
-UPDATED: Removed unused 'io' import.
+             Supports Console, File, and Syslog outputs.
+             UPDATED: Configured Syslog handler to omit the timestamp key from the log message body to prevent redundancy.
+             UPDATED: Configured Syslog handler to strip the "level=" key from the log message body as it is redundant.
 */
 
 package main
@@ -29,8 +32,23 @@ func InitLogger(cfg LoggingConfig) error {
 	var handlers []slog.Handler
 
 	// Common Options (Level)
+	// Used for Console and File (includes time)
 	opts := &slog.HandlerOptions{
 		Level: parseLogLevel(cfg.Level),
+	}
+
+	// Syslog Options
+	// Excludes time key to avoid duplication with syslog headers
+	// We KEEP the Level key here so the writer can detect severity, 
+	// but we strip it in the writer output.
+	syslogOpts := &slog.HandlerOptions{
+		Level: parseLogLevel(cfg.Level),
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			if a.Key == slog.TimeKey {
+				return slog.Attr{} // Drop the time key
+			}
+			return a
+		},
 	}
 
 	// 1. Setup Console Output (Always Text)
@@ -47,7 +65,7 @@ func InitLogger(cfg LoggingConfig) error {
 			if cfg.File.Path == "" {
 				return fmt.Errorf("file logging enabled but no path specified")
 			}
-			
+
 			perm := os.FileMode(0644)
 			if cfg.File.Permissions > 0 {
 				perm = os.FileMode(cfg.File.Permissions)
@@ -80,8 +98,9 @@ func InitLogger(cfg LoggingConfig) error {
 			if h, err := os.Hostname(); err == nil {
 				syslogWriter.Hostname = h
 			}
-			// Syslog expects text lines, so we enforce TextHandler
-			handlers = append(handlers, slog.NewTextHandler(syslogWriter, opts))
+			// Syslog expects text lines, so we enforce TextHandler.
+			// We use syslogOpts here to strip the timestamp from the message body.
+			handlers = append(handlers, slog.NewTextHandler(syslogWriter, syslogOpts))
 			break
 		}
 	}
@@ -232,26 +251,41 @@ func (w *SyslogWriter) Write(p []byte) (n int, err error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	severity := 6 // Info
-	pri := (w.Facility * 8) + severity
+	// Default severity: Info
+	severity := 6 
 
 	timestamp := time.Now().Format(time.RFC3339)
-	
+
 	// Trim newline from slog text handler to avoid double spacing in syslog
 	msg := strings.TrimSuffix(string(p), "\n")
-	
-	if strings.Contains(msg, "level=ERROR") || strings.Contains(msg, "\"level\":\"ERROR\"") {
-		pri = (w.Facility * 8) + 3 // Error
-	} else if strings.Contains(msg, "level=WARN") || strings.Contains(msg, "\"level\":\"WARN\"") {
-		pri = (w.Facility * 8) + 4 // Warning
-	} else if strings.Contains(msg, "level=DEBUG") || strings.Contains(msg, "\"level\":\"DEBUG\"") {
-		pri = (w.Facility * 8) + 7 // Debug
-	}
 
-	syslogMsg := fmt.Sprintf("<%d>%s %s %s: %s", pri, timestamp, w.Hostname, w.Tag, msg)
+	// Determine severity based on message content from slog and strip the level key
+	// Note: We intentionally strip "level=XXX" because it's redundant in Syslog (which has headers)
+	if strings.Contains(msg, "level=ERROR") {
+		severity = 3 // Error
+		msg = strings.Replace(msg, "level=ERROR", "", 1)
+	} else if strings.Contains(msg, "level=WARN") {
+		severity = 4 // Warning
+		msg = strings.Replace(msg, "level=WARN", "", 1)
+	} else if strings.Contains(msg, "level=DEBUG") {
+		severity = 7 // Debug
+		msg = strings.Replace(msg, "level=DEBUG", "", 1)
+	} else if strings.Contains(msg, "level=INFO") {
+		severity = 6 // Info
+		msg = strings.Replace(msg, "level=INFO", "", 1)
+	}
 	
+	// Clean up any double spaces or leading spaces created by the removal
+	msg = strings.TrimSpace(msg)
+
+	pri := (w.Facility * 8) + severity
+
+	// Construct Syslog Frame (RFC 3164/5424 hybrid style)
+	// Header contains timestamp/host/tag. Body contains cleaned message.
+	syslogMsg := fmt.Sprintf("<%d>%s %s %s: %s", pri, timestamp, w.Hostname, w.Tag, msg)
+
 	if err := w.connect(); err != nil {
-		return len(p), nil 
+		return len(p), nil
 	}
 
 	_, err = fmt.Fprint(w.conn, syslogMsg)
