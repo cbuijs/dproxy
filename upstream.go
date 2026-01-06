@@ -4,7 +4,7 @@ Description: Defines the Upstream struct and handles downstream connection logic
              Includes Circuit Breaker logic to handle failing upstreams efficiently.
              OPTIMIZED: Implemented Background Bootstrap Resolution to remove DNS lookups from the hot path.
              OPTIMIZED: Circuit Breaker now trips on Timeouts to fail-over faster from slow upstreams.
-             OPTIMIZED: TCP/DoT Pool connection handling improved with stricter deadlining.
+             OPTIMIZED: TCP/DoT and DoQ Pools are now SHARDED to eliminate global lock contention.
              OPTIMIZED: HTTP/2 Transport tuned for higher concurrency.
 */
 
@@ -17,6 +17,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"math/rand/v2"
 	"net"
@@ -40,6 +41,7 @@ const (
 	maxDoQSessions     = 8                // Allow up to 8 concurrent QUIC sessions per upstream
 	tcpIdlePoolSize    = 512              // Max idle TCP connections to hold per upstream
 	bootstrapRefresh   = 10 * time.Minute // Interval to refresh upstream IPs
+	poolShardCount     = 256              // Number of shards for connection pools
 )
 
 // Global TLS Session Cache to enable Session Resumption (Fast Handshakes)
@@ -61,7 +63,7 @@ type Upstream struct {
 	Port        string
 	BootstrapIP string
 	Path        string // Template path
-	
+
 	// ResolvedIPs is now managed by the background refresher
 	resolvedIPs        []net.IP
 	resolvedIPsLock    sync.RWMutex
@@ -209,48 +211,72 @@ func (u *Upstream) getLastProbeTime() time.Time {
 	return time.Unix(0, nanos)
 }
 
-// --- TCP/DoT Connection Pool ---
+// --- Sharded TCP/DoT Connection Pool ---
 
-type TCPConnPool struct {
-	mu    sync.Mutex
+type tcpPoolShard struct {
+	sync.Mutex
 	conns map[string][]*dns.Conn
 }
 
-var tcpPool = &TCPConnPool{
-	conns: make(map[string][]*dns.Conn),
+type TCPConnPool struct {
+	shards [poolShardCount]*tcpPoolShard
+}
+
+var tcpPool = newTCPConnPool()
+
+func newTCPConnPool() *TCPConnPool {
+	p := &TCPConnPool{}
+	for i := 0; i < poolShardCount; i++ {
+		p.shards[i] = &tcpPoolShard{
+			conns: make(map[string][]*dns.Conn),
+		}
+	}
+	return p
+}
+
+func (p *TCPConnPool) getShard(key string) *tcpPoolShard {
+	h := fnv.New32a()
+	h.Write([]byte(key))
+	return p.shards[h.Sum32()%uint32(poolShardCount)]
 }
 
 func (p *TCPConnPool) Get(key string) *dns.Conn {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	shard := p.getShard(key)
+	shard.Lock()
+	defer shard.Unlock()
 
-	list := p.conns[key]
+	list := shard.conns[key]
 	if len(list) > 0 {
 		// LIFO (Stack) to keep hot connections hot
 		conn := list[len(list)-1]
-		p.conns[key] = list[:len(list)-1]
+		shard.conns[key] = list[:len(list)-1]
 		return conn
 	}
 	return nil
 }
 
 func (p *TCPConnPool) Put(key string, conn *dns.Conn) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	shard := p.getShard(key)
+	shard.Lock()
+	defer shard.Unlock()
 
-	if len(p.conns[key]) >= tcpIdlePoolSize {
+	if len(shard.conns[key]) >= tcpIdlePoolSize {
 		conn.Close()
 		return
 	}
-	p.conns[key] = append(p.conns[key], conn)
+	shard.conns[key] = append(shard.conns[key], conn)
 }
 
-// --- DoQ Connection Pool ---
+// --- Sharded DoQ Connection Pool ---
 
-type DoQPool struct {
-	mu       sync.RWMutex
+type doqPoolShard struct {
+	sync.RWMutex
 	sessions map[string][]*doqSession
 	nextIdx  map[string]int
+}
+
+type DoQPool struct {
+	shards [poolShardCount]*doqPoolShard
 }
 
 type doqSession struct {
@@ -259,17 +285,32 @@ type doqSession struct {
 	mu       sync.Mutex
 }
 
-var doqPool = &DoQPool{
-	sessions: make(map[string][]*doqSession),
-	nextIdx:  make(map[string]int),
+var doqPool = newDoQPool()
+
+func newDoQPool() *DoQPool {
+	p := &DoQPool{}
+	for i := 0; i < poolShardCount; i++ {
+		p.shards[i] = &doqPoolShard{
+			sessions: make(map[string][]*doqSession),
+			nextIdx:  make(map[string]int),
+		}
+	}
+	return p
+}
+
+func (p *DoQPool) getShard(key string) *doqPoolShard {
+	h := fnv.New32a()
+	h.Write([]byte(key))
+	return p.shards[h.Sum32()%uint32(poolShardCount)]
 }
 
 func (p *DoQPool) Get(ctx context.Context, addr string, tlsConf *tls.Config) (quic.Connection, error) {
 	poolKey := fmt.Sprintf("%s|%s", addr, tlsConf.ServerName)
+	shard := p.getShard(poolKey)
 
-	p.mu.Lock()
+	shard.Lock()
 	// Clean closed sessions
-	sessions := p.sessions[poolKey]
+	sessions := shard.sessions[poolKey]
 	validSessions := make([]*doqSession, 0, len(sessions))
 	for _, s := range sessions {
 		select {
@@ -279,11 +320,11 @@ func (p *DoQPool) Get(ctx context.Context, addr string, tlsConf *tls.Config) (qu
 			validSessions = append(validSessions, s)
 		}
 	}
-	p.sessions[poolKey] = validSessions
+	shard.sessions[poolKey] = validSessions
 
 	// If fewer than max sessions, dial a new one
 	if len(validSessions) < maxDoQSessions {
-		p.mu.Unlock()
+		shard.Unlock()
 
 		conn, err := quic.DialAddr(ctx, addr, tlsConf, &quic.Config{
 			KeepAlivePeriod:    30 * time.Second,
@@ -292,32 +333,32 @@ func (p *DoQPool) Get(ctx context.Context, addr string, tlsConf *tls.Config) (qu
 		})
 
 		if err != nil {
-			p.mu.Lock()
+			shard.Lock()
 			// Fallback to existing if dial fails
-			if len(p.sessions[poolKey]) > 0 {
-				idx := p.nextIdx[poolKey] % len(p.sessions[poolKey])
-				p.nextIdx[poolKey]++
-				s := p.sessions[poolKey][idx]
+			if len(shard.sessions[poolKey]) > 0 {
+				idx := shard.nextIdx[poolKey] % len(shard.sessions[poolKey])
+				shard.nextIdx[poolKey]++
+				s := shard.sessions[poolKey][idx]
 				s.lastUsed = time.Now()
-				p.mu.Unlock()
+				shard.Unlock()
 				return s.conn, nil
 			}
-			p.mu.Unlock()
+			shard.Unlock()
 			return nil, err
 		}
 
-		p.mu.Lock()
+		shard.Lock()
 		newSess := &doqSession{conn: conn, lastUsed: time.Now()}
-		p.sessions[poolKey] = append(p.sessions[poolKey], newSess)
-		p.mu.Unlock()
+		shard.sessions[poolKey] = append(shard.sessions[poolKey], newSess)
+		shard.Unlock()
 		return conn, nil
 	}
 
-	idx := p.nextIdx[poolKey] % len(validSessions)
-	p.nextIdx[poolKey]++
+	idx := shard.nextIdx[poolKey] % len(validSessions)
+	shard.nextIdx[poolKey]++
 	sess := validSessions[idx]
 	sess.lastUsed = time.Now()
-	p.mu.Unlock()
+	shard.Unlock()
 
 	return sess.conn, nil
 }
@@ -330,41 +371,45 @@ func (p *DoQPool) cleanup(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			p.mu.Lock()
 			count := 0
-			for _, sessions := range p.sessions {
-				for _, sess := range sessions {
-					sess.conn.CloseWithError(0, "shutdown")
-					count++
+			for _, shard := range p.shards {
+				shard.Lock()
+				for _, sessions := range shard.sessions {
+					for _, sess := range sessions {
+						sess.conn.CloseWithError(0, "shutdown")
+						count++
+					}
 				}
+				shard.sessions = make(map[string][]*doqSession)
+				shard.Unlock()
 			}
-			p.sessions = make(map[string][]*doqSession)
-			p.mu.Unlock()
 			LogInfo("[DOQ] Closed %d connections on shutdown", count)
 			return
 		case <-ticker.C:
-			p.mu.Lock()
 			closedCount := 0
-			for addr, sessions := range p.sessions {
-				var active []*doqSession
-				for _, sess := range sessions {
-					sess.mu.Lock()
-					if time.Since(sess.lastUsed) > 2*time.Minute {
-						sess.conn.CloseWithError(0, "idle timeout")
-						closedCount++
-					} else {
-						active = append(active, sess)
+			for _, shard := range p.shards {
+				shard.Lock()
+				for addr, sessions := range shard.sessions {
+					var active []*doqSession
+					for _, sess := range sessions {
+						sess.mu.Lock()
+						if time.Since(sess.lastUsed) > 2*time.Minute {
+							sess.conn.CloseWithError(0, "idle timeout")
+							closedCount++
+						} else {
+							active = append(active, sess)
+						}
+						sess.mu.Unlock()
 					}
-					sess.mu.Unlock()
+					if len(active) == 0 {
+						delete(shard.sessions, addr)
+						delete(shard.nextIdx, addr)
+					} else {
+						shard.sessions[addr] = active
+					}
 				}
-				if len(active) == 0 {
-					delete(p.sessions, addr)
-					delete(p.nextIdx, addr)
-				} else {
-					p.sessions[addr] = active
-				}
+				shard.Unlock()
 			}
-			p.mu.Unlock()
 			if closedCount > 0 {
 				LogDebug("[DOQ] Cleaned up %d idle DoQ connections", closedCount)
 			}
@@ -387,7 +432,7 @@ func (u *Upstream) resolveIPs() []net.IP {
 
 	// If empty, try immediate resolve (blocking)
 	u.refreshIPs()
-	
+
 	u.resolvedIPsLock.RLock()
 	defer u.resolvedIPsLock.RUnlock()
 	return u.resolvedIPs
@@ -449,7 +494,7 @@ func (u *Upstream) startBootstrapRefresher() {
 		// Use a randomized ticker to prevent thundering herd
 		jitter := time.Duration(rand.Int64N(60)) * time.Second
 		time.Sleep(jitter)
-		
+
 		ticker := time.NewTicker(bootstrapRefresh)
 		defer ticker.Stop()
 
@@ -556,7 +601,7 @@ func parseUpstream(raw string, ipVersion string, insecure bool, timeout string) 
 func resolveHostnameWithBootstrap(ctx context.Context, hostname string, preferredVersion string) ([]net.IP, error) {
 	// This function now just wraps the logic to query the bootstrap servers
 	// It is called by the background refresher
-	
+
 	var allIPs []net.IP
 	var lastErr error
 
@@ -700,7 +745,7 @@ func (u *Upstream) exchangeTCPPool(ctx context.Context, req *dns.Msg, addr strin
 		if !ok {
 			deadline = time.Now().Add(getTimeout())
 		}
-		
+
 		c.SetDeadline(deadline)
 		if err := c.WriteMsg(req); err != nil {
 			return nil, err

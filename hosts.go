@@ -3,6 +3,7 @@ File: hosts.go
 Description: Handles loading, parsing, and querying of standard HOSTS files AND Domain Lists.
              Supports IPv4, IPv6, PTR (Reverse), and optional wildcard matching for subdomains.
              UPDATED: Added support for configurable TTL (hosts_ttl) for records served from HOSTS.
+             OPTIMIZED: Lookup functions now assume input is pre-lowercased/trimmed to save CPU.
 */
 
 package main
@@ -116,14 +117,14 @@ func (hc *HostsCache) Load(paths []string, urls []string, wildcard bool, optimiz
 	hc.urlMetas = newUrlMetas
 	hc.Unlock()
 
-	LogInfo("[HOSTS] Loaded %d files and %d URLs in %v (%d names, %d IPs)", 
+	LogInfo("[HOSTS] Loaded %d files and %d URLs in %v (%d names, %d IPs)",
 		len(paths), len(urls), loadDuration, len(newForward), len(newReverse))
 }
 
 // optimize removes subdomains from the maps if their parent domain exists.
 func (hc *HostsCache) optimize(fwd map[string][]net.IP, rev map[string][]string) {
 	const parallelThreshold = 5000
-	
+
 	count := len(fwd)
 	if count == 0 {
 		return
@@ -183,7 +184,7 @@ func (hc *HostsCache) optimize(fwd map[string][]net.IP, rev map[string][]string)
 	}
 
 	removedCount := len(toDelete)
-	
+
 	for _, hostname := range toDelete {
 		ips := fwd[hostname]
 		delete(fwd, hostname)
@@ -199,7 +200,7 @@ func (hc *HostsCache) optimize(fwd map[string][]net.IP, rev map[string][]string)
 				}
 			}
 			names = names[:n]
-			
+
 			if len(names) == 0 {
 				delete(rev, ipKey)
 			} else {
@@ -215,7 +216,7 @@ func (hc *HostsCache) optimize(fwd map[string][]net.IP, rev map[string][]string)
 
 func (hc *HostsCache) findRedundantKeys(fwd map[string][]net.IP, keys []string) []string {
 	var redundant []string
-	
+
 	check := func(hostname string) {
 		domain := hostname
 		for {
@@ -224,7 +225,7 @@ func (hc *HostsCache) findRedundantKeys(fwd map[string][]net.IP, keys []string) 
 				break
 			}
 			domain = domain[idx+1:]
-			
+
 			if domain == "" {
 				break
 			}
@@ -257,7 +258,7 @@ func (hc *HostsCache) findRedundantKeysChannel(fwd map[string][]net.IP, keys []s
 				break
 			}
 			domain = domain[idx+1:]
-			
+
 			if domain == "" {
 				break
 			}
@@ -287,7 +288,7 @@ func isBlockedIP(ip net.IP) bool {
 func parseReader(sourceName string, r io.Reader, forward map[string][]net.IP, reverse map[string][]string) (int, int, string) {
 	addedNames := 0
 	addedIPs := 0
-	
+
 	// Format detection counters
 	hostsCount := 0
 	domainsCount := 0
@@ -297,17 +298,17 @@ func parseReader(sourceName string, r io.Reader, forward map[string][]net.IP, re
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		
+
 		// 1. Skip empty lines and comments (#)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		
+
 		// Remove inline comments
 		if idx := strings.Index(line, "#"); idx != -1 {
 			line = line[:idx]
 		}
-		
+
 		// Re-trim after removing comments
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -328,12 +329,12 @@ func parseReader(sourceName string, r io.Reader, forward map[string][]net.IP, re
 			if len(fields) < 2 {
 				continue // Valid IP but no domain? Skip.
 			}
-			
+
 			hostsCount++
-			
+
 			isBlocked := isBlockedIP(ip)
 			ipKey := ip.String()
-			
+
 			// Only add to reverse lookup if NOT a blocked IP
 			if !isBlocked {
 				if _, exists := reverse[ipKey]; !exists {
@@ -358,9 +359,9 @@ func parseReader(sourceName string, r io.Reader, forward map[string][]net.IP, re
 					LogDebug("[HOSTS] [%s] Skipped hostname '%s' because it is a valid IP address", sourceName, host)
 					continue
 				}
-				
+
 				forward[host] = append(forward[host], ip)
-				
+
 				if !isBlocked {
 					reverse[ipKey] = append(reverse[ipKey], host)
 				}
@@ -370,13 +371,13 @@ func parseReader(sourceName string, r io.Reader, forward map[string][]net.IP, re
 		} else {
 			// --- DOMAIN LIST FORMAT: domain ---
 			// Line starts with something that is NOT an IP. Treat as domain to block.
-			
+
 			domainsCount++
 			// Only process the first field as the domain
 			originalHost := fields[0]
 			// Normalize: lowercase and trim ALL leading/trailing dots
 			host := strings.ToLower(strings.Trim(originalHost, "."))
-			
+
 			if host != "" {
 				if host != strings.ToLower(originalHost) {
 					LogDebug("[HOSTS] [%s] Sanitized domain list entry: '%s' -> '%s'", sourceName, originalHost, host)
@@ -486,10 +487,10 @@ func (hc *HostsCache) StartAutoRefresh(ctx context.Context, checkInterval time.D
 	if len(hc.paths) == 0 && len(hc.urls) == 0 {
 		return
 	}
-	
-	LogInfo("[HOSTS] Starting auto-refresh for %d files, %d URLs (Interval: %v)", 
+
+	LogInfo("[HOSTS] Starting auto-refresh for %d files, %d URLs (Interval: %v)",
 		len(hc.paths), len(hc.urls), checkInterval)
-	
+
 	ticker := time.NewTicker(checkInterval)
 	defer ticker.Stop()
 
@@ -524,7 +525,7 @@ func (hc *HostsCache) checkUpdates() {
 		if !known || info.ModTime().After(lastMod) {
 			LogInfo("[HOSTS] File changed: %s", path)
 			shouldReload = true
-			break 
+			break
 		}
 	}
 
@@ -579,11 +580,16 @@ func (hc *HostsCache) checkURLChanged(url string) bool {
 	return resp.StatusCode == http.StatusOK
 }
 
+// Lookup queries the hosts cache.
+// OPTIMIZATION: qName MUST be passed in lowercase and without trailing dot.
+// The caller (process.go) is responsible for this normalization to save CPU cycles here.
 func (hc *HostsCache) Lookup(qName string, qType uint16, wildcard bool) ([]dns.RR, bool) {
 	hc.RLock()
 	defer hc.RUnlock()
 
-	qName = strings.ToLower(strings.TrimSuffix(qName, "."))
+	// REMOVED redundant strings.ToLower/TrimSuffix.
+	// We trust the caller (processDNSRequest) to pass the normalized reqCtx.QueryName.
+
 	var ips []net.IP
 	matchType := ""
 	matchedName := ""
@@ -666,10 +672,14 @@ func (hc *HostsCache) Lookup(qName string, qType uint16, wildcard bool) ([]dns.R
 	return answers, true
 }
 
+// LookupPTR queries the reverse hosts cache.
+// OPTIMIZATION: qName is assumed to be lowercased, but extractIPFromPTR handles structure parsing.
 func (hc *HostsCache) LookupPTR(qName string) ([]dns.RR, bool) {
 	hc.RLock()
 	defer hc.RUnlock()
 
+	// extractIPFromPTR internally handles suffix checking which requires specific structure,
+	// but we can assume qName input is already lowercased from process.go.
 	ip := extractIPFromPTR(qName)
 	if ip == nil {
 		return nil, false
@@ -701,8 +711,9 @@ func (hc *HostsCache) LookupPTR(qName string) ([]dns.RR, bool) {
 }
 
 func extractIPFromPTR(qName string) net.IP {
-	qName = strings.TrimSuffix(strings.ToLower(qName), ".")
-	
+	// Assume input is already trimmed/lowered, but we need to check suffixes
+	// Since suffixes are standard, we don't need to re-lower the known suffix parts
+
 	if strings.HasSuffix(qName, ".in-addr.arpa") {
 		parts := strings.Split(strings.TrimSuffix(qName, ".in-addr.arpa"), ".")
 		if len(parts) != 4 {

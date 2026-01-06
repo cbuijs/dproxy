@@ -3,6 +3,7 @@ File: process.go
 Version: 2.3.4
 Description: Handles the core processing logic for DNS requests.
              UPDATED: Enhanced logging to show "no-op" decisions for TTL/Response logic when enabled.
+             OPTIMIZED: Use pre-lowercased QueryName for cache keys and hosts lookup to avoid redundant allocations.
 */
 
 package main
@@ -144,6 +145,7 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 
 	if len(r.Question) > 0 {
 		q := r.Question[0]
+		// Store lowercased query name for consistent lookups (hosts/cache/trie)
 		reqCtx.QueryName = strings.TrimSuffix(strings.ToLower(q.Name), ".")
 		qType = q.Qtype
 
@@ -197,8 +199,9 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		q := r.Question[0]
 		routingKey := ruleName
 
+		// OPTIMIZATION: Use reqCtx.QueryName (lowercased) for cache key to ensure case-insensitive hits
 		sb.Reset()
-		sb.WriteString(q.Name)
+		sb.WriteString(reqCtx.QueryName)
 		sb.WriteString("|")
 		sb.WriteString(strconv.Itoa(int(q.Qtype)))
 		sb.WriteString("|")
@@ -213,12 +216,12 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	if hostsCache != nil && len(r.Question) > 0 {
 		var answers []dns.RR
 		var found bool
-		qName := r.Question[0].Name
-
+		
+		// OPTIMIZATION: Pass already lowercased reqCtx.QueryName to hosts lookup
 		if qType == dns.TypePTR {
-			answers, found = hostsCache.LookupPTR(qName)
+			answers, found = hostsCache.LookupPTR(reqCtx.QueryName)
 		} else {
-			answers, found = hostsCache.Lookup(qName, qType, hostsWildcard)
+			answers, found = hostsCache.Lookup(reqCtx.QueryName, qType, hostsWildcard)
 		}
 
 		if found {
@@ -252,7 +255,7 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 			} else {
 				status = fmt.Sprintf("CACHE_HIT (%s, TTL:%ds)", ruleName, remainingTTL)
 			}
-			
+
 			// Sort Cache Response if configured
 			sortResponse(cachedResp)
 
@@ -334,12 +337,12 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	if resp != nil {
 		// Minimization (if enabled)
 		cleanResponse(resp)
-		
+
 		// CNAME Flattening (if enabled)
 		if config.Server.Response.CNAMEFlattening {
 			flattenCNAMEs(resp)
 		}
-		
+
 		// Apply TTL clamping (min_ttl, max_ttl, min_neg_ttl, max_neg_ttl) to response
 		applyTTLClamping(resp)
 		// Apply TTL strategy to normalize TTLs across the response
@@ -388,7 +391,7 @@ func cleanResponse(msg *dns.Msg) {
 	if msg == nil {
 		return
 	}
-	
+
 	// Only minimize if explicitly enabled
 	if !config.Server.Response.Minimization {
 		return
@@ -397,11 +400,11 @@ func cleanResponse(msg *dns.Msg) {
 	// Logging removed counts
 	nsCount := len(msg.Ns)
 	extraCount := len(msg.Extra)
-	
+
 	// Strip Authority and Additional sections
 	msg.Ns = nil
 	msg.Extra = nil
-	
+
 	// Keep Answer section, but filter out DNSSEC records if present in Answer
 	// (usually DNSSEC is in Authority/Additional, but checking Answer is safe)
 	removedAnswerCount := 0
@@ -423,7 +426,7 @@ func cleanResponse(msg *dns.Msg) {
 	}
 
 	// Log always if minimization is enabled to show it's active
-	LogDebug("[RESPONSE] Minimization: Stripped %d Authority, %d Additional, %d DNSSEC Answer records", 
+	LogDebug("[RESPONSE] Minimization: Stripped %d Authority, %d Additional, %d DNSSEC Answer records",
 		nsCount, extraCount, removedAnswerCount)
 }
 
@@ -457,7 +460,7 @@ func flattenCNAMEs(msg *dns.Msg) {
 			otherRRs = append(otherRRs, rr)
 		}
 	}
-	
+
 	if len(finalRRs) == 0 {
 		// Log that we checked but couldn't flatten
 		LogDebug("[RESPONSE] CNAME Flattening: No final A/AAAA records found to flatten to")
@@ -470,7 +473,7 @@ func flattenCNAMEs(msg *dns.Msg) {
 		// Walk forwards from QName.
 		current := qName
 		visited := make(map[string]bool)
-		
+
 		for {
 			if current == targetName {
 				return true
@@ -479,7 +482,7 @@ func flattenCNAMEs(msg *dns.Msg) {
 				return false // Cycle
 			}
 			visited[current] = true
-			
+
 			next, ok := cnameMap[current]
 			if !ok {
 				return false // End of chain, didn't reach target
@@ -490,7 +493,7 @@ func flattenCNAMEs(msg *dns.Msg) {
 
 	// 4. Rewrite names of final records
 	newAnswers := make([]dns.RR, 0, len(finalRRs)+len(otherRRs))
-	
+
 	// Add flattened IP records
 	for _, rr := range finalRRs {
 		// If this record's name is the target of the chain starting at qName
@@ -504,7 +507,7 @@ func flattenCNAMEs(msg *dns.Msg) {
 			newAnswers = append(newAnswers, rr)
 		}
 	}
-	
+
 	// Add back other records (TXT, etc)
 	newAnswers = append(newAnswers, otherRRs...)
 
@@ -522,7 +525,7 @@ func sortResponse(msg *dns.Msg) {
 	if msg == nil || len(msg.Answer) <= 1 {
 		return
 	}
-	
+
 	strategy := config.Cache.ResponseSorting
 	if strategy == "none" {
 		return
@@ -557,26 +560,26 @@ func sortResponse(msg *dns.Msg) {
 		sort.Slice(ips, func(i, j int) bool {
 			// Sort by Rdata (IP address)
 			var ipI, ipJ net.IP
-			
+
 			if a, ok := ips[i].(*dns.A); ok {
 				ipI = a.A
 			} else if aaaa, ok := ips[i].(*dns.AAAA); ok {
 				ipI = aaaa.AAAA
 			}
-			
+
 			if a, ok := ips[j].(*dns.A); ok {
 				ipJ = a.A
 			} else if aaaa, ok := ips[j].(*dns.AAAA); ok {
 				ipJ = aaaa.AAAA
 			}
-			
+
 			return bytes.Compare(ipI, ipJ) < 0
 		})
 	}
 
 	// Reassemble
 	msg.Answer = append(ips, others...)
-	
+
 	LogDebug("[RESPONSE] Sorted Answer section (Strategy: %s, Records: %d)", strategy, len(ips))
 }
 
@@ -597,7 +600,7 @@ func applyTTLClamping(msg *dns.Msg) {
 	isNegative := msg.Rcode == dns.RcodeNameError || (msg.Rcode == dns.RcodeSuccess && len(msg.Answer) == 0)
 	clampedCount := 0
 	totalChecked := 0
-	
+
 	// Helper to clamp TTLs in a slice of RRs
 	clampTTLs := func(rrs []dns.RR) {
 		for _, rr := range rrs {
@@ -679,7 +682,7 @@ func applyTTLStrategy(msg *dns.Msg) {
 
 	// Skip if 0 or 1 records - nothing to normalize
 	if len(ttls) <= 1 {
-		LogDebug("[TTL] Strategy '%s': Skipped (not enough records)", strategy)
+		LogDebug("[TTL] Strategy '%s': Skipped (not enough records)", strategy, len(ttls))
 		return
 	}
 
@@ -1365,7 +1368,7 @@ func addEDNS0Options(msg *dns.Msg, ip net.IP, mac net.HardwareAddr) {
 	}
 	o.Option = opts
 
-	LogDebug("[EDNS0] ClientIP=%v | ECS(%s): %s | MAC(%s): %s | Opts: %d", 
+	LogDebug("[EDNS0] ClientIP=%v | ECS(%s): %s | MAC(%s): %s | Opts: %d",
 		ip, ecsMode, ecsLog, macMode, macLog, len(opts))
 }
 
