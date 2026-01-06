@@ -1,12 +1,13 @@
 /*
 File: process.go
-Version: 2.7.1
+Version: 2.7.2
 Description: Handles the core processing logic for DNS requests.
              OPTIMIZED: "Cache-First" Strategy. Internal DNS Cache is checked BEFORE Hosts files.
              OPTIMIZED: Hosts file responses are now cached in the internal DNS Cache.
              OPTIMIZED: Response sorting and processing happens ONCE before caching.
              OPTIMIZED: Implemented "Serve-Stale" (Stale-While-Revalidate) to pipeline upstream fetches out of the hot path.
              UPDATED: Strict Cross-Fetch trigger logic. Only initiates on Cache Miss AND specific types (A/AAAA).
+             UPDATED: DDR responses now use configured HostName as SVCB Target.
 */
 
 package main
@@ -468,6 +469,11 @@ func generateDDRResponse(req *dns.Msg, serverIP net.IP) *dns.Msg {
 		defaultDohPath = config.Server.DOH.AllowedPaths[0]
 	}
 
+	target := "."
+	if config.Server.DDR.HostName != "" {
+		target = config.Server.DDR.HostName
+	}
+
 	var answers []dns.RR
 
 	for _, l := range config.Server.Listeners {
@@ -502,7 +508,7 @@ func generateDDRResponse(req *dns.Msg, serverIP net.IP) *dns.Msg {
 						Ttl:    60,
 					},
 					Priority: 1,
-					Target:   ".",
+					Target:   target,
 				}
 
 				svcb.Value = append(svcb.Value, &dns.SVCBAlpn{Alpn: alpn})

@@ -4,6 +4,7 @@ Description: Entry point for the dproxy application. Initializes globals, parses
              UPDATED: Starts auto-refresh routines for all configured HOSTS files.
              UPDATED: Smart ARP maintenance (skips if configured "none" or not required by any rules).
              UPDATED: Correctly flattens multiple listener IPs for TLS certificate generation.
+             UPDATED: Auto-detects DDR hostname from certificate if not configured.
 */
 
 package main
@@ -15,6 +16,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -169,6 +171,21 @@ Usage: %s -config <config.yaml>
 	tlsConfig, err := getTLSConfig(config.Server.TLS.CertFile, config.Server.TLS.KeyFile, listenIPs)
 	if err != nil {
 		LogFatal("Failed to setup TLS: %v", err)
+	}
+
+	// --- DDR Hostname Auto-Detection ---
+	// If DDR is enabled but no hostname is configured, try to extract it from the certificate.
+	if config.Server.DDR.Enabled && config.Server.DDR.HostName == "" && len(tlsConfig.Certificates) > 0 {
+		extracted := ExtractDNSNameFromCert(&tlsConfig.Certificates[0])
+		if extracted != "" {
+			config.Server.DDR.HostName = extracted
+			LogInfo("[DDR] Auto-detected hostname from certificate: %s", extracted)
+		}
+	}
+
+	// Ensure DDR hostname is fully qualified (ends with a dot)
+	if config.Server.DDR.HostName != "" && !strings.HasSuffix(config.Server.DDR.HostName, ".") {
+		config.Server.DDR.HostName += "."
 	}
 
 	// Start Servers

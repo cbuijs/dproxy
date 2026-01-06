@@ -1,5 +1,5 @@
 # ------------------------------------------------------------------------------
-# dproxy Configuration File (v2.3.4)
+# dproxy Configuration File (v2.3.5)
 # ------------------------------------------------------------------------------
 # This configuration file controls all aspects of the dproxy server, including
 # network listeners, security settings, caching behavior, prefetching, 
@@ -96,6 +96,10 @@ server:
   # encrypted protocols (DoT, DoQ, DoH) by querying _dns.resolver.arpa.
   ddr:
     enabled: true
+    # Hostname: Optional. Explicitly set the target DNS name for SVCB records.
+    # If empty, dproxy attempts to extract the first DNSName/CN from the TLS certificate.
+    # If detection fails, it defaults to "." (the root).
+    # host_name: "dns.server.com"
 
   # DoH (DNS over HTTPS) Specific Settings
   doh:

@@ -1,8 +1,8 @@
 /*
 File: config.go
-Version: 2.4.0
+Version: 2.4.1
 Description: Defines configuration structures and handles YAML parsing and validation.
-UPDATED: Added DDR (Discovery of Designated Resolvers) configuration.
+UPDATED: Added HostName to DDR config to support custom target domains in SVCB records.
 */
 
 package main
@@ -77,7 +77,8 @@ type ServerConfig struct {
 
 	// DDR (Discovery of Designated Resolvers) - RFC 9462
 	DDR struct {
-		Enabled bool `yaml:"enabled"`
+		Enabled  bool   `yaml:"enabled"`
+		HostName string `yaml:"host_name"` // DNS name of the encrypted DNS server (optional)
 	} `yaml:"ddr"`
 
 	DOH struct {

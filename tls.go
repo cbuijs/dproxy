@@ -1,7 +1,7 @@
 /*
 File: tls.go
 Description: Helper functions for loading TLS certificates or generating self-signed certificates.
-UPDATED: Support for multiple listener IPs in self-signed certificate generation.
+UPDATED: Added utility to extract DNS name from certificate for DDR configuration.
 */
 
 package main
@@ -89,5 +89,22 @@ func generateSelfSignedCert(listenIPs []string) (tls.Certificate, error) {
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
 
 	return tls.X509KeyPair(certPEM, keyPEM)
+}
+
+// ExtractDNSNameFromCert extracts the first DNS name or CommonName from a TLS certificate.
+func ExtractDNSNameFromCert(cert *tls.Certificate) string {
+	if cert == nil || len(cert.Certificate) == 0 {
+		return ""
+	}
+	x509Cert, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return ""
+	}
+	// Prefer DNS Names (SANs)
+	if len(x509Cert.DNSNames) > 0 {
+		return x509Cert.DNSNames[0]
+	}
+	// Fallback to Common Name (CN)
+	return x509Cert.Subject.CommonName
 }
 
