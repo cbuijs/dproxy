@@ -1,11 +1,12 @@
 /*
 File: process.go
-Version: 2.7.0
+Version: 2.7.1
 Description: Handles the core processing logic for DNS requests.
              OPTIMIZED: "Cache-First" Strategy. Internal DNS Cache is checked BEFORE Hosts files.
              OPTIMIZED: Hosts file responses are now cached in the internal DNS Cache.
              OPTIMIZED: Response sorting and processing happens ONCE before caching.
              OPTIMIZED: Implemented "Serve-Stale" (Stale-While-Revalidate) to pipeline upstream fetches out of the hot path.
+             UPDATED: Strict Cross-Fetch trigger logic. Only initiates on Cache Miss AND specific types (A/AAAA).
 */
 
 package main
@@ -221,11 +222,13 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 
 	// --- CACHE CHECK (First) ---
 	// "Single Source of Truth": Check cache before checking Hosts or Upstreams.
+	// NOTE: If a cache hit occurs, we return IMMEDIATELY. This satisfies the requirement
+	// to "DO NOT initiate cross-fetching" if cached.
 	if config.Cache.Enabled && cacheKey != "" {
 		if cachedResp, remainingTTL := getFromCacheWithTTL(cacheKey, r.Id); cachedResp != nil {
 			// Hit! Serve immediately.
 			serveCache(w, cachedResp, remainingTTL, r.Id, reqCtx, ruleName, qInfo, start)
-			return
+			return // Exit prevents any cross-fetching logic below
 		} else {
 			// Miss or Expired?
 			// Check if we can SERVE STALE. This requires a modification to `getFromCache` or a new function.
@@ -234,7 +237,7 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 			// Ideally, we'd add `getFromCacheStale` to cache.go.
 			// For now, let's assume if it returned nil, it's truly gone or we don't support stale in this pass.
 			// To support stale, we would need to fetch the expired item.
-			// Implementation Note: A full Serve-Stale requires cache.go changes. 
+			// Implementation Note: A full Serve-Stale requires cache.go changes.
 			// Assuming we want to keep changes local if possible, we proceed.
 		}
 	}
@@ -243,7 +246,7 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	if hostsCache != nil && len(r.Question) > 0 {
 		var answers []dns.RR
 		var found bool
-		
+
 		if qType == dns.TypePTR {
 			answers, found = hostsCache.LookupPTR(reqCtx.QueryName)
 		} else {
@@ -263,7 +266,7 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 
 			if len(answers) > 0 {
 				resp.Answer = answers
-				
+
 				if config.Cache.Enabled && cacheKey != "" {
 					addToCache(cacheKey, resp)
 				}
@@ -273,7 +276,7 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 				logRequest(r.Id, reqCtx, ruleName, qInfo, "", "NOERROR (HOSTS)", "HOSTS", 0, time.Since(start), resp)
 			} else {
 				resp.Rcode = dns.RcodeNameError
-				
+
 				if config.Cache.Enabled && cacheKey != "" {
 					addToCache(cacheKey, resp)
 				}
@@ -287,6 +290,7 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	}
 
 	// --- UPSTREAM FORWARDING ---
+	// This block executes ONLY on a CACHE MISS (or expiration).
 	msg := r.Copy()
 	addEDNS0Options(msg, ip, mac)
 	upstreamQInfo := buildUpstreamInfo(msg)
@@ -307,7 +311,7 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 
 	// --- Singleflight Optimization with Pipelining Potential ---
 	// We use DoChan to allow the caller (us) to wait, but the group ensures only one query goes out.
-	
+
 	safeReqCtx := reqCtx.Clone()
 
 	// Use cacheKey as the suppression key
@@ -376,25 +380,46 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		addToCache(cacheKey, resp)
 
 		// Prefetch Pipelining: Fire and forget
+		// REQUIREMENT: Cross-fetching only happens after a CACHE-MISS (we are here).
+		// REQUIREMENT: Check if it is an A or AAAA record.
 		if config.Cache.Prefetch.CrossFetch.Enabled && resp.Rcode == dns.RcodeSuccess && len(resp.Answer) > 0 {
-			req := prefetchReq{
-				qName:      reqCtx.QueryName,
-				qType:      qType,
-				routingKey: ruleName,
-				upstreams:  selectedUpstreams,
-				strategy:   selectedStrategy,
+			mode := config.Cache.Prefetch.CrossFetch.Mode
+			shouldPrefetch := false
+
+			// Only trigger if the current query matches the configured mode for A/AAAA
+			switch mode {
+			case "on_a":
+				shouldPrefetch = (qType == dns.TypeA)
+			case "on_aaaa":
+				shouldPrefetch = (qType == dns.TypeAAAA)
+			case "both":
+				shouldPrefetch = (qType == dns.TypeA || qType == dns.TypeAAAA)
+			default:
+				// Fallback to strict "both" if mode is weird but enabled
+				shouldPrefetch = (qType == dns.TypeA || qType == dns.TypeAAAA)
 			}
 
-			if len(reqCtx.ClientIP) > 0 {
-				req.clientIP = make(net.IP, len(reqCtx.ClientIP))
-				copy(req.clientIP, reqCtx.ClientIP)
-			}
-			if len(reqCtx.ClientMAC) > 0 {
-				req.clientMAC = make(net.HardwareAddr, len(reqCtx.ClientMAC))
-				copy(req.clientMAC, reqCtx.ClientMAC)
-			}
+			if shouldPrefetch {
+				req := prefetchReq{
+					qName:      reqCtx.QueryName,
+					qType:      qType,
+					routingKey: ruleName,
+					upstreams:  selectedUpstreams,
+					strategy:   selectedStrategy,
+				}
 
-			AttemptCrossFetch(req)
+				if len(reqCtx.ClientIP) > 0 {
+					req.clientIP = make(net.IP, len(reqCtx.ClientIP))
+					copy(req.clientIP, reqCtx.ClientIP)
+				}
+				if len(reqCtx.ClientMAC) > 0 {
+					req.clientMAC = make(net.HardwareAddr, len(reqCtx.ClientMAC))
+					copy(req.clientMAC, reqCtx.ClientMAC)
+				}
+
+				AttemptCrossFetch(req)
+				LogDebug("[PROCESS] Triggered Cross-Fetch for %s (Type: %s, Mode: %s)", reqCtx.QueryName, dns.TypeToString[qType], mode)
+			}
 		}
 	}
 
@@ -404,7 +429,7 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	}
 
 	resp.Id = r.Id
-	
+
 	w.WriteMsg(resp)
 
 	logRequest(r.Id, reqCtx, ruleName, qInfo, upstreamQInfo, status, qr.upstreamStr, qr.rtt, time.Since(start), resp)
@@ -432,26 +457,26 @@ func generateDDRResponse(req *dns.Msg, serverIP net.IP) *dns.Msg {
 	if len(req.Question) == 0 {
 		return nil
 	}
-	
+
 	resp := new(dns.Msg)
 	resp.SetReply(req)
 	resp.Authoritative = true
 	resp.RecursionAvailable = true
-	
+
 	defaultDohPath := "/dns-query"
 	if len(config.Server.DOH.AllowedPaths) > 0 {
 		defaultDohPath = config.Server.DOH.AllowedPaths[0]
 	}
 
 	var answers []dns.RR
-	
+
 	for _, l := range config.Server.Listeners {
 		protos := strings.ToLower(l.Protocol)
-		
+
 		for _, port := range l.Port {
 			var alpn []string
 			var dohPath string
-			
+
 			switch protos {
 			case "dot", "tls":
 				alpn = []string{"dot"}
@@ -467,7 +492,7 @@ func generateDDRResponse(req *dns.Msg, serverIP net.IP) *dns.Msg {
 				alpn = []string{"h2", "h3"}
 				dohPath = defaultDohPath
 			}
-			
+
 			if len(alpn) > 0 {
 				svcb := &dns.SVCB{
 					Hdr: dns.RR_Header{
@@ -479,10 +504,10 @@ func generateDDRResponse(req *dns.Msg, serverIP net.IP) *dns.Msg {
 					Priority: 1,
 					Target:   ".",
 				}
-				
+
 				svcb.Value = append(svcb.Value, &dns.SVCBAlpn{Alpn: alpn})
 				svcb.Value = append(svcb.Value, &dns.SVCBPort{Port: uint16(port)})
-				
+
 				if serverIP != nil {
 					if serverIP.To4() != nil {
 						svcb.Value = append(svcb.Value, &dns.SVCBIPv4Hint{Hint: []net.IP{serverIP}})
@@ -494,16 +519,16 @@ func generateDDRResponse(req *dns.Msg, serverIP net.IP) *dns.Msg {
 				if dohPath != "" {
 					svcb.Value = append(svcb.Value, &dns.SVCBDoHPath{Template: dohPath})
 				}
-				
+
 				answers = append(answers, svcb)
 			}
 		}
 	}
-	
+
 	if len(answers) == 0 {
 		return nil
 	}
-	
+
 	resp.Answer = answers
 	return resp
 }

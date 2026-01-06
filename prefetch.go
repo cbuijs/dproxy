@@ -1,7 +1,9 @@
 /*
 File: prefetch.go
+Version: 1.2.0
 Description: Implements cache prefetching and cross-record fetching for DNS queries.
              UPDATED: Applied TTL clamping and strategy to prefetched entries BEFORE caching.
+             UPDATED: Enhanced logging to explicitly confirm caching of cross-fetched results.
 */
 
 package main
@@ -248,9 +250,10 @@ func doCrossFetch(qName string, qType uint16, routingKey, cacheKey string, upstr
 	applyTTLClamping(resp)
 	applyTTLStrategy(resp)
 	
+	// REQUIREMENT: Make sure that any cross-fetched responses are cached.
 	addToCache(cacheKey, resp)
 
-	LogInfo("[PREFETCH] Cross-fetched %s %s from %s (RTT: %v, Total: %v, Answers: %d)",
+	LogInfo("[PREFETCH] Cached & Cross-fetched %s %s from %s (RTT: %v, Total: %v, Answers: %d)",
 		qName, dns.TypeToString[qType], upstreamStr, rtt, time.Since(start), len(resp.Answer))
 }
 
