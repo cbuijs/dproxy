@@ -2,14 +2,16 @@
 File: hosts.go
 Description: Handles loading, parsing, and querying of standard HOSTS files AND Domain Lists.
              Supports IPv4, IPv6, PTR (Reverse), and optional wildcard matching for subdomains.
-             UPDATED: Added support for configurable TTL (hosts_ttl) for records served from HOSTS.
-             OPTIMIZED: Lookup functions now assume input is pre-lowercased/trimmed to save CPU.
+             OPTIMIZED: Implements Global Deduplication. Files/URLs are loaded once into a SourceCache,
+             then shared across multiple HostsCache instances to save memory and I/O.
+             UPDATED: Load functions now return statistics for consistent logging.
 */
 
 package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"io"
 	"net"
@@ -28,7 +30,21 @@ type urlMeta struct {
 	lastModified string
 }
 
-// HostsCache holds the parsed data from multiple hosts files and URLs.
+// SourceData holds the raw parsed data for a single file or URL.
+// This is intended to be shared (read-only) across multiple HostsCache instances.
+type SourceData struct {
+	Forward map[string][]net.IP
+	Reverse map[string][]string
+	Names   int
+	IPs     int
+	MTime   time.Time
+	Meta    urlMeta
+}
+
+// SourceCache is a container for deduplicated source data
+type SourceCache map[string]*SourceData
+
+// HostsCache holds the active lookup maps for a specific routing rule.
 type HostsCache struct {
 	sync.RWMutex
 	// forward: hostname -> list of IPs
@@ -42,8 +58,11 @@ type HostsCache struct {
 	wildcard   bool
 	performOpt bool
 	defaultTTL uint32 // Configurable TTL for hosts entries
+	
+	// We keep track of file/url metadata to trigger refreshes
 	fileMtimes map[string]time.Time
 	urlMetas   map[string]urlMeta
+	
 	client     *http.Client
 }
 
@@ -55,9 +74,9 @@ func NewHostsCache() *HostsCache {
 		fileMtimes: make(map[string]time.Time),
 		urlMetas:   make(map[string]urlMeta),
 		client: &http.Client{
-			Timeout: 10 * time.Second,
+			Timeout: 15 * time.Second,
 		},
-		defaultTTL: 0, // Default to 0 (no cache) unless set
+		defaultTTL: 0,
 	}
 }
 
@@ -68,44 +87,119 @@ func (hc *HostsCache) SetTTL(ttl uint32) {
 	hc.defaultTTL = ttl
 }
 
-// Load reads multiple hosts files AND URLs, then populates the cache.
-func (hc *HostsCache) Load(paths []string, urls []string, wildcard bool, optimize bool) {
+// BatchLoadSources loads all unique paths and URLs concurrently and returns a SourceCache.
+// This is called once during startup to deduplicate I/O and parsing.
+func BatchLoadSources(paths []string, urls []string) SourceCache {
+	cache := make(SourceCache)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	// Deduplicate inputs
+	uniquePaths := make(map[string]bool)
+	for _, p := range paths { uniquePaths[p] = true }
+	
+	uniqueUrls := make(map[string]bool)
+	for _, u := range urls { uniqueUrls[u] = true }
+
+	// Limit concurrency
+	maxConcurrency := runtime.NumCPU() * 2
+	if maxConcurrency < 4 { maxConcurrency = 4 }
+	sem := make(chan struct{}, maxConcurrency)
+
+	LogInfo("[HOSTS] Global Batch Load: %d unique files, %d unique URLs", len(uniquePaths), len(uniqueUrls))
+
+	// Helper to safely add to cache
+	add := func(key string, data *SourceData) {
+		mu.Lock()
+		cache[key] = data
+		mu.Unlock()
+	}
+
+	// Load Files
+	for path := range uniquePaths {
+		wg.Add(1)
+		go func(p string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			fwd := make(map[string][]net.IP)
+			rev := make(map[string][]string)
+			names, ips, mtime := loadFileInternal(p, fwd, rev)
+			
+			add(p, &SourceData{Forward: fwd, Reverse: rev, Names: names, IPs: ips, MTime: mtime})
+		}(path)
+	}
+
+	// Load URLs
+	// We need a temporary client here since this static function runs before any HostsCache is fully ready
+	client := &http.Client{Timeout: 15 * time.Second}
+	
+	for url := range uniqueUrls {
+		wg.Add(1)
+		go func(u string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			fwd := make(map[string][]net.IP)
+			rev := make(map[string][]string)
+			names, ips, meta := loadURLInternal(client, u, fwd, rev, urlMeta{})
+			
+			add(u, &SourceData{Forward: fwd, Reverse: rev, Names: names, IPs: ips, Meta: meta})
+		}(url)
+	}
+
+	wg.Wait()
+	return cache
+}
+
+// LoadFromCache populates this HostsCache using data from the provided SourceCache.
+// It merges the data from the requested paths/urls into its own maps.
+// Returns the count of names and IPs loaded.
+func (hc *HostsCache) LoadFromCache(paths []string, urls []string, sourceCache SourceCache, wildcard bool, optimize bool) (int, int) {
 	start := time.Now()
-	// 1. Prepare new data structures locally
+
+	// 1. Merge Data
 	newForward := make(map[string][]net.IP)
 	newReverse := make(map[string][]string)
 	newFileMtimes := make(map[string]time.Time)
 	newUrlMetas := make(map[string]urlMeta)
 
-	totalNames := 0
-	totalIPs := 0
+	totalSources := 0
 
-	// 2. Load Files
-	for _, path := range paths {
-		names, ips, mtime := hc.loadFile(path, newForward, newReverse)
-		totalNames += names
-		totalIPs += ips
-		if !mtime.IsZero() {
-			newFileMtimes[path] = mtime
+	merge := func(key string) {
+		if data, ok := sourceCache[key]; ok {
+			totalSources++
+			// Efficient Merge: Copy slice headers and keys. Underlying arrays are shared.
+			for k, v := range data.Forward {
+				newForward[k] = append(newForward[k], v...)
+			}
+			for k, v := range data.Reverse {
+				newReverse[k] = append(newReverse[k], v...)
+			}
+			
+			// Track metadata for future refreshes
+			if !data.MTime.IsZero() {
+				newFileMtimes[key] = data.MTime
+			}
+			if data.Meta.etag != "" || data.Meta.lastModified != "" {
+				newUrlMetas[key] = data.Meta
+			}
+		} else {
+			LogWarn("[HOSTS] Source not found in cache during merge: %s", key)
 		}
 	}
 
-	// 3. Load URLs
-	for _, url := range urls {
-		names, ips, meta := hc.loadURL(url, newForward, newReverse)
-		totalNames += names
-		totalIPs += ips
-		newUrlMetas[url] = meta
-	}
+	for _, path := range paths { merge(path) }
+	for _, url := range urls { merge(url) }
 
-	loadDuration := time.Since(start)
-
-	// 4. Optimize (if wildcard enabled AND optimize requested)
+	// 2. Optimize (if requested)
 	if wildcard && optimize {
 		hc.optimize(newForward, newReverse)
 	}
 
-	// 5. Atomic Swap
+	// 3. Atomic Swap
 	hc.Lock()
 	hc.forward = newForward
 	hc.reverse = newReverse
@@ -117,78 +211,57 @@ func (hc *HostsCache) Load(paths []string, urls []string, wildcard bool, optimiz
 	hc.urlMetas = newUrlMetas
 	hc.Unlock()
 
-	LogInfo("[HOSTS] Loaded %d files and %d URLs in %v (%d names, %d IPs)",
-		len(paths), len(urls), loadDuration, len(newForward), len(newReverse))
+	LogDebug("[HOSTS] Cache assembled from %d sources in %v (%d names)", totalSources, time.Since(start), len(newForward))
+	return len(newForward), len(newReverse)
+}
+
+// Load (Legacy/Refresh) - Loads directly without external cache.
+// Used by auto-refresh logic which updates specific instances.
+func (hc *HostsCache) Load(paths []string, urls []string, wildcard bool, optimize bool) {
+	cache := BatchLoadSources(paths, urls)
+	names, ips := hc.LoadFromCache(paths, urls, cache, wildcard, optimize)
+	LogInfo("[HOSTS] Refresh complete: %d names, %d IPs", names, ips)
 }
 
 // optimize removes subdomains from the maps if their parent domain exists.
 func (hc *HostsCache) optimize(fwd map[string][]net.IP, rev map[string][]string) {
 	const parallelThreshold = 5000
-
 	count := len(fwd)
-	if count == 0 {
-		return
-	}
+	if count == 0 { return }
 
-	start := time.Now()
 	var toDelete []string
-
 	if count < parallelThreshold {
 		toDelete = hc.findRedundantKeys(fwd, nil)
 	} else {
+		// Parallel optimization logic
 		keys := make([]string, 0, count)
-		for k := range fwd {
-			keys = append(keys, k)
-		}
-
+		for k := range fwd { keys = append(keys, k) }
+		
 		numWorkers := runtime.NumCPU()
-		if count/numWorkers < 1000 {
-			numWorkers = count / 1000
-			if numWorkers < 1 {
-				numWorkers = 1
-			}
-		}
-
-		LogDebug("[HOSTS] Optimizing %d entries using %d workers", count, numWorkers)
+		if count/numWorkers < 1000 { numWorkers = count / 1000; if numWorkers < 1 { numWorkers = 1 } }
 
 		toDeleteCh := make(chan string, count/10)
 		var wg sync.WaitGroup
-
 		chunkSize := (count + numWorkers - 1) / numWorkers
 
 		for i := 0; i < numWorkers; i++ {
-			startIndex := i * chunkSize
-			endIndex := startIndex + chunkSize
-			if startIndex >= count {
-				break
-			}
-			if endIndex > count {
-				endIndex = count
-			}
-
+			start, end := i*chunkSize, (i+1)*chunkSize
+			if start >= count { break }
+			if end > count { end = count }
 			wg.Add(1)
 			go func(chunk []string) {
 				defer wg.Done()
 				hc.findRedundantKeysChannel(fwd, chunk, toDeleteCh)
-			}(keys[startIndex:endIndex])
+			}(keys[start:end])
 		}
-
-		go func() {
-			wg.Wait()
-			close(toDeleteCh)
-		}()
-
-		for k := range toDeleteCh {
-			toDelete = append(toDelete, k)
-		}
+		go func() { wg.Wait(); close(toDeleteCh) }()
+		for k := range toDeleteCh { toDelete = append(toDelete, k) }
 	}
-
-	removedCount := len(toDelete)
 
 	for _, hostname := range toDelete {
 		ips := fwd[hostname]
 		delete(fwd, hostname)
-
+		// Clean reverse map
 		for _, ip := range ips {
 			ipKey := ip.String()
 			names := rev[ipKey]
@@ -200,52 +273,27 @@ func (hc *HostsCache) optimize(fwd map[string][]net.IP, rev map[string][]string)
 				}
 			}
 			names = names[:n]
-
-			if len(names) == 0 {
-				delete(rev, ipKey)
-			} else {
-				rev[ipKey] = names
-			}
+			if len(names) == 0 { delete(rev, ipKey) } else { rev[ipKey] = names }
 		}
-	}
-
-	if removedCount > 0 {
-		LogDebug("[HOSTS] Optimization complete in %v: Removed %d redundant subdomains", time.Since(start), removedCount)
 	}
 }
 
 func (hc *HostsCache) findRedundantKeys(fwd map[string][]net.IP, keys []string) []string {
 	var redundant []string
-
 	check := func(hostname string) {
 		domain := hostname
 		for {
 			idx := strings.IndexByte(domain, '.')
-			if idx == -1 {
-				break
-			}
+			if idx == -1 { break }
 			domain = domain[idx+1:]
-
-			if domain == "" {
-				break
-			}
-
+			if domain == "" { break }
 			if _, exists := fwd[domain]; exists {
 				redundant = append(redundant, hostname)
 				break
 			}
 		}
 	}
-
-	if keys != nil {
-		for _, k := range keys {
-			check(k)
-		}
-	} else {
-		for k := range fwd {
-			check(k)
-		}
-	}
+	if keys != nil { for _, k := range keys { check(k) } } else { for k := range fwd { check(k) } }
 	return redundant
 }
 
@@ -254,15 +302,9 @@ func (hc *HostsCache) findRedundantKeysChannel(fwd map[string][]net.IP, keys []s
 		domain := hostname
 		for {
 			idx := strings.IndexByte(domain, '.')
-			if idx == -1 {
-				break
-			}
+			if idx == -1 { break }
 			domain = domain[idx+1:]
-
-			if domain == "" {
-				break
-			}
-
+			if domain == "" { break }
 			if _, exists := fwd[domain]; exists {
 				out <- hostname
 				break
@@ -271,185 +313,93 @@ func (hc *HostsCache) findRedundantKeysChannel(fwd map[string][]net.IP, keys []s
 	}
 }
 
-// isBlockedIP checks if an IP is one of the "blocking" addresses (0.0.0.0, ::, 127.0.0.1, ::1).
 func isBlockedIP(ip net.IP) bool {
-	if ip.IsUnspecified() { // 0.0.0.0 or ::
-		return true
-	}
-	if ip.IsLoopback() { // 127.0.0.0/8 or ::1
-		return true
-	}
-	return false
+	return ip.IsUnspecified() || ip.IsLoopback()
 }
 
-// parseReader is a helper to parse HOSTS content OR DOMAIN lists from any reader.
-// Automatically detects format line-by-line.
-// Returns: addedNames, addedIPs, detectedFormatString
 func parseReader(sourceName string, r io.Reader, forward map[string][]net.IP, reverse map[string][]string) (int, int, string) {
 	addedNames := 0
 	addedIPs := 0
-
-	// Format detection counters
 	hostsCount := 0
 	domainsCount := 0
-
-	zeroIP := net.IPv4(0, 0, 0, 0) // Used for domain list entries (blocked)
-
+	zeroIP := net.IPv4(0, 0, 0, 0)
 	scanner := bufio.NewScanner(r)
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+		lineBytes := scanner.Bytes()
+		if idx := bytes.IndexByte(lineBytes, '#'); idx >= 0 { lineBytes = lineBytes[:idx] }
+		lineBytes = bytes.TrimSpace(lineBytes)
+		if len(lineBytes) == 0 { continue }
 
-		// 1. Skip empty lines and comments (#)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		// Remove inline comments
-		if idx := strings.Index(line, "#"); idx != -1 {
-			line = line[:idx]
-		}
-
-		// Re-trim after removing comments
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-
+		line := string(lineBytes)
 		fields := strings.Fields(line)
-		if len(fields) == 0 {
-			continue
-		}
+		if len(fields) == 0 { continue }
 
-		// Attempt to parse first field as IP
 		ipStr := fields[0]
 		ip := net.ParseIP(ipStr)
 
 		if ip != nil {
-			// --- HOSTS FORMAT: IP domain1 [domain2...] ---
-			if len(fields) < 2 {
-				continue // Valid IP but no domain? Skip.
-			}
-
+			if len(fields) < 2 { continue }
 			hostsCount++
-
 			isBlocked := isBlockedIP(ip)
 			ipKey := ip.String()
-
-			// Only add to reverse lookup if NOT a blocked IP
 			if !isBlocked {
-				if _, exists := reverse[ipKey]; !exists {
-					addedIPs++
-				}
+				if _, exists := reverse[ipKey]; !exists { addedIPs++ }
 			}
-
-			// Process domains (fields[1:])
 			for _, originalHost := range fields[1:] {
-				// Normalize: lowercase and trim ALL leading/trailing dots
 				host := strings.ToLower(strings.Trim(originalHost, "."))
-				if host == "" {
-					continue
-				}
-
-				if host != strings.ToLower(originalHost) {
-					LogDebug("[HOSTS] [%s] Sanitized hostname: '%s' -> '%s'", sourceName, originalHost, host)
-				}
-
-				// Skip if the hostname is actually an IP address
-				if net.ParseIP(host) != nil {
-					LogDebug("[HOSTS] [%s] Skipped hostname '%s' because it is a valid IP address", sourceName, host)
-					continue
-				}
-
+				if host == "" { continue }
+				if net.ParseIP(host) != nil { continue }
 				forward[host] = append(forward[host], ip)
-
-				if !isBlocked {
-					reverse[ipKey] = append(reverse[ipKey], host)
-				}
+				if !isBlocked { reverse[ipKey] = append(reverse[ipKey], host) }
 				addedNames++
 			}
-
 		} else {
-			// --- DOMAIN LIST FORMAT: domain ---
-			// Line starts with something that is NOT an IP. Treat as domain to block.
-
 			domainsCount++
-			// Only process the first field as the domain
 			originalHost := fields[0]
-			// Normalize: lowercase and trim ALL leading/trailing dots
 			host := strings.ToLower(strings.Trim(originalHost, "."))
-
 			if host != "" {
-				if host != strings.ToLower(originalHost) {
-					LogDebug("[HOSTS] [%s] Sanitized domain list entry: '%s' -> '%s'", sourceName, originalHost, host)
-				}
-
-				// Skip if the hostname is actually an IP address
-				if net.ParseIP(host) != nil {
-					LogDebug("[HOSTS] [%s] Skipped domain list entry '%s' because it is a valid IP address", sourceName, host)
-					continue
-				}
-
-				// Store as 0.0.0.0 (Blocked)
+				if net.ParseIP(host) != nil { continue }
 				forward[host] = append(forward[host], zeroIP)
 				addedNames++
 			}
 		}
 	}
 
-	// Determine format string
 	format := "UNKNOWN"
-	if hostsCount > 0 && domainsCount == 0 {
-		format = "HOSTS"
-	} else if domainsCount > 0 && hostsCount == 0 {
-		format = "DOMAINS"
-	} else if hostsCount > 0 && domainsCount > 0 {
-		format = "MIXED"
-	} else if addedNames == 0 {
-		format = "EMPTY"
-	}
-
+	if hostsCount > 0 && domainsCount == 0 { format = "HOSTS" } else if domainsCount > 0 && hostsCount == 0 { format = "DOMAINS" } else if hostsCount > 0 && domainsCount > 0 { format = "MIXED" } else if addedNames == 0 { format = "EMPTY" }
 	return addedNames, addedIPs, format
 }
 
-func (hc *HostsCache) loadFile(path string, fwd map[string][]net.IP, rev map[string][]string) (int, int, time.Time) {
+// loadFileInternal is the standalone loader for files
+func loadFileInternal(path string, fwd map[string][]net.IP, rev map[string][]string) (int, int, time.Time) {
 	file, err := os.Open(path)
 	if err != nil {
 		LogWarn("[HOSTS] Failed to open file %s: %v", path, err)
 		return 0, 0, time.Time{}
 	}
 	defer file.Close()
-
 	info, err := file.Stat()
 	mtime := time.Time{}
-	if err == nil {
-		mtime = info.ModTime()
-	}
-
+	if err == nil { mtime = info.ModTime() }
 	names, _, format := parseReader(path, file, fwd, rev)
 	LogDebug("[HOSTS] Parsed file %s (%s): %d names", path, format, names)
 	return names, 0, mtime
 }
 
-func (hc *HostsCache) loadURL(url string, fwd map[string][]net.IP, rev map[string][]string) (int, int, urlMeta) {
+// loadURLInternal is the standalone loader for URLs
+func loadURLInternal(client *http.Client, url string, fwd map[string][]net.IP, rev map[string][]string, oldMeta urlMeta) (int, int, urlMeta) {
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		LogWarn("[HOSTS] Invalid URL %s: %v", url, err)
 		return 0, 0, urlMeta{}
 	}
+	if oldMeta.etag != "" { req.Header.Set("If-None-Match", oldMeta.etag) }
+	if oldMeta.lastModified != "" { req.Header.Set("If-Modified-Since", oldMeta.lastModified) }
 
-	hc.RLock()
-	oldMeta, exists := hc.urlMetas[url]
-	hc.RUnlock()
-	if exists {
-		if oldMeta.etag != "" {
-			req.Header.Set("If-None-Match", oldMeta.etag)
-		}
-		if oldMeta.lastModified != "" {
-			req.Header.Set("If-Modified-Since", oldMeta.lastModified)
-		}
-	}
-
-	resp, err := hc.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		LogWarn("[HOSTS] Failed to fetch URL %s: %v", url, err)
 		return 0, 0, urlMeta{}
@@ -458,13 +408,12 @@ func (hc *HostsCache) loadURL(url string, fwd map[string][]net.IP, rev map[strin
 
 	if resp.StatusCode == http.StatusNotModified {
 		LogDebug("[HOSTS] URL %s not modified (304)", url)
+		// Retry without conditions to populate the new map
+		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
-		req.Header.Del("If-None-Match")
-		req.Header.Del("If-Modified-Since")
-		resp, err = hc.client.Do(req)
-		if err != nil {
-			return 0, 0, urlMeta{}
-		}
+		req.Header.Del("If-None-Match"); req.Header.Del("If-Modified-Since")
+		resp, err = client.Do(req)
+		if err != nil { return 0, 0, urlMeta{} }
 		defer resp.Body.Close()
 	}
 
@@ -473,268 +422,154 @@ func (hc *HostsCache) loadURL(url string, fwd map[string][]net.IP, rev map[strin
 		return 0, 0, urlMeta{}
 	}
 
-	meta := urlMeta{
-		etag:         resp.Header.Get("ETag"),
-		lastModified: resp.Header.Get("Last-Modified"),
-	}
-
+	meta := urlMeta{ etag: resp.Header.Get("ETag"), lastModified: resp.Header.Get("Last-Modified") }
 	names, _, format := parseReader(url, resp.Body, fwd, rev)
 	LogDebug("[HOSTS] Parsed URL %s (%s): %d names", url, format, names)
 	return names, 0, meta
 }
 
+// Helper methods for auto-refresh using internal logic
+func (hc *HostsCache) loadFile(path string, fwd map[string][]net.IP, rev map[string][]string) (int, int, time.Time) {
+	return loadFileInternal(path, fwd, rev)
+}
+func (hc *HostsCache) loadURL(url string, fwd map[string][]net.IP, rev map[string][]string) (int, int, urlMeta) {
+	hc.RLock(); old := hc.urlMetas[url]; hc.RUnlock()
+	return loadURLInternal(hc.client, url, fwd, rev, old)
+}
+
 func (hc *HostsCache) StartAutoRefresh(ctx context.Context, checkInterval time.Duration) {
-	if len(hc.paths) == 0 && len(hc.urls) == 0 {
-		return
-	}
-
-	LogInfo("[HOSTS] Starting auto-refresh for %d files, %d URLs (Interval: %v)",
-		len(hc.paths), len(hc.urls), checkInterval)
-
+	if len(hc.paths) == 0 && len(hc.urls) == 0 { return }
+	LogInfo("[HOSTS] Starting auto-refresh for %d files, %d URLs (Interval: %v)", len(hc.paths), len(hc.urls), checkInterval)
 	ticker := time.NewTicker(checkInterval)
 	defer ticker.Stop()
-
 	for {
 		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			hc.checkUpdates()
+		case <-ctx.Done(): return
+		case <-ticker.C: hc.checkUpdates()
 		}
 	}
 }
 
-func (hc *HostsCache) HasRemote() bool {
-	hc.RLock()
-	defer hc.RUnlock()
-	return len(hc.urls) > 0
-}
+func (hc *HostsCache) HasRemote() bool { hc.RLock(); defer hc.RUnlock(); return len(hc.urls) > 0 }
 
 func (hc *HostsCache) checkUpdates() {
 	shouldReload := false
-
 	for _, path := range hc.paths {
 		info, err := os.Stat(path)
-		if err != nil {
-			continue
-		}
-		hc.RLock()
-		lastMod, known := hc.fileMtimes[path]
-		hc.RUnlock()
-
+		if err != nil { continue }
+		hc.RLock(); lastMod, known := hc.fileMtimes[path]; hc.RUnlock()
 		if !known || info.ModTime().After(lastMod) {
 			LogInfo("[HOSTS] File changed: %s", path)
-			shouldReload = true
-			break
+			shouldReload = true; break
 		}
 	}
-
 	if !shouldReload {
 		for _, url := range hc.urls {
 			if hc.checkURLChanged(url) {
 				LogInfo("[HOSTS] URL changed: %s", url)
-				shouldReload = true
-				break
+				shouldReload = true; break
 			}
 		}
 	}
-
 	if shouldReload {
-		hc.RLock()
-		wildcard := hc.wildcard
-		optimize := hc.performOpt
-		hc.RUnlock()
-		hc.Load(hc.paths, hc.urls, wildcard, optimize)
+		hc.RLock(); w := hc.wildcard; o := hc.performOpt; hc.RUnlock()
+		hc.Load(hc.paths, hc.urls, w, o)
 	}
 }
 
 func (hc *HostsCache) checkURLChanged(url string) bool {
-	hc.RLock()
-	meta, known := hc.urlMetas[url]
-	hc.RUnlock()
-
+	hc.RLock(); meta, known := hc.urlMetas[url]; hc.RUnlock()
 	req, err := http.NewRequest("HEAD", url, nil)
-	if err != nil {
-		return false
-	}
-
+	if err != nil { return false }
 	if known {
-		if meta.etag != "" {
-			req.Header.Set("If-None-Match", meta.etag)
-		}
-		if meta.lastModified != "" {
-			req.Header.Set("If-Modified-Since", meta.lastModified)
-		}
+		if meta.etag != "" { req.Header.Set("If-None-Match", meta.etag) }
+		if meta.lastModified != "" { req.Header.Set("If-Modified-Since", meta.lastModified) }
 	}
-
 	resp, err := hc.client.Do(req)
-	if err != nil {
-		return false
-	}
+	if err != nil { return false }
 	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusNotModified {
-		return false
-	}
-
-	return resp.StatusCode == http.StatusOK
+	return resp.StatusCode != http.StatusNotModified && resp.StatusCode == http.StatusOK
 }
 
 // Lookup queries the hosts cache.
-// OPTIMIZATION: qName MUST be passed in lowercase and without trailing dot.
-// The caller (process.go) is responsible for this normalization to save CPU cycles here.
 func (hc *HostsCache) Lookup(qName string, qType uint16, wildcard bool) ([]dns.RR, bool) {
-	hc.RLock()
-	defer hc.RUnlock()
-
-	// REMOVED redundant strings.ToLower/TrimSuffix.
-	// We trust the caller (processDNSRequest) to pass the normalized reqCtx.QueryName.
-
-	var ips []net.IP
-	matchType := ""
-	matchedName := ""
-	found := false
+	hc.RLock(); defer hc.RUnlock()
+	var ips []net.IP; matchType := ""; matchedName := ""; found := false
 
 	if matches, ok := hc.forward[qName]; ok {
-		ips = matches
-		matchType = "exact"
-		matchedName = qName
-		found = true
+		ips = matches; matchType = "exact"; matchedName = qName; found = true
 	} else if wildcard {
 		parts := strings.Split(qName, ".")
 		for i := 1; i < len(parts); i++ {
 			parent := strings.Join(parts[i:], ".")
 			if matches, ok := hc.forward[parent]; ok {
-				ips = matches
-				matchType = "wildcard"
-				matchedName = parent
-				found = true
-				break
+				ips = matches; matchType = "wildcard"; matchedName = parent; found = true; break
 			}
 		}
 	}
 
-	if !found {
-		return nil, false
-	}
+	if !found { return nil, false }
 
-	// Check if this domain is blocked (has 0.0.0.0, ::, 127.0.0.1, or ::1)
 	isBlocked := false
-	for _, ip := range ips {
-		if isBlockedIP(ip) {
-			isBlocked = true
-			break
-		}
-	}
+	for _, ip := range ips { if isBlockedIP(ip) { isBlocked = true; break } }
 
 	var answers []dns.RR
-	ttl := hc.defaultTTL // Use the configured TTL
-
-	// If blocked, force return 0.0.0.0 (A) or :: (AAAA) regardless of what's in the file
+	ttl := hc.defaultTTL
 	if isBlocked {
 		if qType == dns.TypeA {
-			rr := new(dns.A)
-			rr.Hdr = dns.RR_Header{Name: dns.Fqdn(qName), Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: ttl}
-			rr.A = net.IPv4(0, 0, 0, 0)
-			answers = append(answers, rr)
+			rr := new(dns.A); rr.Hdr = dns.RR_Header{Name: dns.Fqdn(qName), Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: ttl}; rr.A = net.IPv4(0, 0, 0, 0); answers = append(answers, rr)
 		} else if qType == dns.TypeAAAA {
-			rr := new(dns.AAAA)
-			rr.Hdr = dns.RR_Header{Name: dns.Fqdn(qName), Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: ttl}
-			rr.AAAA = net.ParseIP("::")
-			answers = append(answers, rr)
+			rr := new(dns.AAAA); rr.Hdr = dns.RR_Header{Name: dns.Fqdn(qName), Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: ttl}; rr.AAAA = net.ParseIP("::"); answers = append(answers, rr)
 		}
-		// If other types (MX, etc.), return empty answers + found=true -> triggers NXDOMAIN in process.go
 		LogDebug("[HOSTS] Hit (%s): %s -> %s (BLOCKED -> Null Response, TTL: %d)", matchType, qName, matchedName, ttl)
 		return answers, true
 	}
 
-	// Normal Behavior
 	for _, ip := range ips {
 		if qType == dns.TypeA && ip.To4() != nil {
-			rr := new(dns.A)
-			rr.Hdr = dns.RR_Header{Name: dns.Fqdn(qName), Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: ttl}
-			rr.A = ip.To4()
-			answers = append(answers, rr)
+			rr := new(dns.A); rr.Hdr = dns.RR_Header{Name: dns.Fqdn(qName), Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: ttl}; rr.A = ip.To4(); answers = append(answers, rr)
 		} else if qType == dns.TypeAAAA && ip.To4() == nil {
-			rr := new(dns.AAAA)
-			rr.Hdr = dns.RR_Header{Name: dns.Fqdn(qName), Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: ttl}
-			rr.AAAA = ip
-			answers = append(answers, rr)
+			rr := new(dns.AAAA); rr.Hdr = dns.RR_Header{Name: dns.Fqdn(qName), Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: ttl}; rr.AAAA = ip; answers = append(answers, rr)
 		}
 	}
-
 	if len(answers) > 0 {
 		LogDebug("[HOSTS] Hit (%s): %s -> %s (Matches: %v, TTL: %d)", matchType, qName, matchedName, ips, ttl)
 	} else {
 		LogDebug("[HOSTS] Hit (%s): %s -> %s (No %s records found, existing IPs: %v)", matchType, qName, matchedName, dns.TypeToString[qType], ips)
 	}
-
 	return answers, true
 }
 
-// LookupPTR queries the reverse hosts cache.
-// OPTIMIZATION: qName is assumed to be lowercased, but extractIPFromPTR handles structure parsing.
 func (hc *HostsCache) LookupPTR(qName string) ([]dns.RR, bool) {
-	hc.RLock()
-	defer hc.RUnlock()
-
-	// extractIPFromPTR internally handles suffix checking which requires specific structure,
-	// but we can assume qName input is already lowercased from process.go.
+	hc.RLock(); defer hc.RUnlock()
 	ip := extractIPFromPTR(qName)
-	if ip == nil {
-		return nil, false
-	}
-
-	// Check for Blocked IPs (0.0.0.0, ::, 127.0.0.1, ::1) -> Force NXDOMAIN (Found=true, Answers=nil)
-	if isBlockedIP(ip) {
-		LogDebug("[HOSTS] PTR Hit: %s -> BLOCKED (NXDOMAIN)", qName)
-		return nil, true
-	}
-
+	if ip == nil { return nil, false }
+	if isBlockedIP(ip) { return nil, true }
 	names, ok := hc.reverse[ip.String()]
-	if !ok {
-		return nil, false
-	}
+	if !ok { return nil, false }
 
 	var answers []dns.RR
-	ttl := hc.defaultTTL // Use the configured TTL
-
+	ttl := hc.defaultTTL
 	for _, name := range names {
-		rr := new(dns.PTR)
-		rr.Hdr = dns.RR_Header{Name: qName, Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: ttl}
-		rr.Ptr = dns.Fqdn(name)
-		answers = append(answers, rr)
+		rr := new(dns.PTR); rr.Hdr = dns.RR_Header{Name: qName, Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: ttl}; rr.Ptr = dns.Fqdn(name); answers = append(answers, rr)
 	}
-
 	LogDebug("[HOSTS] PTR Hit: %s -> %v (TTL: %d)", qName, names, ttl)
 	return answers, true
 }
 
 func extractIPFromPTR(qName string) net.IP {
-	// Assume input is already trimmed/lowered, but we need to check suffixes
-	// Since suffixes are standard, we don't need to re-lower the known suffix parts
-
 	if strings.HasSuffix(qName, ".in-addr.arpa") {
 		parts := strings.Split(strings.TrimSuffix(qName, ".in-addr.arpa"), ".")
-		if len(parts) != 4 {
-			return nil
-		}
+		if len(parts) != 4 { return nil }
 		ipStr := parts[3] + "." + parts[2] + "." + parts[1] + "." + parts[0]
 		return net.ParseIP(ipStr)
 	} else if strings.HasSuffix(qName, ".ip6.arpa") {
 		hexStr := strings.TrimSuffix(qName, ".ip6.arpa")
 		hexStr = strings.ReplaceAll(hexStr, ".", "")
-		runes := []rune(hexStr)
-		for i, j := 0, len(runes)-1; i < j; i, j = i+1, j-1 {
-			runes[i], runes[j] = runes[j], runes[i]
-		}
+		runes := []rune(hexStr); n := len(runes)
+		for i := 0; i < n/2; i++ { runes[i], runes[n-1-i] = runes[n-1-i], runes[i] }
 		var sb strings.Builder
-		for i, r := range runes {
-			if i > 0 && i%4 == 0 {
-				sb.WriteString(":")
-			}
-			sb.WriteRune(r)
-		}
+		for i, r := range runes { if i > 0 && i%4 == 0 { sb.WriteString(":") }; sb.WriteRune(r) }
 		return net.ParseIP(sb.String())
 	}
 	return nil

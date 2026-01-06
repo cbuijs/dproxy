@@ -1,8 +1,8 @@
 /*
 File: config.go
-Version: 2.3.2
+Version: 2.3.3
 Description: Defines configuration structures and handles YAML parsing and validation.
-UPDATED: Auto-detect 'unixgram' network for local syslog paths.
+UPDATED: Added compatibility for singular 'host_files' and 'host_urls' keys in YAML configuration.
 */
 
 package main
@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -160,6 +161,11 @@ type DefaultRule struct {
 	Strategy      string      `yaml:"strategy"`
 	HostsFiles    []string    `yaml:"hosts_files"`
 	HostsURLs     []string    `yaml:"hosts_urls"`
+	
+	// Compatibility fields for singular keys
+	HostFilesSingular []string `yaml:"host_files"`
+	HostURLsSingular  []string `yaml:"host_urls"`
+
 	HostsWildcard bool        `yaml:"hosts_wildcard"`
 	HostsOptimize bool        `yaml:"hosts_optimize"`
 
@@ -174,6 +180,11 @@ type RoutingRule struct {
 	Strategy      string          `yaml:"strategy"`
 	HostsFiles    []string        `yaml:"hosts_files"`
 	HostsURLs     []string        `yaml:"hosts_urls"`
+
+	// Compatibility fields for singular keys
+	HostFilesSingular []string `yaml:"host_files"`
+	HostURLsSingular  []string `yaml:"host_urls"`
+
 	HostsWildcard bool            `yaml:"hosts_wildcard"`
 	HostsOptimize bool            `yaml:"hosts_optimize"`
 
@@ -377,7 +388,6 @@ func LoadConfig(path string) error {
 	if len(cfg.Bootstrap.Servers) == 0 {
 		cfg.Bootstrap.Servers = []string{"1.1.1.1:53", "8.8.8.8:53"}
 	} else {
-		// THIS LOOP USES strings.Contains AND MUST NOT BE ABBREVIATED
 		for i, bs := range cfg.Bootstrap.Servers {
 			if !strings.Contains(bs, ":") {
 				cfg.Bootstrap.Servers[i] = bs + ":53"
@@ -395,11 +405,9 @@ func LoadConfig(path string) error {
 	if cfg.Cache.Size == 0 {
 		cfg.Cache.Size = 10000
 	}
-	// TTLStrategy defaults to "none" if not specified
 	if cfg.Cache.TTLStrategy == "" {
 		cfg.Cache.TTLStrategy = "none"
 	}
-	// Validate TTL Strategy
 	validStrategies := map[string]bool{
 		"none": true, "first": true, "last": true,
 		"lowest": true, "highest": true, "average": true,
@@ -409,27 +417,31 @@ func LoadConfig(path string) error {
 	}
 	cfg.Cache.TTLStrategy = strings.ToLower(cfg.Cache.TTLStrategy)
 
-	// Cache Sorting Default
 	if cfg.Cache.ResponseSorting == "" {
 		cfg.Cache.ResponseSorting = "none"
 	}
-	// Validate Sorting
 	validSorting := map[string]bool{"none": true, "round-robin": true, "sorted": true}
 	if !validSorting[strings.ToLower(cfg.Cache.ResponseSorting)] {
 		return fmt.Errorf("invalid response_sorting: %s (must be: none, round-robin, sorted)", cfg.Cache.ResponseSorting)
 	}
 	cfg.Cache.ResponseSorting = strings.ToLower(cfg.Cache.ResponseSorting)
 
-
-	// Prefetch Configuration
 	if err := parsePrefetchConfig(&cfg.Cache.Prefetch); err != nil {
 		return fmt.Errorf("prefetch config: %w", err)
 	}
 
-	// Parse routing rules
-	LogInfo("--- Loading Routing Rules ---")
+	// Parse routing rules (Synchronous Validation Phase)
+	LogInfo("--- Loading Routing Rules (Parsing Phase) ---")
 	for i := range cfg.Routing.RoutingRules {
 		rule := &cfg.Routing.RoutingRules[i]
+
+		// Merge singular compatibility fields
+		if len(rule.HostFilesSingular) > 0 {
+			rule.HostsFiles = append(rule.HostsFiles, rule.HostFilesSingular...)
+		}
+		if len(rule.HostURLsSingular) > 0 {
+			rule.HostsURLs = append(rule.HostsURLs, rule.HostURLsSingular...)
+		}
 
 		if err := parseMatchConditions(&rule.Match); err != nil {
 			return fmt.Errorf("rule '%s': %w", rule.Name, err)
@@ -455,24 +467,22 @@ func LoadConfig(path string) error {
 		if rule.Strategy == "" {
 			rule.Strategy = "failover"
 		}
-
-		// Load Hosts Files AND URLs for this rule
-		if len(rule.HostsFiles) > 0 || len(rule.HostsURLs) > 0 {
-			hc := NewHostsCache()
-			// Set the default TTL for hosts entries from config
-			hc.SetTTL(uint32(cfg.Cache.HostsTTL))
-			// Pass wildcard AND optimize bools
-			hc.Load(rule.HostsFiles, rule.HostsURLs, rule.HostsWildcard, rule.HostsOptimize)
-			rule.parsedHosts = hc
-			LogInfo("[RULE] Loaded hosts for '%s' (Files: %d, URLs: %d, TTL: %d)", 
-				rule.Name, len(rule.HostsFiles), len(rule.HostsURLs), cfg.Cache.HostsTTL)
-		}
-
-		LogInfo("[RULE] Loaded '%s' (Strategy: %s)", rule.Name, rule.Strategy)
+		
+		// Detailed Rule Logging
+		LogInfo("--- Rule: %s ---", rule.Name)
 		logMatchConditions(&rule.Match)
+		LogInfo("   └─ Forward: Strategy=%s, Upstreams=%d", rule.Strategy, len(rule.parsedUpstreams))
 	}
 
-	// Parse default rule
+	// Merge singular compatibility fields for default rule
+	if len(cfg.Routing.DefaultRule.HostFilesSingular) > 0 {
+		cfg.Routing.DefaultRule.HostsFiles = append(cfg.Routing.DefaultRule.HostsFiles, cfg.Routing.DefaultRule.HostFilesSingular...)
+	}
+	if len(cfg.Routing.DefaultRule.HostURLsSingular) > 0 {
+		cfg.Routing.DefaultRule.HostsURLs = append(cfg.Routing.DefaultRule.HostsURLs, cfg.Routing.DefaultRule.HostURLsSingular...)
+	}
+
+	// Parse default rule (Synchronous Validation Phase)
 	if cfg.Routing.DefaultRule.Upstreams == nil {
 		return fmt.Errorf("default upstreams are required")
 	}
@@ -498,21 +508,78 @@ func LoadConfig(path string) error {
 		cfg.Routing.DefaultRule.Strategy = "failover"
 	}
 
-	// Load Hosts Files AND URLs for default rule
-	if len(cfg.Routing.DefaultRule.HostsFiles) > 0 || len(cfg.Routing.DefaultRule.HostsURLs) > 0 {
-		hc := NewHostsCache()
-		// Set the default TTL for hosts entries from config
-		hc.SetTTL(uint32(cfg.Cache.HostsTTL))
-		// Pass wildcard AND optimize bools
-		hc.Load(cfg.Routing.DefaultRule.HostsFiles, cfg.Routing.DefaultRule.HostsURLs, cfg.Routing.DefaultRule.HostsWildcard, cfg.Routing.DefaultRule.HostsOptimize)
-		cfg.Routing.DefaultRule.parsedHosts = hc
-		LogInfo("[RULE] Loaded hosts for 'DEFAULT' (Files: %d, URLs: %d, TTL: %d)", 
-			len(cfg.Routing.DefaultRule.HostsFiles), len(cfg.Routing.DefaultRule.HostsURLs), cfg.Cache.HostsTTL)
+	// --- Global Deduplicated Hosts Loading ---
+	LogInfo("--- Loading Hosts (Global Deduplication Phase) ---")
+	
+	// 1. Collect all unique paths and URLs
+	uniquePaths := make([]string, 0)
+	uniqueUrls := make([]string, 0)
+	pathMap := make(map[string]bool)
+	urlMap := make(map[string]bool)
+
+	collect := func(paths, urls []string) {
+		for _, p := range paths {
+			if !pathMap[p] {
+				pathMap[p] = true
+				uniquePaths = append(uniquePaths, p)
+			}
+		}
+		for _, u := range urls {
+			if !urlMap[u] {
+				urlMap[u] = true
+				uniqueUrls = append(uniqueUrls, u)
+			}
+		}
 	}
 
-	LogInfo("[RULE] Loaded 'DEFAULT' (Strategy: %s)", cfg.Routing.DefaultRule.Strategy)
+	// Collect from Rules
+	for _, rule := range cfg.Routing.RoutingRules {
+		collect(rule.HostsFiles, rule.HostsURLs)
+	}
+	// Collect from Default Rule
+	collect(cfg.Routing.DefaultRule.HostsFiles, cfg.Routing.DefaultRule.HostsURLs)
+
+	// 2. Load all sources once (concurrently)
+	sourceCache := BatchLoadSources(uniquePaths, uniqueUrls)
+
+	// 3. Assemble per-rule caches from shared sources (parallel assembly)
+	var assemblyWg sync.WaitGroup
+
+	// Assemble Rules
+	for i := range cfg.Routing.RoutingRules {
+		rule := &cfg.Routing.RoutingRules[i]
+		if len(rule.HostsFiles) > 0 || len(rule.HostsURLs) > 0 {
+			assemblyWg.Add(1)
+			go func(r *RoutingRule) {
+				defer assemblyWg.Done()
+				hc := NewHostsCache()
+				hc.SetTTL(uint32(cfg.Cache.HostsTTL))
+				names, ips := hc.LoadFromCache(r.HostsFiles, r.HostsURLs, sourceCache, r.HostsWildcard, r.HostsOptimize)
+				r.parsedHosts = hc
+				LogInfo("[RULE] Loaded hosts for '%s' (Names: %d, IPs: %d)", r.Name, names, ips)
+			}(rule)
+		}
+	}
+
+	// Assemble Default Rule
+	if len(cfg.Routing.DefaultRule.HostsFiles) > 0 || len(cfg.Routing.DefaultRule.HostsURLs) > 0 {
+		assemblyWg.Add(1)
+		go func() {
+			defer assemblyWg.Done()
+			hc := NewHostsCache()
+			hc.SetTTL(uint32(cfg.Cache.HostsTTL))
+			names, ips := hc.LoadFromCache(cfg.Routing.DefaultRule.HostsFiles, cfg.Routing.DefaultRule.HostsURLs, sourceCache, cfg.Routing.DefaultRule.HostsWildcard, cfg.Routing.DefaultRule.HostsOptimize)
+			cfg.Routing.DefaultRule.parsedHosts = hc
+			LogInfo("[RULE] Loaded hosts for 'DEFAULT' (Names: %d, IPs: %d)", names, ips)
+		}()
+	}
+
+	// Wait for assembly to finish
+	assemblyWg.Wait()
+
+	LogInfo("--- Rule: DEFAULT ---")
 	LogInfo("   ├─ Match: * (Catch-All)")
-	LogInfo("   └─ Upstreams (%d):", len(cfg.Routing.DefaultRule.parsedUpstreams))
+	LogInfo("   └─ Forward: Strategy=%s, Upstreams=%d", cfg.Routing.DefaultRule.Strategy, len(cfg.Routing.DefaultRule.parsedUpstreams))
 	for _, u := range cfg.Routing.DefaultRule.parsedUpstreams {
 		LogInfo("      - %s", u.String())
 	}
@@ -529,7 +596,33 @@ func logMatchConditions(m *MatchConditions) {
 	if len(m.ClientIP) > 0 {
 		LogInfo("   ├─ Match OR: Client IP = %v", []string(m.ClientIP))
 	}
-	// (Other logging omitted for brevity but should be present in real file if needed)
+	if len(m.ClientCIDR) > 0 {
+		LogInfo("   ├─ Match OR: Client CIDR = %v", []string(m.ClientCIDR))
+	}
+	if len(m.ClientMAC) > 0 {
+		LogInfo("   ├─ Match OR: Client MAC = %v", []string(m.ClientMAC))
+	}
+	if len(m.ClientECS) > 0 {
+		LogInfo("   ├─ Match OR: Client ECS = %v", []string(m.ClientECS))
+	}
+	if len(m.ClientEDNSMAC) > 0 {
+		LogInfo("   ├─ Match OR: Client EDNS MAC = %v", []string(m.ClientEDNSMAC))
+	}
+	if len(m.ServerIP) > 0 {
+		LogInfo("   ├─ Match OR: Server IP = %v", []string(m.ServerIP))
+	}
+	if len(m.ServerPort) > 0 {
+		LogInfo("   ├─ Match OR: Server Port = %v", []int(m.ServerPort))
+	}
+	if len(m.ServerHostname) > 0 {
+		LogInfo("   ├─ Match OR: Server Hostname = %v", []string(m.ServerHostname))
+	}
+	if len(m.ServerPath) > 0 {
+		LogInfo("   ├─ Match OR: Server Path = %v", []string(m.ServerPath))
+	}
+	if len(m.QueryDomain) > 0 {
+		LogInfo("   ├─ Match OR: Query Domain = %v", []string(m.QueryDomain))
+	}
 }
 
 func parsePrefetchConfig(p *PrefetchConfig) error {

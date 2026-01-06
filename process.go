@@ -4,6 +4,7 @@ Version: 2.3.4
 Description: Handles the core processing logic for DNS requests.
              UPDATED: Enhanced logging to show "no-op" decisions for TTL/Response logic when enabled.
              OPTIMIZED: Use pre-lowercased QueryName for cache keys and hosts lookup to avoid redundant allocations.
+             UPDATED: Included Rule Name in request logging for consistent tracing.
 */
 
 package main
@@ -231,11 +232,11 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 			if len(answers) > 0 {
 				resp.Answer = answers
 				LogDebug("[PROCESS] Serving from HOSTS file (Rule: %s)", ruleName)
-				logRequest(r.Id, reqCtx, qInfo, "", "NOERROR (HOSTS)", "HOSTS", 0, time.Since(start), resp)
+				logRequest(r.Id, reqCtx, ruleName, qInfo, "", "NOERROR (HOSTS)", "HOSTS", 0, time.Since(start), resp)
 			} else {
 				resp.Rcode = dns.RcodeNameError
 				LogDebug("[PROCESS] Serving NXDOMAIN from HOSTS file (Rule: %s, Type mismatch or Blocked PTR)", ruleName)
-				logRequest(r.Id, reqCtx, qInfo, "", "NXDOMAIN (HOSTS)", "HOSTS", 0, time.Since(start), resp)
+				logRequest(r.Id, reqCtx, ruleName, qInfo, "", "NXDOMAIN (HOSTS)", "HOSTS", 0, time.Since(start), resp)
 			}
 
 			w.WriteMsg(resp)
@@ -251,15 +252,15 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 
 			var status string
 			if isNegative {
-				status = fmt.Sprintf("CACHE_HIT (%s, NEG, TTL:%ds)", ruleName, remainingTTL)
+				status = fmt.Sprintf("CACHE_HIT (NEG, TTL:%ds)", remainingTTL)
 			} else {
-				status = fmt.Sprintf("CACHE_HIT (%s, TTL:%ds)", ruleName, remainingTTL)
+				status = fmt.Sprintf("CACHE_HIT (TTL:%ds)", remainingTTL)
 			}
 
 			// Sort Cache Response if configured
 			sortResponse(cachedResp)
 
-			logRequest(r.Id, reqCtx, qInfo, "", status, "CACHE", 0, time.Since(start), cachedResp)
+			logRequest(r.Id, reqCtx, ruleName, qInfo, "", status, "CACHE", 0, time.Since(start), cachedResp)
 			w.WriteMsg(cachedResp)
 			return
 		}
@@ -379,7 +380,7 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		status = fmt.Sprintf("%s (COALESCED)", status)
 	}
 
-	logRequest(r.Id, reqCtx, qInfo, upstreamQInfo, status, qr.upstreamStr, qr.rtt, time.Since(start), resp)
+	logRequest(r.Id, reqCtx, ruleName, qInfo, upstreamQInfo, status, qr.upstreamStr, qr.rtt, time.Since(start), resp)
 
 	resp.Id = r.Id
 	w.WriteMsg(resp)
@@ -1074,7 +1075,7 @@ func raceStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, reqC
 
 // --- Helpers ---
 
-func logRequest(qid uint16, reqCtx *RequestContext, qInfo, upstreamQInfo, status, upstream string, upstreamRTT, duration time.Duration, resp *dns.Msg) {
+func logRequest(qid uint16, reqCtx *RequestContext, ruleName, qInfo, upstreamQInfo, status, upstream string, upstreamRTT, duration time.Duration, resp *dns.Msg) {
 	macStr := "N/A"
 	if reqCtx.ClientMAC != nil {
 		macStr = reqCtx.ClientMAC.String()
@@ -1094,15 +1095,15 @@ func logRequest(qid uint16, reqCtx *RequestContext, qInfo, upstreamQInfo, status
 	}
 	ingress := sb.String()
 
-	LogInfo("[QRY] QID:%d | Client:%s | MAC:%s | Proto:%s | Ingress:%s | Query:%s",
-		qid, reqCtx.ClientIP, macStr, reqCtx.Protocol, ingress, qInfo)
+	LogInfo("[QRY] QID:%d | Rule:%s | Client:%s | MAC:%s | Proto:%s | Ingress:%s | Query:%s",
+		qid, ruleName, reqCtx.ClientIP, macStr, reqCtx.Protocol, ingress, qInfo)
 
 	if upstream != "" && upstream != "CACHE" {
 		useInfo := qInfo
 		if upstreamQInfo != "" {
 			useInfo = upstreamQInfo
 		}
-		LogInfo("[FWD] QID:%d | Upstream:%s | RTT:%v | Query:%s | Response:%s", qid, upstream, upstreamRTT, useInfo, status)
+		LogInfo("[FWD] QID:%d | Rule:%s | Upstream:%s | RTT:%v | Query:%s | Response:%s", qid, ruleName, upstream, upstreamRTT, useInfo, status)
 	}
 
 	sb.Reset()
