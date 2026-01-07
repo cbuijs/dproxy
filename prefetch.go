@@ -1,9 +1,8 @@
 /*
 File: prefetch.go
-Version: 1.2.0
+Version: 1.4.0
 Description: Implements cache prefetching and cross-record fetching for DNS queries.
-             UPDATED: Applied TTL clamping and strategy to prefetched entries BEFORE caching.
-             UPDATED: Enhanced logging to explicitly confirm caching of cross-fetched results.
+             UPDATED: Passing routingKey (ruleName) to forwardToUpstreams for correct logging.
 */
 
 package main
@@ -12,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -103,8 +103,30 @@ func initPrefetch() {
 // --- Cross-Fetch Logic ---
 
 // AttemptCrossFetch queues a prefetch request non-blocking.
-// If the queue is full, the request is dropped to save resources.
+// If the queue is full or system load is high, the request is dropped to save resources.
 func AttemptCrossFetch(req prefetchReq) {
+	// --- LOAD SHEDDING CHECKS ---
+	if config.Cache.Prefetch.LoadShedding.Enabled {
+		ls := config.Cache.Prefetch.LoadShedding
+		
+		// 1. Check Global Goroutine Count (System Load)
+		if ls.MaxGoroutines > 0 {
+			if current := runtime.NumGoroutine(); current > ls.MaxGoroutines {
+				LogDebug("[PREFETCH] Load shedding: Too many goroutines (%d > %d), dropping %s", current, ls.MaxGoroutines, req.qName)
+				return
+			}
+		}
+
+		// 2. Check Prefetch Queue Depth (Worker Load)
+		if ls.MaxQueueUsagePct > 0 && ls.MaxQueueUsagePct < 100 {
+			usage := (len(prefetchCh) * 100) / cap(prefetchCh)
+			if usage > ls.MaxQueueUsagePct {
+				LogDebug("[PREFETCH] Load shedding: Queue %d%% full (limit %d%%), dropping %s", usage, ls.MaxQueueUsagePct, req.qName)
+				return
+			}
+		}
+	}
+
 	select {
 	case prefetchCh <- req:
 		// Queued successfully
@@ -160,8 +182,6 @@ func processCrossFetch(req prefetchReq) {
 		// Try to acquire semaphore (network limiter)
 		select {
 		case crossFetchLimiter <- struct{}{}:
-			// Execute synchronously in the worker (the worker pool size limits concurrency anyway)
-			// We keep the limiter pattern in case we want different sizing for CPU vs Network later
 			func(ft uint16, key string) {
 				defer func() {
 					<-crossFetchLimiter
@@ -169,7 +189,6 @@ func processCrossFetch(req prefetchReq) {
 				}()
 
 				// Reconstruct context from struct
-				// Note: RequestContext here is partial, only IP/MAC are preserved
 				reqCtx := &RequestContext{
 					ClientIP:  req.clientIP,
 					ClientMAC: req.clientMAC,
@@ -177,7 +196,6 @@ func processCrossFetch(req prefetchReq) {
 				doCrossFetch(req.qName, ft, req.routingKey, key, req.upstreams, req.strategy, reqCtx)
 			}(fetchType, cacheKey)
 		default:
-			// Limiter full, skip this specific type
 			inFlightPrefetch.Delete(cacheKey)
 			LogDebug("[PREFETCH] Network limiter full, skipping %s %s", req.qName, dns.TypeToString[fetchType])
 		}
@@ -185,9 +203,7 @@ func processCrossFetch(req prefetchReq) {
 }
 
 // TriggerCrossFetch is DEPRECATED in favor of AttemptCrossFetch + Worker Pool.
-// Kept only if needed by legacy code, but effectively replaced by AttemptCrossFetch.
 func TriggerCrossFetch(qName string, qType uint16, routingKey string, upstreams []*Upstream, strategy string, reqCtx *RequestContext) {
-	// Wrapper for compatibility, though process.go now calls AttemptCrossFetch directly
 	req := prefetchReq{
 		qName:      qName,
 		qType:      qType,
@@ -228,8 +244,8 @@ func doCrossFetch(qName string, qType uint16, routingKey, cacheKey string, upstr
 		addEDNS0Options(msg, reqCtx.ClientIP, reqCtx.ClientMAC)
 	}
 
-	// Forward to upstreams
-	resp, upstreamStr, rtt, err := forwardToUpstreams(ctx, msg, upstreams, strategy, reqCtx)
+	// Forward to upstreams with RuleName
+	resp, upstreamStr, rtt, err := forwardToUpstreams(ctx, msg, upstreams, strategy, routingKey, reqCtx)
 	putMsg(msg)
 
 	if err != nil {
@@ -245,12 +261,9 @@ func doCrossFetch(qName string, qType uint16, routingKey, cacheKey string, upstr
 	// Clean and cache the response
 	cleanResponse(resp)
 
-	// FIX: Apply TTL clamping and strategy logic BEFORE adding to cache
-	// This ensures consistency between live responses and prefetched responses
 	applyTTLClamping(resp)
 	applyTTLStrategy(resp)
 	
-	// REQUIREMENT: Make sure that any cross-fetched responses are cached.
 	addToCache(cacheKey, resp)
 
 	LogInfo("[PREFETCH] Cached & Cross-fetched %s %s from %s (RTT: %v, Total: %v, Answers: %d)",
@@ -259,7 +272,6 @@ func doCrossFetch(qName string, qType uint16, routingKey, cacheKey string, upstr
 
 // --- Stale Refresh Logic ---
 
-// maintainStaleRefresh runs the background loop for proactive cache refresh
 func maintainStaleRefresh(ctx context.Context) {
 	cfg := config.Cache.Prefetch.StaleRefresh
 
@@ -302,15 +314,12 @@ func scanAndRefreshStale(ctx context.Context) {
 
 	var toRefresh []staleRefreshCandidate
 
-	// Use ScanCacheForStale helper from cache.go to iterate the sharded cache safely
+	// Use ScanCacheForStale helper from cache.go
 	ScanCacheForStale(thresholdPct, minHits, func(entry *CacheItem, hitCount int64) {
-		// Check if already being refreshed
 		if _, inFlight := inFlightPrefetch.Load(entry.Key); inFlight {
 			return
 		}
 
-		// Recalculate remainingPct for logging purposes
-		// (ScanCacheForStale already verified it's below threshold)
 		remainingPct := 0
 		if entry.OriginalTTL > 0 {
 			remaining := entry.Expiration.Sub(time.Now())
@@ -334,14 +343,11 @@ func scanAndRefreshStale(ctx context.Context) {
 
 	LogDebug("[PREFETCH] Found %d stale entries to refresh", len(toRefresh))
 
-	// Refresh candidates
 	for _, candidate := range toRefresh {
-		// Check if already in-flight
 		if _, loaded := inFlightPrefetch.LoadOrStore(candidate.key, struct{}{}); loaded {
 			continue
 		}
 
-		// Try to acquire semaphore (non-blocking)
 		select {
 		case staleRefreshLimiter <- struct{}{}:
 			go func(c staleRefreshCandidate) {
@@ -376,12 +382,9 @@ func doStaleRefresh(ctx context.Context, c staleRefreshCandidate) {
 
 	start := time.Now()
 
-	// Get upstreams for this routing key
-	// For stale refresh, we use default upstreams since we don't have client context
 	upstreams := config.Routing.DefaultRule.parsedUpstreams
 	strategy := config.Routing.DefaultRule.Strategy
 
-	// If routing key is not DEFAULT, we need to find the right rule
 	if c.routingKey != "DEFAULT" {
 		for _, rule := range config.Routing.RoutingRules {
 			if rule.Name == c.routingKey {
@@ -392,16 +395,13 @@ func doStaleRefresh(ctx context.Context, c staleRefreshCandidate) {
 		}
 	}
 
-	// Build refresh query
 	msg := getMsg()
 	msg.SetQuestion(dns.Fqdn(c.qName), c.qType)
 	msg.RecursionDesired = true
-
-	// Empty request context for background refresh
 	reqCtx := &RequestContext{}
 
-	// Forward to upstreams
-	resp, upstreamStr, rtt, err := forwardToUpstreams(ctx, msg, upstreams, strategy, reqCtx)
+	// Forward with rule name (c.routingKey)
+	resp, upstreamStr, rtt, err := forwardToUpstreams(ctx, msg, upstreams, strategy, c.routingKey, reqCtx)
 	putMsg(msg)
 
 	if err != nil {
@@ -414,11 +414,7 @@ func doStaleRefresh(ctx context.Context, c staleRefreshCandidate) {
 		return
 	}
 
-	// Clean and cache the response
 	cleanResponse(resp)
-
-	// FIX: Apply TTL clamping and strategy logic BEFORE adding to cache
-	// This ensures consistency between live responses and refreshed responses
 	applyTTLClamping(resp)
 	applyTTLStrategy(resp)
 
@@ -430,19 +426,15 @@ func doStaleRefresh(ctx context.Context, c staleRefreshCandidate) {
 
 // --- Helper Functions ---
 
-// buildPrefetchCacheKey constructs a cache key for a given query (used by prefetch)
 func buildPrefetchCacheKey(qName string, qType, qClass uint16, routingKey string) string {
-	// Use numeric encoding to match process.go cache key format
 	return fmt.Sprintf("%s|%d|%d|%s", dns.Fqdn(qName), qType, qClass, routingKey)
 }
 
-// recordCacheHit increments the hit counter for a cache key
 func recordCacheHit(key string) {
 	counter, _ := cacheHitCounter.LoadOrStore(key, &atomic.Int64{})
 	counter.(*atomic.Int64).Add(1)
 }
 
-// getCacheHitCount returns the hit count for a cache key
 func getCacheHitCount(key string) int64 {
 	counter, ok := cacheHitCounter.Load(key)
 	if !ok {
@@ -451,12 +443,10 @@ func getCacheHitCount(key string) int64 {
 	return counter.(*atomic.Int64).Load()
 }
 
-// resetCacheHitCount removes the hit counter for a cache key (called on eviction)
 func resetCacheHitCount(key string) {
 	cacheHitCounter.Delete(key)
 }
 
-// parseFetchTypes converts string type names to DNS type codes
 func parseFetchTypes(types []string) []uint16 {
 	result := make([]uint16, 0, len(types))
 	for _, t := range types {
@@ -469,7 +459,6 @@ func parseFetchTypes(types []string) []uint16 {
 	return result
 }
 
-// typeListToStrings converts a list of DNS type codes to their string names
 func typeListToStrings(types []uint16) []string {
 	result := make([]string, len(types))
 	for i, t := range types {

@@ -1,8 +1,10 @@
 /*
 File: upstream.go
-Version: 1.4.0
+Version: 1.6.0
 Last Update: 2026-01-07
 Description: Defines the Upstream struct and handles downstream connection logic, pooling, and protocol-specific exchanges.
+             UPDATED: Added QPS Rate Limiting per upstream.
+             UPDATED: executeExchange now returns the used IP address (targetAddr) for improved logging visibility.
              OPTIMIZED: DoH client now reuses buffers for request packing to reduce allocation.
              OPTIMIZED: Response reading now uses LimitReader to prevent DoS.
 */
@@ -23,6 +25,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,6 +34,7 @@ import (
 	"github.com/miekg/dns"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+	"golang.org/x/time/rate"
 )
 
 // Circuit Breaker Constants
@@ -75,6 +79,9 @@ type Upstream struct {
 	httpClient *http.Client
 	h3Client   *http.Client
 
+	// Rate Limiter
+	limiter *rate.Limiter
+
 	// Circuit Breaker State
 	cbFailures  atomic.Uint32
 	cbOpen      atomic.Bool
@@ -97,6 +104,14 @@ func (u *Upstream) DynamicString(rc *RequestContext) string {
 		s += fmt.Sprintf("#%s", u.BootstrapIP)
 	}
 	return s
+}
+
+// Allow checks if the upstream has capacity for a request (QPS limit).
+func (u *Upstream) Allow() bool {
+	if u.limiter == nil {
+		return true
+	}
+	return u.limiter.Allow()
 }
 
 // --- Variable Replacement Helper ---
@@ -515,6 +530,21 @@ func parseUpstream(raw string, ipVersion string, insecure bool, timeout string) 
 		return nil, err
 	}
 
+	// Extract QPS from query params if present
+	qpsLimit := 0
+	if qpsStr := uUrl.Query().Get("qps"); qpsStr != "" {
+		if v, err := strconv.Atoi(qpsStr); err == nil && v > 0 {
+			qpsLimit = v
+		}
+	}
+
+	// Clean up query params from stored URL to avoid clutter
+	if len(uUrl.RawQuery) > 0 {
+		q := uUrl.Query()
+		q.Del("qps")
+		uUrl.RawQuery = q.Encode()
+	}
+
 	proto := strings.ToLower(uUrl.Scheme)
 	switch proto {
 	case "tls":
@@ -549,6 +579,17 @@ func parseUpstream(raw string, ipVersion string, insecure bool, timeout string) 
 		URL: uUrl, Proto: proto, Host: host,
 		Port: port, BootstrapIP: bootstrap, Path: path,
 		bootstrapIPVersion: ipVersion,
+	}
+
+	// Init Rate Limiter if QPS configured
+	if qpsLimit > 0 {
+		// Burst size 2x QPS or min 10
+		burst := qpsLimit * 2
+		if burst < 10 {
+			burst = 10
+		}
+		up.limiter = rate.NewLimiter(rate.Limit(qpsLimit), burst)
+		LogInfo("[UPSTREAM] Configured QPS limit for %s: %d (Burst: %d)", up.String(), qpsLimit, burst)
 	}
 
 	// Initialize HTTP clients
@@ -652,9 +693,14 @@ func resolveHostnameWithBootstrap(ctx context.Context, hostname string, preferre
 
 // --- Exchange ---
 
-func (u *Upstream) executeExchange(ctx context.Context, req *dns.Msg, reqCtx *RequestContext) (*dns.Msg, time.Duration, error) {
+func (u *Upstream) executeExchange(ctx context.Context, req *dns.Msg, reqCtx *RequestContext) (*dns.Msg, string, time.Duration, error) {
+	// Check QPS Limit
+	if !u.Allow() {
+		return nil, "", 0, fmt.Errorf("QPS limit exceeded for %s", u.String())
+	}
+
 	if !u.IsHealthy() {
-		return nil, 0, fmt.Errorf("circuit open for %s", u.String())
+		return nil, "", 0, fmt.Errorf("circuit open for %s", u.String())
 	}
 
 	start := time.Now()
@@ -673,7 +719,7 @@ func (u *Upstream) executeExchange(ctx context.Context, req *dns.Msg, reqCtx *Re
 	if err == nil && resp != nil {
 		u.recordSuccess()
 		u.updateRTT(rtt, resp.Rcode)
-		return resp, rtt, nil
+		return resp, targetAddr, rtt, nil
 	}
 
 	shouldRecordFailure := true
@@ -687,7 +733,7 @@ func (u *Upstream) executeExchange(ctx context.Context, req *dns.Msg, reqCtx *Re
 		u.recordFailure()
 	}
 
-	return nil, rtt, err
+	return nil, targetAddr, rtt, err
 }
 
 func (u *Upstream) doExchange(ctx context.Context, req *dns.Msg, targetAddr string, reqCtx *RequestContext) (*dns.Msg, error) {

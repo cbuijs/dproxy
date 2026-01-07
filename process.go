@@ -1,16 +1,9 @@
 /*
 File: process.go
-Version: 3.0.0
+Version: 3.1.0
 Last Update: 2026-01-07
 Description: Handles the core processing logic for DNS requests.
-             REFACTORED: Logic split into context.go, edns.go, response.go, and strategy.go for maintainability.
-             OPTIMIZED: "Cache-First" Strategy. Internal DNS Cache is checked BEFORE Hosts files.
-             OPTIMIZED: Hosts file responses are now cached in the internal DNS Cache.
-             OPTIMIZED: Response sorting and processing happens ONCE before caching.
-             OPTIMIZED: Implemented "Serve-Stale" (Stale-While-Revalidate) to pipeline upstream fetches out of the hot path.
-             OPTIMIZED: Log message construction is now gated by IsInfoEnabled checks to reduce allocations in hot paths.
-             UPDATED: Strict Cross-Fetch trigger logic. Only initiates on Cache Miss AND specific types (A/AAAA).
-             UPDATED: DDR responses now use configured HostName as SVCB Target.
+             UPDATED: Pass 'ruleName' to forwarding logic for better logging context.
 */
 
 package main
@@ -200,7 +193,8 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		uCtx, cancel := context.WithTimeout(context.Background(), upstreamTimeout)
 		defer cancel()
 
-		resp, upstreamStr, rtt, err := forwardToUpstreams(uCtx, msg, selectedUpstreams, selectedStrategy, safeReqCtx)
+		// PASS ruleName to strategy
+		resp, upstreamStr, rtt, err := forwardToUpstreams(uCtx, msg, selectedUpstreams, selectedStrategy, ruleName, safeReqCtx)
 		if err != nil {
 			return nil, err
 		}

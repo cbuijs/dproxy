@@ -1,7 +1,8 @@
 /*
 File: config.go
-Version: 2.7.0
+Version: 2.8.0
 Description: Defines configuration structures and handles YAML parsing and validation.
+             UPDATED: Added LoadSheddingConfig to PrefetchConfig to limit background work under load.
              UPDATED: Fixed struct field names to match usage (parsedClientMACs -> parsedClientMACs).
              UPDATED: Ensures MatchConditions struct has all required fields.
 */
@@ -138,6 +139,13 @@ type CacheConfig struct {
 type PrefetchConfig struct {
 	CrossFetch   CrossFetchConfig   `yaml:"cross_fetch"`
 	StaleRefresh StaleRefreshConfig `yaml:"stale_refresh"`
+	LoadShedding LoadSheddingConfig `yaml:"load_shedding"`
+}
+
+type LoadSheddingConfig struct {
+	Enabled          bool `yaml:"enabled"`
+	MaxGoroutines    int  `yaml:"max_goroutines"`     // Drop prefetch if runtime.NumGoroutine > this
+	MaxQueueUsagePct int  `yaml:"max_queue_usage_pct"` // Drop prefetch if worker queue > X% full
 }
 
 type CrossFetchConfig struct {
@@ -727,6 +735,23 @@ func parsePrefetchConfig(p *PrefetchConfig) error {
 	}
 	sr.parsedCheckInterval = d
 
+	// Load Shedding Defaults
+	ls := &p.LoadShedding
+	// Enable by default if not explicitly disabled in config (assuming user wants stability)
+	// We check if it was present in YAML, but since bool defaults to false, we can't easily distinguish "not set" from "false".
+	// For safety, we will assume if max_goroutines or max_queue is set, it's enabled.
+	// Or we just default it to enabled = true if it's 0/false but MaxGoroutines is set?
+	// Let's just set reasonable defaults if values are missing.
+	
+	if ls.MaxGoroutines == 0 {
+		ls.MaxGoroutines = 10000 // High default limit
+	}
+	if ls.MaxQueueUsagePct == 0 {
+		ls.MaxQueueUsagePct = 80 // Start shedding at 80% capacity
+	}
+	// Note: We don't force ls.Enabled = true here to allow user to explicitly disable it if they want.
+	// But in InitPrefetch or main logic we can treat it accordingly.
+	
 	LogInfo("=== Prefetch Configuration ===")
 	LogInfo("Cross-Fetch: Enabled=%v, Mode=%s", cf.Enabled, cf.Mode)
 	if cf.Enabled {
@@ -737,6 +762,11 @@ func parsePrefetchConfig(p *PrefetchConfig) error {
 	if sr.Enabled {
 		LogInfo("  ThresholdPercent: %d%%, MinHits: %d", sr.ThresholdPercent, sr.MinHits)
 		LogInfo("  MaxConcurrent: %d, CheckInterval: %v", sr.MaxConcurrent, sr.parsedCheckInterval)
+	}
+	LogInfo("Load-Shedding: Enabled=%v", ls.Enabled)
+	if ls.Enabled {
+		LogInfo("  MaxGoroutines: %d", ls.MaxGoroutines)
+		LogInfo("  MaxQueueUsagePct: %d%%", ls.MaxQueueUsagePct)
 	}
 	LogInfo("==============================")
 

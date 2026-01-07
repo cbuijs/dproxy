@@ -1,9 +1,12 @@
 /*
 File: strategy.go
-Version: 1.0.0
+Version: 1.4.0
 Description: Implements upstream selection strategies (Round-Robin, Random, Failover, Fastest, Race)
              and the main forwarder logic.
-             Extracted from process.go for modularity.
+             UPDATED: Strategies now check upstream.Allow() (QPS limit) and skip busy upstreams.
+             UPDATED: Strategies now capture and format the specific Upstream IP address used for logging.
+             UPDATED: Added comparative logging to Fastest strategy to explain selection "why".
+             UPDATED: All strategies now accept 'ruleName' for better context in logs.
 */
 
 package main
@@ -15,47 +18,56 @@ import (
 	"math/rand/v2"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/miekg/dns"
 )
 
-var raceLimiter = make(chan struct{}, 4096)
+var (
+	raceLimiter       = make(chan struct{}, 4096)
+	lastFastestWinner sync.Map // map[string]string (RuleName -> Upstream URL)
+)
 
-func forwardToUpstreams(ctx context.Context, req *dns.Msg, upstreams []*Upstream, strategy string, reqCtx *RequestContext) (*dns.Msg, string, time.Duration, error) {
+func forwardToUpstreams(ctx context.Context, req *dns.Msg, upstreams []*Upstream, strategy string, ruleName string, reqCtx *RequestContext) (*dns.Msg, string, time.Duration, error) {
 	if len(upstreams) == 0 {
 		return nil, "", 0, errors.New("no upstreams available")
 	}
 
 	if len(upstreams) == 1 {
 		u := upstreams[0]
-		resp, rtt, err := u.executeExchange(ctx, req, reqCtx)
-		return resp, u.DynamicString(reqCtx), rtt, err
+		// Still check QPS for single upstream
+		if !u.Allow() {
+			return nil, "", 0, fmt.Errorf("upstream %s is rate limited (QPS exceeded)", u.String())
+		}
+		resp, addr, rtt, err := u.executeExchange(ctx, req, reqCtx)
+		return resp, fmt.Sprintf("%s (%s)", u.DynamicString(reqCtx), addr), rtt, err
 	}
 
 	strat := strings.ToLower(strategy)
 
 	switch strat {
 	case "round-robin":
-		return roundRobinStrategy(ctx, req, upstreams, reqCtx)
+		return roundRobinStrategy(ctx, req, upstreams, ruleName, reqCtx)
 	case "random":
-		return randomStrategy(ctx, req, upstreams, reqCtx)
+		return randomStrategy(ctx, req, upstreams, ruleName, reqCtx)
 	case "failover":
-		return failoverStrategy(ctx, req, upstreams, reqCtx)
+		return failoverStrategy(ctx, req, upstreams, ruleName, reqCtx)
 	case "fastest":
-		return fastestStrategy(ctx, req, upstreams, reqCtx)
+		return fastestStrategy(ctx, req, upstreams, ruleName, reqCtx)
 	case "race":
-		return raceStrategy(ctx, req, upstreams, reqCtx)
+		return raceStrategy(ctx, req, upstreams, ruleName, reqCtx)
 	default:
 		LogWarn("[STRATEGY] Unknown strategy '%s', using failover", strategy)
-		return failoverStrategy(ctx, req, upstreams, reqCtx)
+		return failoverStrategy(ctx, req, upstreams, ruleName, reqCtx)
 	}
 }
 
-func roundRobinStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, reqCtx *RequestContext) (*dns.Msg, string, time.Duration, error) {
+func roundRobinStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, ruleName string, reqCtx *RequestContext) (*dns.Msg, string, time.Duration, error) {
 	startIdx := rrCounter.Add(1) - 1
 	n := len(upstreams)
 
+	// Try all upstreams starting from the RR index
 	for i := 0; i < n; i++ {
 		idx := (int(startIdx) + i) % n
 		u := upstreams[idx]
@@ -64,20 +76,27 @@ func roundRobinStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream
 			continue
 		}
 
-		LogDebug("[STRATEGY] Round-Robin: Selected #%d/%d: %s", idx+1, n, u.String())
-		resp, rtt, err := u.executeExchange(ctx, req, reqCtx)
-		if err == nil {
-			LogDebug("[STRATEGY] Round-Robin: Success with %s (RTT: %v)", u.DynamicString(reqCtx), rtt)
-			return resp, u.DynamicString(reqCtx), rtt, nil
+		// Check QPS Limit
+		if !u.Allow() {
+			LogDebug("[STRATEGY] Round-Robin (%s): Skipping busy upstream %s", ruleName, u.String())
+			continue
 		}
 
-		LogWarn("[STRATEGY] Round-Robin: Failed with %s: %v", u.DynamicString(reqCtx), err)
+		LogDebug("[STRATEGY] Round-Robin (%s): Selected #%d/%d: %s", ruleName, idx+1, n, u.String())
+		resp, addr, rtt, err := u.executeExchange(ctx, req, reqCtx)
+		if err == nil {
+			logStr := fmt.Sprintf("%s (%s)", u.DynamicString(reqCtx), addr)
+			LogDebug("[STRATEGY] Round-Robin (%s): Success with %s (RTT: %v)", ruleName, logStr, rtt)
+			return resp, logStr, rtt, nil
+		}
+
+		LogWarn("[STRATEGY] Round-Robin (%s): Failed with %s: %v", ruleName, u.DynamicString(reqCtx), err)
 	}
 
-	return nil, "", 0, fmt.Errorf("all upstreams failed or unhealthy in round-robin")
+	return nil, "", 0, fmt.Errorf("all upstreams failed, busy, or unhealthy in round-robin")
 }
 
-func randomStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, reqCtx *RequestContext) (*dns.Msg, string, time.Duration, error) {
+func randomStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, ruleName string, reqCtx *RequestContext) (*dns.Msg, string, time.Duration, error) {
 	n := len(upstreams)
 	startIdx := rand.IntN(n)
 
@@ -89,36 +108,48 @@ func randomStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, re
 			continue
 		}
 
-		LogDebug("[STRATEGY] Random: Trying #%d/%d: %s", idx+1, n, u.String())
-		resp, rtt, err := u.executeExchange(ctx, req, reqCtx)
-		if err == nil {
-			LogDebug("[STRATEGY] Random: Success with %s (RTT: %v)", u.DynamicString(reqCtx), rtt)
-			return resp, u.DynamicString(reqCtx), rtt, nil
+		if !u.Allow() {
+			LogDebug("[STRATEGY] Random (%s): Skipping busy upstream %s", ruleName, u.String())
+			continue
 		}
-		LogWarn("[STRATEGY] Random: Failed with %s: %v", u.DynamicString(reqCtx), err)
+
+		LogDebug("[STRATEGY] Random (%s): Trying #%d/%d: %s", ruleName, idx+1, n, u.String())
+		resp, addr, rtt, err := u.executeExchange(ctx, req, reqCtx)
+		if err == nil {
+			logStr := fmt.Sprintf("%s (%s)", u.DynamicString(reqCtx), addr)
+			LogDebug("[STRATEGY] Random (%s): Success with %s (RTT: %v)", ruleName, logStr, rtt)
+			return resp, logStr, rtt, nil
+		}
+		LogWarn("[STRATEGY] Random (%s): Failed with %s: %v", ruleName, u.DynamicString(reqCtx), err)
 	}
 
-	return nil, "", 0, fmt.Errorf("all upstreams failed or unhealthy in random")
+	return nil, "", 0, fmt.Errorf("all upstreams failed, busy, or unhealthy in random")
 }
 
-func failoverStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, reqCtx *RequestContext) (*dns.Msg, string, time.Duration, error) {
+func failoverStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, ruleName string, reqCtx *RequestContext) (*dns.Msg, string, time.Duration, error) {
 	for i, u := range upstreams {
 		if !u.IsHealthy() {
 			continue
 		}
 
-		LogDebug("[STRATEGY] Failover: Attempting #%d/%d: %s", i+1, len(upstreams), u.String())
-		resp, rtt, err := u.executeExchange(ctx, req, reqCtx)
-		if err == nil {
-			LogDebug("[STRATEGY] Failover: Success with %s (RTT: %v)", u.DynamicString(reqCtx), rtt)
-			return resp, u.DynamicString(reqCtx), rtt, nil
+		if !u.Allow() {
+			LogDebug("[STRATEGY] Failover (%s): Skipping busy upstream %s", ruleName, u.String())
+			continue
 		}
-		LogWarn("[STRATEGY] Failover: Failed %s: %v", u.DynamicString(reqCtx), err)
+
+		LogDebug("[STRATEGY] Failover (%s): Attempting #%d/%d: %s", ruleName, i+1, len(upstreams), u.String())
+		resp, addr, rtt, err := u.executeExchange(ctx, req, reqCtx)
+		if err == nil {
+			logStr := fmt.Sprintf("%s (%s)", u.DynamicString(reqCtx), addr)
+			LogDebug("[STRATEGY] Failover (%s): Success with %s (RTT: %v)", ruleName, logStr, rtt)
+			return resp, logStr, rtt, nil
+		}
+		LogWarn("[STRATEGY] Failover (%s): Failed %s: %v", ruleName, u.DynamicString(reqCtx), err)
 	}
-	return nil, "", 0, errors.New("all upstreams failed or unhealthy in failover")
+	return nil, "", 0, errors.New("all upstreams failed, busy, or unhealthy in failover")
 }
 
-func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, reqCtx *RequestContext) (*dns.Msg, string, time.Duration, error) {
+func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, ruleName string, reqCtx *RequestContext) (*dns.Msg, string, time.Duration, error) {
 	const (
 		explorationRate    = 0.15
 		staleThreshold     = 30 * time.Second
@@ -140,6 +171,14 @@ func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, r
 		if !u.IsHealthy() {
 			continue
 		}
+		
+		// Note: We check Allow() here to filter candidates, but we will check it again
+		// before execution in case of race/time-passed, though redundant it's safer for heavy load.
+		// For statistics gathering, it's better to exclude busy ones entirely from consideration.
+		if !u.Allow() {
+			// Do not log here to avoid spamming for every request if an upstream is saturated
+			continue 
+		}
 
 		rtt := u.getRTT()
 		lastProbe := u.getLastProbeTime()
@@ -153,20 +192,21 @@ func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, r
 	}
 
 	if len(stats) == 0 {
-		return nil, "", 0, errors.New("all upstreams are unhealthy (circuit open)")
+		return nil, "", 0, errors.New("all upstreams are unhealthy or busy")
 	}
 
+	// Sort by RTT (lowest first)
 	sort.Slice(stats, func(i, j int) bool {
 		rttI, rttJ := stats[i].rtt, stats[j].rtt
 		staleI, staleJ := stats[i].isStale, stats[j].isStale
 		if staleI != staleJ {
-			return !staleI
+			return !staleI // Prefer non-stale
 		}
 		if rttI == 0 && rttJ == 0 {
 			return stats[i].index < stats[j].index
 		}
 		if rttI == 0 {
-			return false
+			return false // Prefer proven RTT
 		}
 		if rttJ == 0 {
 			return true
@@ -174,8 +214,50 @@ func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, r
 		return rttI < rttJ
 	})
 
+	// --- Primary Selection Logic & Logging ---
 	best := stats[0].upstream
 	bestRTT := stats[0].rtt
+
+	// Check if the primary upstream has changed
+	prevURL, ok := lastFastestWinner.Load(ruleName)
+	if !ok || prevURL.(string) != best.String() {
+		// Calculate the "Why"
+		reason := "Initial selection"
+		if ok {
+			// Find previous winner stats to compare
+			var prevStat *upstreamStat
+			for i := range stats {
+				if stats[i].upstream.String() == prevURL.(string) {
+					prevStat = &stats[i]
+					break
+				}
+			}
+
+			if prevStat != nil {
+				reason = fmt.Sprintf("RTT Improved (%v < %v)", time.Duration(bestRTT), time.Duration(prevStat.rtt))
+				if bestRTT == 0 {
+					reason = "Previous was stale/failed, falling back to index order"
+				}
+			} else {
+				// If previous winner isn't in stats, it was filtered out (unhealthy or busy)
+				reason = "Previous upstream became unhealthy, busy, or removed"
+			}
+			
+			// Log the switch at INFO level so it's visible
+			LogInfo("[STRATEGY] Fastest (%s): Switched Primary -> %s. Reason: %s", ruleName, best.String(), reason)
+		}
+		lastFastestWinner.Store(ruleName, best.String())
+	} else {
+		// Still the same winner, just debug log the current comparison
+		if len(stats) > 1 {
+			LogDebug("[STRATEGY] Fastest (%s) Top 2: 1. %s (%v) | 2. %s (%v)",
+				ruleName,
+				stats[0].upstream.String(), time.Duration(stats[0].rtt),
+				stats[1].upstream.String(), time.Duration(stats[1].rtt))
+		}
+	}
+
+	// --- Exploration Logic ---
 	shouldExplore := false
 	var explorationTarget *Upstream
 	var explorationReason string
@@ -190,7 +272,7 @@ func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, r
 		if len(candidates) > 0 {
 			explorationTarget = candidates[rand.IntN(len(candidates))]
 			shouldExplore = true
-			explorationReason = "random exploration"
+			explorationReason = "Random Exploration"
 		}
 	}
 	if !shouldExplore {
@@ -198,7 +280,7 @@ func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, r
 			if s.rtt == 0 && now.Sub(s.lastProbed) > minProbeInterval {
 				explorationTarget = s.upstream
 				shouldExplore = true
-				explorationReason = "no RTT data available"
+				explorationReason = "No RTT Data"
 				break
 			}
 		}
@@ -206,21 +288,23 @@ func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, r
 	if !shouldExplore && stats[0].isStale {
 		explorationTarget = best
 		shouldExplore = true
-		explorationReason = "RTT data is stale"
+		explorationReason = "Primary Data Stale"
 	}
+	// "Competitive" exploration (if 2nd best is close to best)
 	if !shouldExplore && bestRTT > 0 && len(stats) > 1 {
 		for _, s := range stats[1:] {
 			if s.rtt > 0 && now.Sub(s.lastProbed) > minProbeInterval {
 				if float64(s.rtt) <= float64(bestRTT)/rttDifferenceRatio {
 					explorationTarget = s.upstream
 					shouldExplore = true
-					explorationReason = fmt.Sprintf("competitive RTT (%v vs best %v)", time.Duration(s.rtt), time.Duration(bestRTT))
+					explorationReason = fmt.Sprintf("Competitive RTT (%v ~ %v)", time.Duration(s.rtt), time.Duration(bestRTT))
 					break
 				}
 			}
 		}
 	}
 
+	// Trigger background probes for really stale upstreams
 	for _, s := range stats {
 		if now.Sub(s.lastProbed) > 3*staleThreshold {
 			go func(u *Upstream) {
@@ -238,45 +322,47 @@ func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, r
 	var selectedUpstream *Upstream
 	if shouldExplore && explorationTarget != nil {
 		selectedUpstream = explorationTarget
-		LogDebug("[STRATEGY] Fastest: EXPLORING %s (reason: %s)", selectedUpstream.String(), explorationReason)
+		// Exploration is a deviation from the "Best", so we log it at INFO to explain the choice
+		LogInfo("[STRATEGY] Fastest (%s): Exploring %s. Reason: %s", ruleName, selectedUpstream.String(), explorationReason)
 	} else {
 		selectedUpstream = best
-		LogDebug("[STRATEGY] Fastest: Selected %s (RTT: %v)", best.String(), time.Duration(bestRTT))
 	}
 
-	resp, rtt, err := selectedUpstream.executeExchange(ctx, req, reqCtx)
+	resp, addr, rtt, err := selectedUpstream.executeExchange(ctx, req, reqCtx)
 	if err != nil {
-		LogWarn("[STRATEGY] Fastest: Failed with %s: %v, trying alternatives", selectedUpstream.DynamicString(reqCtx), err)
+		LogWarn("[STRATEGY] Fastest (%s): Failed with %s: %v, trying alternatives", ruleName, selectedUpstream.DynamicString(reqCtx), err)
 		for _, s := range stats {
 			if s.upstream == selectedUpstream {
 				continue
 			}
 			u := s.upstream
-			resp, rtt, err = u.executeExchange(ctx, req, reqCtx)
+			resp, addr, rtt, err = u.executeExchange(ctx, req, reqCtx)
 			if err == nil {
-				LogDebug("[STRATEGY] Fastest Failover: Success with %s (RTT: %v)", u.DynamicString(reqCtx), rtt)
-				return resp, u.DynamicString(reqCtx), rtt, nil
+				logStr := fmt.Sprintf("%s (%s)", u.DynamicString(reqCtx), addr)
+				LogInfo("[STRATEGY] Fastest (%s): Failover success with %s (RTT: %v)", ruleName, logStr, rtt)
+				return resp, logStr, rtt, nil
 			}
 		}
 		return nil, "", 0, fmt.Errorf("all upstreams failed in fastest strategy")
 	}
 
-	return resp, selectedUpstream.DynamicString(reqCtx), rtt, nil
+	logStr := fmt.Sprintf("%s (%s)", selectedUpstream.DynamicString(reqCtx), addr)
+	return resp, logStr, rtt, nil
 }
 
-func raceStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, reqCtx *RequestContext) (*dns.Msg, string, time.Duration, error) {
+func raceStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, ruleName string, reqCtx *RequestContext) (*dns.Msg, string, time.Duration, error) {
 	candidates := make([]*Upstream, 0, len(upstreams))
 	for _, u := range upstreams {
-		if u.IsHealthy() {
+		if u.IsHealthy() && u.Allow() {
 			candidates = append(candidates, u)
 		}
 	}
 
 	if len(candidates) == 0 {
-		return nil, "", 0, errors.New("all upstreams are unhealthy (circuit open)")
+		return nil, "", 0, errors.New("all upstreams are unhealthy or busy")
 	}
 
-	LogDebug("[STRATEGY] Race: Starting race among %d upstreams (filtered from %d)", len(candidates), len(upstreams))
+	LogDebug("[STRATEGY] Race (%s): Starting race among %d upstreams", ruleName, len(candidates))
 
 	type result struct {
 		msg  *dns.Msg
@@ -298,14 +384,17 @@ func raceStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, reqC
 		go func(upstream *Upstream) {
 			defer func() { <-raceLimiter }()
 
-			resp, rtt, err := upstream.executeExchange(ctx, req, reqCtx)
+			resp, addr, rtt, err := upstream.executeExchange(ctx, req, reqCtx)
+			logStr := upstream.DynamicString(reqCtx)
+			if err == nil {
+				logStr = fmt.Sprintf("%s (%s)", logStr, addr)
+			}
+			
 			if err != nil {
-				LogWarn("[STRATEGY] Race: Upstream %s failed: %v", upstream.DynamicString(reqCtx), err)
-			} else {
-				LogDebug("[STRATEGY] Race: Upstream %s responded in %v", upstream.DynamicString(reqCtx), rtt)
+				LogWarn("[STRATEGY] Race (%s): Upstream %s failed: %v", ruleName, upstream.DynamicString(reqCtx), err)
 			}
 			select {
-			case resCh <- result{msg: resp, name: upstream.DynamicString(reqCtx), rtt: rtt, err: err}:
+			case resCh <- result{msg: resp, name: logStr, rtt: rtt, err: err}:
 			case <-ctx.Done():
 			}
 		}(u)
@@ -319,7 +408,7 @@ func raceStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, reqC
 			if res.err == nil {
 				successCount++
 				if successCount == 1 {
-					LogDebug("[STRATEGY] Race: Winner is %s (RTT: %v)", res.name, res.rtt)
+					LogDebug("[STRATEGY] Race (%s): Winner is %s (RTT: %v)", ruleName, res.name, res.rtt)
 					cancel()
 					return res.msg, res.name, res.rtt, nil
 				}

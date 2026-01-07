@@ -1,5 +1,5 @@
 # ------------------------------------------------------------------------------
-# dproxy Configuration File (v3.0.0)
+# dproxy Configuration File (v3.2.0)
 # ------------------------------------------------------------------------------
 # This configuration file controls all aspects of the dproxy server, including
 # network listeners, security settings, caching behavior, prefetching, 
@@ -139,9 +139,17 @@ cache:
       min_hits: 2
       check_interval: "30s"
 
+    # Load Shedding (New): Limits prefetching when system is under load
+    load_shedding:
+      enabled: true
+      max_goroutines: 10000   # Drop prefetch if goroutines exceed this count
+      max_queue_usage_pct: 80 # Drop prefetch if internal worker queue is > 80% full
+
 # --- Routing Configuration ---
 routing:
   # Define reusable groups of upstream servers
+  # You can now append ?qps=N to any upstream URL to limit its rate.
+  # Example: udp://192.168.1.1:53?qps=50
   upstream_groups:
     public_secure:
       - doh://cloudflare-dns.com/dns-query

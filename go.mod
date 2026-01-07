@@ -6,6 +6,7 @@ require (
 	github.com/miekg/dns v1.1.62
 	github.com/quic-go/quic-go v0.42.0
 	golang.org/x/sync v0.7.0
+	golang.org/x/time v0.5.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
