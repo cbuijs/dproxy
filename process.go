@@ -1,9 +1,9 @@
 /*
 File: process.go
-Version: 3.1.0
+Version: 3.2.0
 Last Update: 2026-01-07
 Description: Handles the core processing logic for DNS requests.
-             UPDATED: Pass 'ruleName' to forwarding logic for better logging context.
+             UPDATED: Pass 'ruleName' and client info to HOSTS lookup for better logging.
 */
 
 package main
@@ -118,10 +118,16 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		var answers []dns.RR
 		var found bool
 
+		// Build client info string for logging
+		clientInfo := reqCtx.ClientIP.String()
+		if reqCtx.ClientMAC != nil {
+			clientInfo = fmt.Sprintf("%s (%s)", clientInfo, reqCtx.ClientMAC.String())
+		}
+
 		if qType == dns.TypePTR {
-			answers, found = hostsCache.LookupPTR(reqCtx.QueryName)
+			answers, found = hostsCache.LookupPTR(reqCtx.QueryName, clientInfo, ruleName)
 		} else {
-			answers, found = hostsCache.Lookup(reqCtx.QueryName, qType, hostsWildcard)
+			answers, found = hostsCache.Lookup(reqCtx.QueryName, qType, hostsWildcard, clientInfo, ruleName)
 		}
 
 		if found {
@@ -143,7 +149,7 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 				}
 
 				w.WriteMsg(resp)
-				LogDebug("[PROCESS] Serving from HOSTS file (Rule: %s)", ruleName)
+				// HOSTS lookup now logs internally, so we just log the final request summary here
 				if IsInfoEnabled() {
 					logRequest(r.Id, reqCtx, ruleName, qInfo, "", "NOERROR (HOSTS)", "HOSTS", 0, time.Since(start), resp)
 				}
@@ -155,7 +161,7 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 				}
 
 				w.WriteMsg(resp)
-				LogDebug("[PROCESS] Serving NXDOMAIN from HOSTS file (Rule: %s, Type mismatch or Blocked PTR)", ruleName)
+				// HOSTS lookup now logs internally
 				if IsInfoEnabled() {
 					logRequest(r.Id, reqCtx, ruleName, qInfo, "", "NXDOMAIN (HOSTS)", "HOSTS", 0, time.Since(start), resp)
 				}
