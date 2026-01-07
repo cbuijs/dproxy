@@ -1,13 +1,16 @@
 /*
 File: process.go
-Version: 2.7.2
+Version: 2.8.1
+Last Update: 2026-01-07
 Description: Handles the core processing logic for DNS requests.
              OPTIMIZED: "Cache-First" Strategy. Internal DNS Cache is checked BEFORE Hosts files.
              OPTIMIZED: Hosts file responses are now cached in the internal DNS Cache.
              OPTIMIZED: Response sorting and processing happens ONCE before caching.
              OPTIMIZED: Implemented "Serve-Stale" (Stale-While-Revalidate) to pipeline upstream fetches out of the hot path.
+             OPTIMIZED: Log message construction is now gated by IsInfoEnabled checks to reduce allocations in hot paths.
              UPDATED: Strict Cross-Fetch trigger logic. Only initiates on Cache Miss AND specific types (A/AAAA).
              UPDATED: DDR responses now use configured HostName as SVCB Target.
+             UPDATED: Added Query Name to RSP log messages for better traceability.
 */
 
 package main
@@ -200,7 +203,9 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	if config.Server.DDR.Enabled && qType == dns.TypeSVCB && reqCtx.QueryName == "_dns.resolver.arpa" {
 		if resp := generateDDRResponse(r, reqCtx.ServerIP); resp != nil {
 			w.WriteMsg(resp) // Write first
-			logRequest(r.Id, reqCtx, "DDR", qInfo, "", "NOERROR (DDR)", "INTERNAL", 0, time.Since(start), resp)
+			if IsInfoEnabled() {
+				logRequest(r.Id, reqCtx, "DDR", qInfo, "", "NOERROR (DDR)", "INTERNAL", 0, time.Since(start), resp)
+			}
 			return
 		}
 	}
@@ -223,23 +228,11 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 
 	// --- CACHE CHECK (First) ---
 	// "Single Source of Truth": Check cache before checking Hosts or Upstreams.
-	// NOTE: If a cache hit occurs, we return IMMEDIATELY. This satisfies the requirement
-	// to "DO NOT initiate cross-fetching" if cached.
 	if config.Cache.Enabled && cacheKey != "" {
 		if cachedResp, remainingTTL := getFromCacheWithTTL(cacheKey, r.Id); cachedResp != nil {
 			// Hit! Serve immediately.
 			serveCache(w, cachedResp, remainingTTL, r.Id, reqCtx, ruleName, qInfo, start)
 			return // Exit prevents any cross-fetching logic below
-		} else {
-			// Miss or Expired?
-			// Check if we can SERVE STALE. This requires a modification to `getFromCache` or a new function.
-			// Since `getFromCacheWithTTL` returns nil on expiry, we can't access the stale data there easily
-			// without modifying cache.go.
-			// Ideally, we'd add `getFromCacheStale` to cache.go.
-			// For now, let's assume if it returned nil, it's truly gone or we don't support stale in this pass.
-			// To support stale, we would need to fetch the expired item.
-			// Implementation Note: A full Serve-Stale requires cache.go changes.
-			// Assuming we want to keep changes local if possible, we proceed.
 		}
 	}
 
@@ -274,7 +267,9 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 
 				w.WriteMsg(resp)
 				LogDebug("[PROCESS] Serving from HOSTS file (Rule: %s)", ruleName)
-				logRequest(r.Id, reqCtx, ruleName, qInfo, "", "NOERROR (HOSTS)", "HOSTS", 0, time.Since(start), resp)
+				if IsInfoEnabled() {
+					logRequest(r.Id, reqCtx, ruleName, qInfo, "", "NOERROR (HOSTS)", "HOSTS", 0, time.Since(start), resp)
+				}
 			} else {
 				resp.Rcode = dns.RcodeNameError
 
@@ -284,7 +279,9 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 
 				w.WriteMsg(resp)
 				LogDebug("[PROCESS] Serving NXDOMAIN from HOSTS file (Rule: %s, Type mismatch or Blocked PTR)", ruleName)
-				logRequest(r.Id, reqCtx, ruleName, qInfo, "", "NXDOMAIN (HOSTS)", "HOSTS", 0, time.Since(start), resp)
+				if IsInfoEnabled() {
+					logRequest(r.Id, reqCtx, ruleName, qInfo, "", "NXDOMAIN (HOSTS)", "HOSTS", 0, time.Since(start), resp)
+				}
 			}
 			return
 		}
@@ -294,25 +291,32 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	// This block executes ONLY on a CACHE MISS (or expiration).
 	msg := r.Copy()
 	addEDNS0Options(msg, ip, mac)
-	upstreamQInfo := buildUpstreamInfo(msg)
+	
+	// Only build upstream info if we log debug or if we log info
+	upstreamQInfo := ""
+	if IsDebugEnabled() || IsInfoEnabled() {
+		upstreamQInfo = buildUpstreamInfo(msg)
+	}
 
-	if opt := msg.IsEdns0(); opt != nil {
-		var ednsInfo []string
-		for _, option := range opt.Option {
-			if ecs, ok := option.(*dns.EDNS0_SUBNET); ok {
-				ednsInfo = append(ednsInfo, fmt.Sprintf("ECS=%s/%d", ecs.Address, ecs.SourceNetmask))
-			} else if local, ok := option.(*dns.EDNS0_LOCAL); ok && local.Code == EDNS0_OPTION_MAC {
-				ednsInfo = append(ednsInfo, fmt.Sprintf("MAC65001=%s", net.HardwareAddr(local.Data)))
+	if IsDebugEnabled() {
+		if opt := msg.IsEdns0(); opt != nil {
+			var ednsInfo []string
+			for _, option := range opt.Option {
+				if ecs, ok := option.(*dns.EDNS0_SUBNET); ok {
+					ednsInfo = append(ednsInfo, fmt.Sprintf("ECS=%s/%d", ecs.Address, ecs.SourceNetmask))
+				} else if local, ok := option.(*dns.EDNS0_LOCAL); ok && local.Code == EDNS0_OPTION_MAC {
+					ednsInfo = append(ednsInfo, fmt.Sprintf("MAC65001=%s", net.HardwareAddr(local.Data)))
+				}
 			}
-		}
-		if len(ednsInfo) > 0 {
-			LogDebug("[UPSTREAM_EDNS0] QID:%d | Forwarding with: %s", r.Id, strings.Join(ednsInfo, ", "))
+			if len(ednsInfo) > 0 {
+				LogDebug("[UPSTREAM_EDNS0] QID:%d | Forwarding with: %s", r.Id, strings.Join(ednsInfo, ", "))
+			}
 		}
 	}
 
 	// --- Singleflight Optimization with Pipelining Potential ---
-	// We use DoChan to allow the caller (us) to wait, but the group ensures only one query goes out.
-
+	
+	// Create a safe clone for the async singleflight operation
 	safeReqCtx := reqCtx.Clone()
 
 	// Use cacheKey as the suppression key
@@ -433,25 +437,27 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 
 	w.WriteMsg(resp)
 
-	logRequest(r.Id, reqCtx, ruleName, qInfo, upstreamQInfo, status, qr.upstreamStr, qr.rtt, time.Since(start), resp)
+	if IsInfoEnabled() {
+		logRequest(r.Id, reqCtx, ruleName, qInfo, upstreamQInfo, status, qr.upstreamStr, qr.rtt, time.Since(start), resp)
+	}
 }
 
 // Helper to serve cache hits to avoid duplication
 func serveCache(w dns.ResponseWriter, resp *dns.Msg, ttl uint32, id uint16, reqCtx *RequestContext, ruleName, qInfo string, start time.Time) {
-	isNegative := resp.Rcode == dns.RcodeNameError || len(resp.Answer) == 0
-
-	var status string
-	if isNegative {
-		status = fmt.Sprintf("CACHE_HIT (NEG, TTL:%ds)", ttl)
-	} else {
-		status = fmt.Sprintf("CACHE_HIT (TTL:%ds)", ttl)
-	}
-
-	// Resp is already sorted/processed in addToCache
 	resp.Id = id
 	w.WriteMsg(resp)
 
-	logRequest(id, reqCtx, ruleName, qInfo, "", status, "CACHE", 0, time.Since(start), resp)
+	// Optimization: Skip string building for log if not needed
+	if IsInfoEnabled() {
+		isNegative := resp.Rcode == dns.RcodeNameError || len(resp.Answer) == 0
+		var status string
+		if isNegative {
+			status = fmt.Sprintf("CACHE_HIT (NEG, TTL:%ds)", ttl)
+		} else {
+			status = fmt.Sprintf("CACHE_HIT (TTL:%ds)", ttl)
+		}
+		logRequest(id, reqCtx, ruleName, qInfo, "", status, "CACHE", 0, time.Since(start), resp)
+	}
 }
 
 func generateDDRResponse(req *dns.Msg, serverIP net.IP) *dns.Msg {
@@ -1228,7 +1234,7 @@ func logRequest(qid uint16, reqCtx *RequestContext, ruleName, qInfo, upstreamQIn
 		ansStr = "Empty"
 	}
 
-	LogInfo("[RSP] QID:%d | Status:%s | TotalTime:%v | Answers:[%s]", qid, status, duration, ansStr)
+	LogInfo("[RSP] QID:%d | Status:%s | TotalTime:%v | Query:%s | Answers:[%s]", qid, status, duration, qInfo, ansStr)
 }
 
 func extractEDNS0ClientInfo(msg *dns.Msg, reqCtx *RequestContext) {

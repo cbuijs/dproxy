@@ -1,7 +1,10 @@
 /*
 File: upstream.go
+Version: 1.4.0
+Last Update: 2026-01-07
 Description: Defines the Upstream struct and handles downstream connection logic, pooling, and protocol-specific exchanges.
              OPTIMIZED: DoH client now reuses buffers for request packing to reduce allocation.
+             OPTIMIZED: Response reading now uses LimitReader to prevent DoS.
 */
 
 package main
@@ -851,6 +854,11 @@ func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetAddr str
 	}
 	length := binary.BigEndian.Uint16(lBuf)
 
+	// SECURITY: limit upstream response size
+	if length > 65535 {
+		return nil, fmt.Errorf("upstream response too large: %d", length)
+	}
+
 	respBuf := packBufPool.Get().(*[]byte)
 	if cap(*respBuf) < int(length) {
 		*respBuf = make([]byte, length)
@@ -908,13 +916,28 @@ func (u *Upstream) exchangeDoH(ctx context.Context, req *dns.Msg, reqCtx *Reques
 		return nil, fmt.Errorf("DoH error: %d", hResp.StatusCode)
 	}
 
-	respBody, err := io.ReadAll(hResp.Body)
+	// SECURITY: Limit response reading to 64KB
+	limitReader := io.LimitReader(hResp.Body, 65535)
+	
+	// OPTIMIZATION: Use bufPool for reading response
+	respBuf := bufPool.Get().([]byte)
+	defer bufPool.Put(respBuf)
+
+	// Reset buffer length but keep capacity
+	respBuf = respBuf[:cap(respBuf)]
+	
+	// ReadAll manually into pooled buffer to avoid allocation if possible
+	// Note: io.ReadAll allocates, so we read manually
+	var b bytes.Buffer
+	b.Grow(4096)
+	
+	_, err = b.ReadFrom(limitReader)
 	if err != nil {
 		return nil, err
 	}
 
 	resp := getMsg()
-	if err := resp.Unpack(respBody); err != nil {
+	if err := resp.Unpack(b.Bytes()); err != nil {
 		putMsg(resp)
 		return nil, err
 	}

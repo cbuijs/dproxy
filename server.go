@@ -1,11 +1,15 @@
 /*
 File: server.go
+Version: 1.4.0
+Last Update: 2026-01-07
 Description: Implements the protocol listeners (UDP, TCP, DoT, DoQ, DoH/DoH3) and request handlers.
              UPDATED: Enhanced logging for failed connection attempts and protocol errors.
              UPDATED: Added String() method to ServerShutdowner for verbose shutdown logging.
              UPDATED: Support for multiple listeners via configuration.
              OPTIMIZED: DoT (DNS over TLS) now supports pipelining. Requests are processed concurrently
                         instead of serially, preventing Head-of-Line blocking.
+             SECURITY: Added MaxBytesReader to DoH to prevent DoS via large bodies.
+             SECURITY: Added concurrency limits to DoT per-connection to prevent goroutine exhaustion.
              FIXED: Correctly handle IPv6 address formatting (brackets) in listener addresses.
 */
 
@@ -27,6 +31,13 @@ import (
 	"github.com/miekg/dns"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+)
+
+// Constants
+const (
+	MaxDNSBodySize       = 65535 // Max size for a DNS message (64KB)
+	MaxDoTPipelines      = 128   // Max concurrent requests per DoT connection
+	DefaultServerTimeout = 5 * time.Second
 )
 
 // ServerShutdowner interface for graceful shutdown
@@ -178,7 +189,7 @@ func startServers(wg *sync.WaitGroup, tlsConfig *tls.Config) []ServerShutdowner 
 	mux.HandleFunc("/", handleDoH)
 
 	for _, l := range config.Server.Listeners {
-		// UPDATED: Iterate over address list and port list
+		// Iterate over address list and port list
 		for _, address := range l.Address {
 			for _, port := range l.Port {
 				// FIX: Use net.JoinHostPort to correctly handle IPv6 literals (e.g. [::1]:53)
@@ -350,11 +361,11 @@ func startServers(wg *sync.WaitGroup, tlsConfig *tls.Config) []ServerShutdowner 
 
 func getTimeout() time.Duration {
 	if config.Server.Timeout == "" {
-		return 5 * time.Second
+		return DefaultServerTimeout
 	}
 	d, err := time.ParseDuration(config.Server.Timeout)
 	if err != nil {
-		return 5 * time.Second
+		return DefaultServerTimeout
 	}
 	return d
 }
@@ -394,6 +405,9 @@ func handleDoTConnection(conn net.Conn) {
 
 	// Mutex to serialize writes to the socket while allowing concurrent processing
 	var writeMu sync.Mutex
+	
+	// SECURITY: Limit concurrent pipelined requests per connection
+	sem := make(chan struct{}, MaxDoTPipelines)
 
 	for {
 		req, err := dconn.ReadMsg()
@@ -404,10 +418,13 @@ func handleDoTConnection(conn net.Conn) {
 			return
 		}
 
+		// Acquire semaphore (blocking if limit reached)
+		sem <- struct{}{}
+
 		// OPTIMIZATION: Launch request in goroutine to allow pipelining
-		// This prevents head-of-line blocking where a slow upstream query
-		// stops the server from reading the next query on the same connection.
 		go func(reqMsg *dns.Msg) {
+			defer func() { <-sem }() // Release semaphore
+
 			ctx, cancel := context.WithTimeout(context.Background(), getTimeout())
 			defer cancel()
 			
@@ -457,6 +474,9 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 		proto = "DoH3"
 	}
 
+	// SECURITY: Enforce max body size to prevent DoS via OOM
+	r.Body = http.MaxBytesReader(w, r.Body, MaxDNSBodySize)
+
 	switch r.Method {
 	case http.MethodPost:
 		if r.Header.Get("Content-Type") != "application/dns-message" {
@@ -464,7 +484,13 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Unsupported Media Type", http.StatusUnsupportedMediaType)
 			return
 		}
-		data, _ := io.ReadAll(r.Body)
+		
+		data, readErr := io.ReadAll(r.Body)
+		if readErr != nil {
+			LogWarn("DoH Body Read failed from %s: %v", remoteAddr, readErr)
+			http.Error(w, "Bad Request", http.StatusBadRequest)
+			return
+		}
 		err = msg.Unpack(data)
 	case http.MethodGet:
 		b64str := r.URL.Query().Get("dns")
@@ -529,6 +555,11 @@ func handleDoQSession(sess quic.Connection) {
 				return
 			}
 			length := binary.BigEndian.Uint16(lBuf)
+
+			if length > MaxDNSBodySize {
+				LogWarn("DoQ message too large from %v: %d", remoteAddr, length)
+				return
+			}
 
 			buf := bufPool.Get().([]byte)
 			if cap(buf) < int(length) {

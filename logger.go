@@ -1,11 +1,11 @@
 /*
 File: logger.go
-Version: 1.3.1
-Last Update: 2026-01-06
+Version: 1.4.0
+Last Update: 2026-01-07
 Description: Modern, structured, and multi-output logging implementation using Go 1.21+ log/slog.
              OPTIMIZED: Implemented Asynchronous Buffered Logging to remove I/O blocking from the hot path.
+             OPTIMIZED: Added IsLevelEnabled helpers to prevent expensive string formatting in hot paths when logging is disabled.
              UPDATED: Log entries are now processed by a background worker.
-             FIXED: Moved runtime import to top level.
 */
 
 package main
@@ -28,6 +28,9 @@ var logger *slog.Logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerO
 	Level: slog.LevelInfo,
 }))
 
+// Cached level for fast checks
+var currentLevel slog.Level = slog.LevelInfo
+
 // Async Logger Internals
 var (
 	logBuffer  chan slog.Record
@@ -42,17 +45,20 @@ const logBufferSize = 4096 // Buffer up to 4k logs before blocking/dropping
 func InitLogger(cfg LoggingConfig) error {
 	var handlers []slog.Handler
 
+	lvl := parseLogLevel(cfg.Level)
+	currentLevel = lvl
+
 	// Common Options (Level)
 	opts := &slog.HandlerOptions{
-		Level: parseLogLevel(cfg.Level),
+		Level: lvl,
 	}
 
 	// Syslog Options
 	syslogOpts := &slog.HandlerOptions{
-		Level: parseLogLevel(cfg.Level),
+		Level: lvl,
 		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
 			if a.Key == slog.TimeKey {
-				return slog.Attr{} // Drop the time key
+				return slog.Attr{} // Drop the time key for syslog as it adds its own
 			}
 			return a
 		},
@@ -264,6 +270,16 @@ func (m *MultiHandler) WithGroup(name string) slog.Handler {
 	return &MultiHandler{handlers: handlers}
 }
 
+// --- Level Checks (Performance Optimization) ---
+
+func IsDebugEnabled() bool {
+	return currentLevel <= slog.LevelDebug
+}
+
+func IsInfoEnabled() bool {
+	return currentLevel <= slog.LevelInfo
+}
+
 // --- Compatibility Wrappers ---
 
 // Helper to get PC for caller
@@ -271,6 +287,7 @@ func logWithCaller(level slog.Level, format string, v ...interface{}) {
 	if logger == nil {
 		return
 	}
+	// Fast check to avoid expensive Sprintf if disabled
 	if !logger.Enabled(context.Background(), level) {
 		return
 	}
