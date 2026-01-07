@@ -1,5 +1,5 @@
 # ------------------------------------------------------------------------------
-# dproxy Configuration File (v2.3.5)
+# dproxy Configuration File (v3.0.0)
 # ------------------------------------------------------------------------------
 # This configuration file controls all aspects of the dproxy server, including
 # network listeners, security settings, caching behavior, prefetching, 
@@ -30,33 +30,15 @@ logging:
     permissions: 0644
 
   # Syslog configuration (only used if "syslog" is in outputs)
-  # Note: Uses local syslog facility (default: 16/local0)
   syslog:
-    # Network: "udp", "tcp", or "unixgram" (for local sockets)
-    # Default is "udp", but if address starts with "/" it auto-switches to "unixgram".
     network: "udp"
-    
-    # Address: Remote IP:Port or Local Socket Path
-    # Examples:
-    #   - "127.0.0.1:514" (UDP default)
-    #   - "/dev/log"      (Linux local syslog, network will auto-set to unixgram)
     address: "127.0.0.1:514"
-    
     tag: "dproxy"
     facility: 16
 
 # --- Server Configuration ---
 server:
   # --- Listeners (Recommended) ---
-  # Configure multiple listeners to bind specific protocols to addresses/ports.
-  # Supported protocols:
-  # - dns / udp : Standard DNS over UDP
-  # - tcp       : Standard DNS over TCP
-  # - dot / tls : DNS over TLS (RFC 7858)
-  # - doq / quic: DNS over QUIC (RFC 9250)
-  # - https     : DNS over HTTPS (HTTP/1.1, H2) AND HTTP/3 (QUIC)
-  # - doh       : DNS over HTTPS (HTTP/1.1, H2) only
-  # - h3        : DNS over HTTPS (HTTP/3) only
   listeners:
     # Public Interface - Standard DNS
     - address: "0.0.0.0"
@@ -74,169 +56,87 @@ server:
       port: 443
       protocol: "https"
 
-    # Local Admin Interface (Example of multi-listener)
-    - address: "127.0.0.1"
-      port: 5353
-      protocol: "udp"
-      
-    # IPv6 Specific Listener (Example)
-    - address: "::1"
-      port: 53
-      protocol: "udp"
-
   # TLS Certificate settings (Required for DoT, DoQ, DoH, HTTPS)
-  # If left empty, a self-signed certificate will be generated automatically.
-  # Note: Self-signed certs automatically include all Listener IPs in the SANs.
   tls:
-    cert_file: ""  # Path to your .crt or .pem file
-    key_file: ""   # Path to your .key file
+    cert_file: ""
+    key_file: ""
   
+  # Log Client Name: If true, attempts to resolve client IPs to names using 
+  # local hosts files for logging purposes. (Useful for LANs)
+  log_client_name: true
+
   # DDR (Discovery of Designated Resolvers) - RFC 9462
-  # Enables clients to automatically upgrade from unencrypted UDP/TCP to 
-  # encrypted protocols (DoT, DoQ, DoH) by querying _dns.resolver.arpa.
   ddr:
     enabled: true
-    # Hostname: Optional. Explicitly set the target DNS name for SVCB records.
-    # If empty, dproxy attempts to extract the first DNSName/CN from the TLS certificate.
-    # If detection fails, it defaults to "." (the root).
     # host_name: "dns.server.com"
 
   # DoH (DNS over HTTPS) Specific Settings
   doh:
-    # Allowed URL paths for DNS queries. Requests to other paths return 404.
     allowed_paths:
       - "/dns-query"
-    # If true, strictly enforces the path check.
     strict_path: true
 
   # EDNS0 (Extension Mechanisms for DNS) Options
-  # Controls how Client Subnet (ECS) and MAC address data is handled.
   edns0:
     ecs:
-      # Mode: "add", "remove", "replace", "preserve"
-      # - add: Add client IP if not present
-      # - remove: Strip ECS data
-      # - replace: Overwrite existing ECS with client IP
-      # - preserve: Keep existing ECS data (default)
       mode: "add"
-      # Netmasks for ECS data (0 = use defaults 32/128)
       ipv4_mask: 32
       ipv6_mask: 128
-    
     mac:
-      # Mode: "add", "remove", "replace", "preserve", "prefer-arp", "prefer-edns0"
-      # - add: Add MAC option (code 65001) if missing
-      # - prefer-arp: Use ARP table MAC if available, otherwise EDNS0
       mode: "prefer-arp"
-      # Source: "arp", "edns0", "both"
       source: "arp"
 
-  # Upstream connection timeout
   timeout: "5s"
-  
-  # Allow connecting to upstreams with invalid TLS certificates (dangerous)
   insecure_upstream: false
-  
-  # Drop DropOnFailure: If true, the proxy drops the client query instead of sending SERVFAIL
-  # when upstreams time out or fail. This forces the client to handle the timeout logic.
-  # Default: false (send SERVFAIL)
   drop_on_failure: false
 
-  # Response Manipulation (NEW)
-  # Controls how responses are formatted before being sent to the client.
+  # Response Manipulation
   response:
-    # Minimization: Strip Authority and Additional sections from the response.
-    # Default: false
     minimization: false
-    
-    # CNAME Flattening: Collapses CNAME chains to return just the final IP record (A/AAAA).
-    # Useful for reducing packet size and client-side lookups.
-    # Default: false
     cname_flattening: false
 
 # --- ARP/NDP Configuration ---
-# Used for mapping IP addresses to MAC addresses for policy routing.
 arp:
-  # Mode: "both", "v4", "v6", "none"
-  # - both: Maintain both ARP (IPv4) and NDP (IPv6) tables
-  # - v4:   Only maintain ARP table
-  # - v6:   Only maintain NDP table
-  # - none: Disable ARP/NDP maintenance entirely
   mode: "both"
-  
-  # Timeout for system commands (e.g. 'ip neigh', 'arp -a') used to fetch tables.
   timeout: "2s"
 
 # --- Bootstrap DNS Configuration ---
-# DNS servers used to resolve hostnames of Upstream servers defined in Routing.
 bootstrap:
   servers:
     - "1.1.1.1:53"
     - "8.8.8.8:53"
-  # IP Version preference for bootstrap resolution: "ipv4", "ipv6", "both"
   ip_version: "both"
 
 # --- Cache Configuration ---
 cache:
   enabled: true
-  size: 10000 # Max items (approximate due to sharding)
+  size: 10000 
   
-  # TTL (Time To Live) Management (in seconds)
-  # 0 = Disabled (respect upstream TTL exactly)
-  
-  # Minimum TTL for successful responses (NOERROR)
-  min_ttl: 60       
-  
-  # Maximum TTL for successful responses (Caps long TTLs)
-  max_ttl: 3600     
-  
-  # Minimum TTL for negative responses (NXDOMAIN, NODATA)
-  min_neg_ttl: 10   
-  
-  # Maximum TTL for negative responses (NXDOMAIN, NODATA)
-  max_neg_ttl: 60   
-  
-  # TTL for records served from local HOSTS files or Domain Lists.
-  # 0 = Do not cache downstream (default)
-  # >0 = Allow clients to cache local records for X seconds
-  hosts_ttl: 300
+  # Disk Cache: Directory to store binary cache of processed hosts/blocklists.
+  # Speeds up startup significantly for large blocklists.
+  hosts_cache_dir: "/var/cache/dproxy"
 
-  # TTL Strategy
-  # Normalizes all TTLs in a single response to ensure consistency across records.
-  # Available modes:
-  # - none    : No normalization (default)
-  # - first   : Use TTL of the first record
-  # - last    : Use TTL of the last record
-  # - lowest  : Use the lowest TTL among all records
-  # - highest : Use the highest TTL among all records
-  # - average : Use the average TTL
+  min_ttl: 60       
+  max_ttl: 3600     
+  min_neg_ttl: 10   
+  max_neg_ttl: 60   
+  hosts_ttl: 300
   ttl_strategy: "none"
-  
-  # Response Sorting (NEW)
-  # Reorders records in the Answer section of cached responses.
-  # Options:
-  # - none        : Preserve original order from upstream (default)
-  # - round-robin : Randomly shuffle A/AAAA records (load balancing)
-  # - sorted      : Sort IPs numerically (deterministic)
   response_sorting: "none"
 
   # Prefetch Configuration
   prefetch:
-    # Cross-Fetch: Proactively fetch related records (e.g., query A -> fetch AAAA)
     cross_fetch:
       enabled: false
-      # Mode: "off", "on_a" (fetch others when A queried), "on_aaaa", "both"
       mode: "off"
-      # Types to fetch in background
       fetch_types: ["A", "AAAA", "HTTPS"]
       max_concurrent: 10
       timeout: "3s"
     
-    # Stale Refresh: Refresh popular cache entries before they expire
     stale_refresh:
       enabled: false
-      threshold_percent: 10  # Refresh when 10% of TTL remains
-      min_hits: 2            # Only refresh if queried at least 2 times
+      threshold_percent: 10
+      min_hits: 2
       check_interval: "30s"
 
 # --- Routing Configuration ---
@@ -248,59 +148,51 @@ routing:
       - dot://dns.google:853
     local_internal:
       - udp://192.168.1.1:53
-    isp_dns:
-      - udp://1.1.1.1
 
   # Routing Rules (Processed in order)
-  # Match conditions use OR logic within a list, and AND logic between categories.
   routing_rules:
     # Example 1: Blocklist (Ads/Trackers)
-    # Uses HOSTS file format (0.0.0.0 domain) or Domain List format (domain).
     - name: "Blocklist"
       match:
         query_domain:
           - "*.ads.example.com"
-          - "*.tracker.com"
-      upstreams: public_secure # Fallback if not found in hosts
+      upstreams: public_secure
       hosts_files:
         - "/etc/blocked.hosts"
       hosts_urls:
         - "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
       hosts_wildcard: true
-      hosts_optimize: true # Remove redundant subdomains
+      hosts_optimize: true
+      # Refresh interval for this specific rule's hosts
+      refresh_interval: "24h"
 
-    # Example 2: Client-Specific Routing
-    # Route IoT devices to specific DNS
-    - name: "IoT Devices"
+    # Example 2: MAC Wildcards (Privacy/Randomized MACs)
+    # Matches MACs where the second char is '2', '6', 'A', or 'E' (locally administered)
+    # Or simple patterns like "00:11:*:*:*:*"
+    - name: "Randomized MACs"
       match:
-        client_ip: 
-          - "192.168.1.50"
-          - "192.168.1.51"
-        # client_mac: ["00:11:22:33:44:55"] # Requires ARP enabled
-      upstreams: isp_dns
+        client_mac: 
+          - "?2:*:*:*:*:*"
+          - "?6:*:*:*:*:*"
+          - "?a:*:*:*:*:*"
+          - "?e:*:*:*:*:*"
+      upstreams: public_secure
       strategy: random
 
     # Example 3: Local Development
-    # Override domains ending in .dev.local using a local hosts file
     - name: "Local Dev"
       match:
         query_domain: ".dev.local"
       upstreams: local_internal
-      strategy: failover
       hosts_files:
         - "/etc/hosts.dev"
-      hosts_wildcard: false
+      refresh_interval: "30s"
 
   # Default Rule (REQUIRED)
-  # Applied if no other rules match.
   default:
     upstreams: public_secure
-    # Strategy: "failover", "round-robin", "random", "fastest", "race"
     strategy: failover
-    
-    # Global HOSTS check for all other queries (e.g. standard /etc/hosts)
     hosts_files:
       - "/etc/hosts"
-    hosts_wildcard: false
-    hosts_optimize: false
+    refresh_interval: "1h"
 

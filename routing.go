@@ -1,7 +1,9 @@
 /*
 File: routing.go
+Version: 1.4.0
 Description: High-performance routing logic using Domain Trie (Radix-style) for rapid lookups.
-OPTIMIZED: Trie Search now walks the string from TLD backwards without string splitting or slice allocations.
+             OPTIMIZED: Trie Search now walks the string from TLD backwards without string splitting or slice allocations.
+             UPDATED: Added wildcard MAC matching logic.
 */
 
 package main
@@ -163,8 +165,10 @@ func hasNonDomainConditions(m *MatchConditions) bool {
 	return len(m.ClientIP) > 0 ||
 		len(m.ClientCIDR) > 0 ||
 		len(m.ClientMAC) > 0 ||
+		len(m.rawClientMACs) > 0 ||
 		len(m.ClientECS) > 0 ||
 		len(m.ClientEDNSMAC) > 0 ||
+		len(m.rawClientEDNSMACs) > 0 ||
 		len(m.ServerIP) > 0 ||
 		len(m.ServerPort) > 0 ||
 		len(m.ServerHostname) > 0 ||
@@ -260,12 +264,23 @@ func matchRule(m *MatchConditions, ctx *RequestContext) (bool, string) {
 		}
 	}
 
-	// Check Client MACs
+	// Check Client MACs (Exact)
 	if len(m.parsedClientMACs) > 0 {
 		conditionsChecked++
 		for _, mac := range m.parsedClientMACs {
 			if effectiveMAC != nil && macEqual(mac, effectiveMAC) {
 				return true, fmt.Sprintf("ClientMAC=%s", effectiveMAC)
+			}
+		}
+	}
+
+	// Check Client MACs (Wildcard)
+	if len(m.rawClientMACs) > 0 {
+		conditionsChecked++
+		macStr := effectiveMAC.String()
+		for _, pattern := range m.rawClientMACs {
+			if effectiveMAC != nil && matchWildcard(macStr, pattern) {
+				return true, fmt.Sprintf("ClientMACPattern=%s (matched %s)", pattern, macStr)
 			}
 		}
 	}
@@ -280,12 +295,23 @@ func matchRule(m *MatchConditions, ctx *RequestContext) (bool, string) {
 		}
 	}
 
-	// Check Client EDNS MACs
+	// Check Client EDNS MACs (Exact)
 	if len(m.parsedClientEDNSMACs) > 0 {
 		conditionsChecked++
 		for _, mac := range m.parsedClientEDNSMACs {
 			if ctx.ClientEDNSMAC != nil && macEqual(mac, ctx.ClientEDNSMAC) {
 				return true, fmt.Sprintf("EDNS0MAC=%s", ctx.ClientEDNSMAC)
+			}
+		}
+	}
+
+	// Check Client EDNS MACs (Wildcard)
+	if len(m.rawClientEDNSMACs) > 0 {
+		conditionsChecked++
+		macStr := ctx.ClientEDNSMAC.String()
+		for _, pattern := range m.rawClientEDNSMACs {
+			if ctx.ClientEDNSMAC != nil && matchWildcard(macStr, pattern) {
+				return true, fmt.Sprintf("EDNS0MACPattern=%s (matched %s)", pattern, macStr)
 			}
 		}
 	}
@@ -376,5 +402,55 @@ func macEqual(a, b net.HardwareAddr) bool {
 		}
 	}
 	return true
+}
+
+// Simple wildcard matcher for strings (supports * and ?)
+func matchWildcard(s, pattern string) bool {
+	// Simple greedy glob match
+	// Fast path for exact match
+	if s == pattern {
+		return true
+	}
+	
+	// Convert to runes to handle potential unicode, though MACs are ASCII
+	rs := []rune(s)
+	rp := []rune(pattern)
+	lenS := len(rs)
+	lenP := len(rp)
+	
+	// Index in string, Index in pattern
+	si := 0
+	pi := 0
+	
+	// Last star positions
+	starIdx := -1
+	matchIdx := 0
+	
+	for si < lenS {
+		// Single character match or exact match
+		if pi < lenP && (rp[pi] == '?' || rp[pi] == rs[si]) {
+			si++
+			pi++
+		} else if pi < lenP && rp[pi] == '*' {
+			// Star match - record position and assume zero chars first
+			starIdx = pi
+			matchIdx = si
+			pi++
+		} else if starIdx != -1 {
+			// Backtrack: If prev was a star, try to consume one more char from string
+			pi = starIdx + 1
+			matchIdx++
+			si = matchIdx
+		} else {
+			return false
+		}
+	}
+	
+	// Consume remaining stars in pattern
+	for pi < lenP && rp[pi] == '*' {
+		pi++
+	}
+	
+	return pi == lenP
 }
 

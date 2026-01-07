@@ -1,8 +1,9 @@
 /*
 File: config.go
-Version: 2.4.1
+Version: 2.7.0
 Description: Defines configuration structures and handles YAML parsing and validation.
-UPDATED: Added HostName to DDR config to support custom target domains in SVCB records.
+             UPDATED: Fixed struct field names to match usage (parsedClientMACs -> parsedClientMACs).
+             UPDATED: Ensures MatchConditions struct has all required fields.
 */
 
 package main
@@ -74,6 +75,9 @@ type ServerConfig struct {
 	} `yaml:"tls"`
 
 	LogLevel string `yaml:"log_level"` // Deprecated
+	
+	// Logging enhancements
+	LogClientName bool `yaml:"log_client_name"` // Resolve client IPs to names from local hosts
 
 	// DDR (Discovery of Designated Resolvers) - RFC 9462
 	DDR struct {
@@ -114,20 +118,21 @@ type BootstrapConfig struct {
 }
 
 type CacheConfig struct {
-	Enabled     bool           `yaml:"enabled"`
-	Size        int            `yaml:"size"`
-	MinTTL      int            `yaml:"min_ttl"`      // Minimum TTL for NOERROR
-	MaxTTL      int            `yaml:"max_ttl"`      // Maximum TTL for NOERROR
-	MinNegTTL   int            `yaml:"min_neg_ttl"`  // Minimum TTL for Negatives (NXDOMAIN, etc)
-	MaxNegTTL   int            `yaml:"max_neg_ttl"`  // Maximum TTL for Negatives
-	HostsTTL    int            `yaml:"hosts_ttl"`    // TTL for records served from HOSTS files
-	TTLStrategy string         `yaml:"ttl_strategy"` // TTL normalization strategy
-	
+	Enabled       bool   `yaml:"enabled"`
+	Size          int    `yaml:"size"`
+	HostsCacheDir string `yaml:"hosts_cache_dir"` // Directory to cache processed hosts files
+	MinTTL        int    `yaml:"min_ttl"`         // Minimum TTL for NOERROR
+	MaxTTL        int    `yaml:"max_ttl"`         // Maximum TTL for NOERROR
+	MinNegTTL     int    `yaml:"min_neg_ttl"`     // Minimum TTL for Negatives (NXDOMAIN, etc)
+	MaxNegTTL     int    `yaml:"max_neg_ttl"`     // Maximum TTL for Negatives
+	HostsTTL      int    `yaml:"hosts_ttl"`       // TTL for records served from HOSTS files
+	TTLStrategy   string `yaml:"ttl_strategy"`    // TTL normalization strategy
+
 	// Response Sorting Strategy for Cache Hits
 	// options: "none", "round-robin", "sorted"
-	ResponseSorting string `yaml:"response_sorting"` 
+	ResponseSorting string `yaml:"response_sorting"`
 
-	Prefetch    PrefetchConfig `yaml:"prefetch"`
+	Prefetch PrefetchConfig `yaml:"prefetch"`
 }
 
 type PrefetchConfig struct {
@@ -163,39 +168,45 @@ type RoutingConfig struct {
 }
 
 type DefaultRule struct {
-	Upstreams     interface{} `yaml:"upstreams"`
-	Strategy      string      `yaml:"strategy"`
-	HostsFiles    []string    `yaml:"hosts_files"`
-	HostsURLs     []string    `yaml:"hosts_urls"`
+	Upstreams   interface{} `yaml:"upstreams"`
+	Strategy    string      `yaml:"strategy"`
+	HostsFiles  []string    `yaml:"hosts_files"`
+	HostsURLs   []string    `yaml:"hosts_urls"`
 	
 	// Compatibility fields for singular keys
 	HostFilesSingular []string `yaml:"host_files"`
 	HostURLsSingular  []string `yaml:"host_urls"`
 
-	HostsWildcard bool        `yaml:"hosts_wildcard"`
-	HostsOptimize bool        `yaml:"hosts_optimize"`
+	HostsWildcard bool   `yaml:"hosts_wildcard"`
+	HostsOptimize bool   `yaml:"hosts_optimize"`
+	
+	RefreshInterval string `yaml:"refresh_interval"` 
 
 	parsedUpstreams []*Upstream
 	parsedHosts     *HostsCache
+	parsedRefresh   time.Duration
 }
 
 type RoutingRule struct {
-	Name          string          `yaml:"name"`
-	Match         MatchConditions `yaml:"match"`
-	Upstreams     interface{}     `yaml:"upstreams"`
-	Strategy      string          `yaml:"strategy"`
-	HostsFiles    []string        `yaml:"hosts_files"`
-	HostsURLs     []string        `yaml:"hosts_urls"`
+	Name        string          `yaml:"name"`
+	Match       MatchConditions `yaml:"match"`
+	Upstreams   interface{}     `yaml:"upstreams"`
+	Strategy    string          `yaml:"strategy"`
+	HostsFiles  []string        `yaml:"hosts_files"`
+	HostsURLs   []string        `yaml:"hosts_urls"`
 
 	// Compatibility fields for singular keys
 	HostFilesSingular []string `yaml:"host_files"`
 	HostURLsSingular  []string `yaml:"host_urls"`
 
-	HostsWildcard bool            `yaml:"hosts_wildcard"`
-	HostsOptimize bool            `yaml:"hosts_optimize"`
+	HostsWildcard bool   `yaml:"hosts_wildcard"`
+	HostsOptimize bool   `yaml:"hosts_optimize"`
+	
+	RefreshInterval string `yaml:"refresh_interval"` 
 
 	parsedUpstreams []*Upstream
 	parsedHosts     *HostsCache
+	parsedRefresh   time.Duration
 }
 
 // StringOrSlice is a custom type that accepts either a single string or a list of strings
@@ -263,6 +274,10 @@ type MatchConditions struct {
 	parsedClientECSs     []*net.IPNet
 	parsedClientEDNSMACs []net.HardwareAddr
 	parsedServerIPs      []net.IP
+	
+	// Helper to store raw MAC strings for wildcard matching
+	rawClientMACs        []string 
+	rawClientEDNSMACs    []string
 }
 
 // --- Configuration Loading ---
@@ -449,6 +464,14 @@ func LoadConfig(path string) error {
 			rule.HostsURLs = append(rule.HostsURLs, rule.HostURLsSingular...)
 		}
 
+		if rule.RefreshInterval != "" {
+			d, err := time.ParseDuration(rule.RefreshInterval)
+			if err != nil {
+				return fmt.Errorf("rule '%s' invalid refresh_interval: %w", rule.Name, err)
+			}
+			rule.parsedRefresh = d
+		}
+
 		if err := parseMatchConditions(&rule.Match); err != nil {
 			return fmt.Errorf("rule '%s': %w", rule.Name, err)
 		}
@@ -486,6 +509,14 @@ func LoadConfig(path string) error {
 	}
 	if len(cfg.Routing.DefaultRule.HostURLsSingular) > 0 {
 		cfg.Routing.DefaultRule.HostsURLs = append(cfg.Routing.DefaultRule.HostsURLs, cfg.Routing.DefaultRule.HostURLsSingular...)
+	}
+
+	if cfg.Routing.DefaultRule.RefreshInterval != "" {
+		d, err := time.ParseDuration(cfg.Routing.DefaultRule.RefreshInterval)
+		if err != nil {
+			return fmt.Errorf("default rule invalid refresh_interval: %w", err)
+		}
+		cfg.Routing.DefaultRule.parsedRefresh = d
 	}
 
 	// Parse default rule (Synchronous Validation Phase)
@@ -545,8 +576,9 @@ func LoadConfig(path string) error {
 	// Collect from Default Rule
 	collect(cfg.Routing.DefaultRule.HostsFiles, cfg.Routing.DefaultRule.HostsURLs)
 
-	// 2. Load all sources once (concurrently)
-	sourceCache := BatchLoadSources(uniquePaths, uniqueUrls)
+	// 2. Load all sources once (concurrently) with Disk Caching Support
+	cacheDir := cfg.Cache.HostsCacheDir
+	sourceCache := BatchLoadSources(uniquePaths, uniqueUrls, cacheDir)
 
 	// 3. Assemble per-rule caches from shared sources (parallel assembly)
 	var assemblyWg sync.WaitGroup
@@ -731,13 +763,19 @@ func parseMatchConditions(m *MatchConditions) error {
 		m.parsedClientCIDRs = append(m.parsedClientCIDRs, ipnet)
 	}
 
-	// Parse Client MACs
+	// Parse Client MACs - Modified to allow patterns
 	for _, macStr := range m.ClientMAC {
-		mac, err := net.ParseMAC(macStr)
-		if err != nil {
-			return fmt.Errorf("invalid client_mac: %s", macStr)
+		// If it contains wildcards, store as raw string
+		if strings.ContainsAny(macStr, "*?") {
+			m.rawClientMACs = append(m.rawClientMACs, strings.ToLower(macStr))
+		} else {
+			// Otherwise try strict parse
+			mac, err := net.ParseMAC(macStr)
+			if err != nil {
+				return fmt.Errorf("invalid client_mac: %s", macStr)
+			}
+			m.parsedClientMACs = append(m.parsedClientMACs, mac)
 		}
-		m.parsedClientMACs = append(m.parsedClientMACs, mac)
 	}
 
 	// Parse Client ECS CIDRs
@@ -751,11 +789,16 @@ func parseMatchConditions(m *MatchConditions) error {
 
 	// Parse Client EDNS MACs
 	for _, macStr := range m.ClientEDNSMAC {
-		mac, err := net.ParseMAC(macStr)
-		if err != nil {
-			return fmt.Errorf("invalid client_edns_mac: %s", macStr)
+		// If it contains wildcards, store as raw string
+		if strings.ContainsAny(macStr, "*?") {
+			m.rawClientEDNSMACs = append(m.rawClientEDNSMACs, strings.ToLower(macStr))
+		} else {
+			mac, err := net.ParseMAC(macStr)
+			if err != nil {
+				return fmt.Errorf("invalid client_edns_mac: %s", macStr)
+			}
+			m.parsedClientEDNSMACs = append(m.parsedClientEDNSMACs, mac)
 		}
-		m.parsedClientEDNSMACs = append(m.parsedClientEDNSMACs, mac)
 	}
 
 	// Parse Server IPs

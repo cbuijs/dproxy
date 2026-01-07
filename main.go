@@ -1,10 +1,9 @@
 /*
 File: main.go
+Version: 1.3.0
 Description: Entry point for the dproxy application. Initializes globals, parses flags, and starts the system.
-             UPDATED: Starts auto-refresh routines for all configured HOSTS files.
-             UPDATED: Smart ARP maintenance (skips if configured "none" or not required by any rules).
-             UPDATED: Correctly flattens multiple listener IPs for TLS certificate generation.
-             UPDATED: Auto-detects DDR hostname from certificate if not configured.
+             UPDATED: Starts auto-refresh routines using configured intervals.
+             UPDATED: Pass Cache Dir to hosts loader.
 */
 
 package main
@@ -126,20 +125,30 @@ Usage: %s -config <config.yaml>
 	startBackgroundTasks()
 
 	// --- START HOSTS FILE REFRESHERS ---
-	// Strategy: If URLs are present, use a long interval (1h) to be polite.
-	// If only local files are used, use a short interval (30s) for rapid dev feedback.
 	
+	// Helper to determine interval
+	getInterval := func(configured time.Duration, hasRemote bool) time.Duration {
+		if configured > 0 {
+			return configured
+		}
+		if hasRemote {
+			return 1 * time.Hour
+		}
+		return 30 * time.Second
+	}
+
 	// Check Default Rule
 	if config.Routing.DefaultRule.parsedHosts != nil {
-		interval := 30 * time.Second
-		if config.Routing.DefaultRule.parsedHosts.HasRemote() {
-			interval = 1 * time.Hour
-		}
+		hc := config.Routing.DefaultRule.parsedHosts
+		// Assign cache dir to the instance so it can be used for reloading
+		hc.cacheDir = config.Cache.HostsCacheDir
+		
+		interval := getInterval(config.Routing.DefaultRule.parsedRefresh, hc.HasRemote())
 		
 		shutdownWg.Add(1)
 		go func() {
 			defer shutdownWg.Done()
-			config.Routing.DefaultRule.parsedHosts.StartAutoRefresh(shutdownContext, interval)
+			hc.StartAutoRefresh(shutdownContext, interval)
 		}()
 	}
 	
@@ -147,16 +156,16 @@ Usage: %s -config <config.yaml>
 	for i := range config.Routing.RoutingRules {
 		rule := &config.Routing.RoutingRules[i]
 		if rule.parsedHosts != nil {
-			interval := 30 * time.Second
-			if rule.parsedHosts.HasRemote() {
-				interval = 1 * time.Hour
-			}
+			hc := rule.parsedHosts
+			hc.cacheDir = config.Cache.HostsCacheDir
+
+			interval := getInterval(rule.parsedRefresh, hc.HasRemote())
 
 			shutdownWg.Add(1)
-			go func(hc *HostsCache) {
+			go func(h *HostsCache) {
 				defer shutdownWg.Done()
-				hc.StartAutoRefresh(shutdownContext, interval)
-			}(rule.parsedHosts)
+				h.StartAutoRefresh(shutdownContext, interval)
+			}(hc)
 		}
 	}
 
