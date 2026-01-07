@@ -1,8 +1,10 @@
 /*
 File: strategy.go
-Version: 1.4.0
+Version: 1.5.0
+Last Update: 2026-01-07
 Description: Implements upstream selection strategies (Round-Robin, Random, Failover, Fastest, Race)
              and the main forwarder logic.
+             UPDATED: Added IP address logging when switching upstreams (Fastest Strategy) and on failures.
              UPDATED: Strategies now check upstream.Allow() (QPS limit) and skip busy upstreams.
              UPDATED: Strategies now capture and format the specific Upstream IP address used for logging.
              UPDATED: Added comparative logging to Fastest strategy to explain selection "why".
@@ -90,7 +92,7 @@ func roundRobinStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream
 			return resp, logStr, rtt, nil
 		}
 
-		LogWarn("[STRATEGY] Round-Robin (%s): Failed with %s: %v", ruleName, u.DynamicString(reqCtx), err)
+		LogWarn("[STRATEGY] Round-Robin (%s): Failed with %s (%s): %v", ruleName, u.DynamicString(reqCtx), addr, err)
 	}
 
 	return nil, "", 0, fmt.Errorf("all upstreams failed, busy, or unhealthy in round-robin")
@@ -120,7 +122,7 @@ func randomStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, ru
 			LogDebug("[STRATEGY] Random (%s): Success with %s (RTT: %v)", ruleName, logStr, rtt)
 			return resp, logStr, rtt, nil
 		}
-		LogWarn("[STRATEGY] Random (%s): Failed with %s: %v", ruleName, u.DynamicString(reqCtx), err)
+		LogWarn("[STRATEGY] Random (%s): Failed with %s (%s): %v", ruleName, u.DynamicString(reqCtx), addr, err)
 	}
 
 	return nil, "", 0, fmt.Errorf("all upstreams failed, busy, or unhealthy in random")
@@ -144,7 +146,7 @@ func failoverStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, 
 			LogDebug("[STRATEGY] Failover (%s): Success with %s (RTT: %v)", ruleName, logStr, rtt)
 			return resp, logStr, rtt, nil
 		}
-		LogWarn("[STRATEGY] Failover (%s): Failed %s: %v", ruleName, u.DynamicString(reqCtx), err)
+		LogWarn("[STRATEGY] Failover (%s): Failed %s (%s): %v", ruleName, u.DynamicString(reqCtx), addr, err)
 	}
 	return nil, "", 0, errors.New("all upstreams failed, busy, or unhealthy in failover")
 }
@@ -244,7 +246,18 @@ func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, r
 			}
 			
 			// Log the switch at INFO level so it's visible
-			LogInfo("[STRATEGY] Fastest (%s): Switched Primary -> %s. Reason: %s", ruleName, best.String(), reason)
+			// Include resolved IPs to track where we are switching to
+			var ipLog string
+			ips := best.resolveIPs()
+			if len(ips) > 0 {
+				var ipStrs []string
+				for _, ip := range ips {
+					ipStrs = append(ipStrs, ip.String())
+				}
+				ipLog = fmt.Sprintf(" [%s]", strings.Join(ipStrs, ", "))
+			}
+			
+			LogInfo("[STRATEGY] Fastest (%s): Switched Primary -> %s%s. Reason: %s", ruleName, best.String(), ipLog, reason)
 		}
 		lastFastestWinner.Store(ruleName, best.String())
 	} else {
@@ -330,7 +343,7 @@ func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, r
 
 	resp, addr, rtt, err := selectedUpstream.executeExchange(ctx, req, reqCtx)
 	if err != nil {
-		LogWarn("[STRATEGY] Fastest (%s): Failed with %s: %v, trying alternatives", ruleName, selectedUpstream.DynamicString(reqCtx), err)
+		LogWarn("[STRATEGY] Fastest (%s): Failed with %s (%s): %v, trying alternatives", ruleName, selectedUpstream.DynamicString(reqCtx), addr, err)
 		for _, s := range stats {
 			if s.upstream == selectedUpstream {
 				continue
@@ -342,6 +355,7 @@ func fastestStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, r
 				LogInfo("[STRATEGY] Fastest (%s): Failover success with %s (RTT: %v)", ruleName, logStr, rtt)
 				return resp, logStr, rtt, nil
 			}
+			LogDebug("[STRATEGY] Fastest (%s): Failover candidate %s (%s) failed: %v", ruleName, u.DynamicString(reqCtx), addr, err)
 		}
 		return nil, "", 0, fmt.Errorf("all upstreams failed in fastest strategy")
 	}
@@ -391,7 +405,7 @@ func raceStrategy(ctx context.Context, req *dns.Msg, upstreams []*Upstream, rule
 			}
 			
 			if err != nil {
-				LogWarn("[STRATEGY] Race (%s): Upstream %s failed: %v", ruleName, upstream.DynamicString(reqCtx), err)
+				LogWarn("[STRATEGY] Race (%s): Upstream %s (%s) failed: %v", ruleName, upstream.DynamicString(reqCtx), addr, err)
 			}
 			select {
 			case resCh <- result{msg: resp, name: logStr, rtt: rtt, err: err}:
