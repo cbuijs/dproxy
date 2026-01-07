@@ -1,9 +1,11 @@
 /*
 File: edns.go
-Version: 1.0.0
+Version: 1.0.1
+Last Update: 2026-01-07
 Description: Handles all EDNS0 related logic including ECS (Client Subnet) extraction/injection
              and MAC address embedding (Option 65001).
              Extracted from process.go for modularity.
+             OPTIMIZED: Removed unconditional string formatting in hot path (logging).
 */
 
 package main
@@ -101,17 +103,21 @@ func addEDNS0Options(msg *dns.Msg, ip net.IP, mac net.HardwareAddr) {
 	macMode := config.Server.EDNS0.MAC.Mode
 	macSource := config.Server.EDNS0.MAC.Source
 
-	var ecsLog string = "None"
-	var macLog string = "None"
+	// Debug logs are only generated if enabled to save allocations
+	debugEnabled := IsDebugEnabled()
 
 	for _, opt := range o.Option {
 		if ecs, ok := opt.(*dns.EDNS0_SUBNET); ok {
 			hasECS = true
-			ecsLog = fmt.Sprintf("Existing(%s/%d)", ecs.Address, ecs.SourceNetmask)
+			if debugEnabled {
+				LogDebug("[EDNS0] Existing ECS: %s/%d", ecs.Address, ecs.SourceNetmask)
+			}
 		} else if local, ok := opt.(*dns.EDNS0_LOCAL); ok && local.Code == EDNS0_OPTION_MAC {
 			hasMAC = true
 			existingMAC = net.HardwareAddr(local.Data)
-			macLog = fmt.Sprintf("Existing(%s)", existingMAC)
+			if debugEnabled {
+				LogDebug("[EDNS0] Existing MAC: %s", existingMAC)
+			}
 		}
 	}
 
@@ -121,38 +127,34 @@ func addEDNS0Options(msg *dns.Msg, ip net.IP, mac net.HardwareAddr) {
 			switch ecsMode {
 			case "preserve":
 				opts = append(opts, opt)
-				ecsLog = "Preserved"
 			case "add":
 				if hasECS {
 					opts = append(opts, opt)
-					ecsLog = "Preserved"
 				}
 			case "replace":
-				ecsLog = "Replacing"
+				// Skip existing if replacing
 			case "remove":
-				ecsLog = "Removed"
+				// Skip
 			}
 		case *dns.EDNS0_LOCAL:
 			if v.Code == EDNS0_OPTION_MAC {
 				switch macMode {
 				case "preserve":
 					opts = append(opts, opt)
-					macLog = "Preserved"
 				case "add":
 					if hasMAC {
 						opts = append(opts, opt)
-						macLog = "Preserved"
 					}
 				case "replace":
-					macLog = "Replacing"
+					// Skip existing
 				case "remove":
-					macLog = "Removed"
+					// Skip
 				case "prefer-edns0":
 					if hasMAC {
 						opts = append(opts, opt)
-						macLog = "Preserved(Preferred)"
 					}
 				case "prefer-arp":
+					// Skip
 				}
 			} else {
 				opts = append(opts, opt)
@@ -207,7 +209,9 @@ func addEDNS0Options(msg *dns.Msg, ip net.IP, mac net.HardwareAddr) {
 			SourceNetmask: mask,
 			Address:       ip,
 		})
-		ecsLog = fmt.Sprintf("Added(%s/%d)", ip, mask)
+		if debugEnabled {
+			LogDebug("[EDNS0] Added ECS: %s/%d", ip, mask)
+		}
 	}
 
 	shouldAddMAC := false
@@ -241,12 +245,15 @@ func addEDNS0Options(msg *dns.Msg, ip net.IP, mac net.HardwareAddr) {
 	}
 	if shouldAddMAC && macToAdd != nil {
 		opts = append(opts, &dns.EDNS0_LOCAL{Code: EDNS0_OPTION_MAC, Data: macToAdd})
-		macLog = fmt.Sprintf("Added(%s)", macToAdd)
+		if debugEnabled {
+			LogDebug("[EDNS0] Added MAC: %s", macToAdd)
+		}
 	}
 	o.Option = opts
 
-	LogDebug("[EDNS0] ClientIP=%v | ECS(%s): %s | MAC(%s): %s | Opts: %d",
-		ip, ecsMode, ecsLog, macMode, macLog, len(opts))
+	if debugEnabled {
+		LogDebug("[EDNS0] Final Options Count: %d", len(opts))
+	}
 }
 
 func determineMAC(arpMAC, edns0MAC net.HardwareAddr, source string) net.HardwareAddr {

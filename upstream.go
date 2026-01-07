@@ -1,8 +1,10 @@
 /*
 File: upstream.go
-Version: 1.7.0
+Version: 1.7.1
+Last Update: 2026-01-07
 Description: Defines the Upstream struct and handles downstream protocol exchange.
              REFACTORED: Connection pools moved to upstream_pool.go.
+             OPTIMIZED: Fixed buffer reuse in exchangeDoH to prevent double allocation.
 */
 
 package main
@@ -746,21 +748,41 @@ func (u *Upstream) exchangeDoH(ctx context.Context, req *dns.Msg, reqCtx *Reques
 	respBuf := bufPool.Get().([]byte)
 	defer bufPool.Put(respBuf)
 
-	// Reset buffer length but keep capacity
+	// Ensure we have capacity and reset slice length
+	if cap(respBuf) < 4096 {
+		respBuf = make([]byte, 4096)
+	}
 	respBuf = respBuf[:cap(respBuf)]
 
-	// ReadAll manually into pooled buffer to avoid allocation if possible
-	// Note: io.ReadAll allocates, so we read manually
-	var b bytes.Buffer
-	b.Grow(4096)
+	// Read directly into pooled buffer to avoid intermediate allocations
+	bytesRead := 0
+	for {
+		// If we filled the buffer, we need to grow
+		if bytesRead == len(respBuf) {
+			if len(respBuf) >= 65535 {
+				return nil, fmt.Errorf("response too large")
+			}
+			newCap := len(respBuf) * 2
+			if newCap > 65535 {
+				newCap = 65535
+			}
+			newBuf := make([]byte, newCap)
+			copy(newBuf, respBuf)
+			respBuf = newBuf
+		}
 
-	_, err = b.ReadFrom(limitReader)
-	if err != nil {
-		return nil, err
+		n, err := limitReader.Read(respBuf[bytesRead:])
+		bytesRead += n
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, err
+		}
 	}
 
 	resp := getMsg()
-	if err := resp.Unpack(b.Bytes()); err != nil {
+	if err := resp.Unpack(respBuf[:bytesRead]); err != nil {
 		putMsg(resp)
 		return nil, err
 	}
