@@ -1,0 +1,271 @@
+# ------------------------------------------------------------------------------
+# dproxy Reference Configuration (v3.2.0)
+# ------------------------------------------------------------------------------
+# This is the master configuration file documenting ALL available options.
+# Use this as a reference manual. For practical examples, see example_config.yaml.
+# ------------------------------------------------------------------------------
+
+# --- Logging Configuration ---
+# Controls where logs go and how they look.
+logging:
+  # Log Level: DEBUG, INFO, WARN, ERROR
+  # Default: "INFO"
+  level: "INFO"
+  
+  # Format: "text" (human readable) or "json" (structured for parsing).
+  # Note: "json" format ONLY applies to File output. Console and Syslog always use Text.
+  # Default: "text"
+  format: "text"
+  
+  # Outputs: List of destinations. 
+  # Options: "console", "file", "syslog"
+  # Default: ["console"]
+  outputs:
+    - "console"
+    # - "file"
+    # - "syslog"
+
+  # File configuration (Required if "file" is in outputs)
+  file:
+    path: "/var/log/dproxy.log"
+    permissions: 0644 # Octal permissions for the log file
+
+  # Syslog configuration (Required if "syslog" is in outputs)
+  syslog:
+    network: "udp"       # "udp", "tcp", or "unixgram"
+    address: "127.0.0.1:514"
+    tag: "dproxy"        # Tag to identifying logs in syslog
+    facility: 16         # Syslog facility (e.g., 16 is local0)
+
+# --- Server Configuration ---
+# Configures how dproxy listens for incoming connections.
+server:
+  # --- Listeners ---
+  # Define multiple entry points with different protocols/ports.
+  listeners:
+    # Standard DNS (UDP & TCP)
+    - address: "0.0.0.0"  # Can be a single string or a list of strings ["0.0.0.0", "::"]
+      port: 53            # Can be a single int or a list of ints [53, 5353]
+      protocol: "udp"     # Options: "udp", "tcp", "dns" (both)
+    
+    - address: "0.0.0.0"
+      port: 53
+      protocol: "tcp"
+    
+    # DNS over TLS (DoT)
+    - address: "0.0.0.0"
+      port: 853
+      protocol: "dot"     # Options: "dot", "tls"
+    
+    # DNS over QUIC (DoQ)
+    - address: "0.0.0.0"
+      port: 853
+      protocol: "doq"     # Options: "doq", "quic"
+
+    # DNS over HTTPS (DoH / DoH3)
+    - address: "0.0.0.0"
+      port: 443
+      protocol: "https"   # "https" enables both HTTP/2 (DoH) and HTTP/3 (DoH3/QUIC)
+                          # Use "doh" for just TCP/H2, or "doh3" for just UDP/QUIC
+
+  # --- TLS Settings ---
+  # Required for DoT, DoQ, DoH, and HTTPS listeners.
+  # If left empty, dproxy generates a self-signed certificate (useful for testing).
+  tls:
+    cert_file: "/path/to/fullchain.pem"
+    key_file: "/path/to/privkey.pem"
+  
+  # Log Client Name: 
+  # If true, attempts to resolve client IPs to hostnames using local hosts files
+  # (and system resolver) for richer logging. Useful for LAN environments.
+  # Default: false
+  log_client_name: true
+
+  # Global Timeout: Max time to wait for upstream processing.
+  # Default: "5s"
+  timeout: "5s"
+
+  # Insecure Upstream: If true, skips TLS verification for upstream DoT/DoH/DoQ servers.
+  # Security Warning: Only use for testing!
+  # Default: false
+  insecure_upstream: false
+
+  # Drop On Failure: 
+  # If true, dproxy silently drops the client query if all upstreams fail, 
+  # instead of returning SERVFAIL. This can force clients to retry faster.
+  # Default: false
+  drop_on_failure: false
+
+  # --- Discovery of Designated Resolvers (DDR) - RFC 9462 ---
+  # Allows clients to upgrade from unencrypted DNS to encrypted DNS automatically.
+  ddr:
+    enabled: true
+    # DNS name of this encrypted server. If empty, tries to extract from TLS cert.
+    host_name: "dns.your-server.com" 
+
+  # --- DNS over HTTPS (DoH) Specifics ---
+  doh:
+    # URL paths that accept DNS queries.
+    # Default: ["/dns-query"]
+    allowed_paths:
+      - "/dns-query"
+    # If true, rejects requests to paths not in allowed_paths.
+    strict_path: true
+
+  # --- EDNS0 (Extension Mechanisms for DNS) ---
+  # Controls how dproxy handles Client Subnet (ECS) and MAC address data options.
+  edns0:
+    ecs:
+      # Mode: 
+      # "add"     : Add client IP subnet if missing (Default)
+      # "preserve": Keep existing ECS option if present
+      # "replace" : Overwrite existing ECS option
+      # "remove"  : Strip ECS option entirely
+      mode: "add"
+      # Masks to use when adding ECS data
+      ipv4_mask: 32
+      ipv6_mask: 128
+      # source_mask: overrides both if set
+    
+    mac:
+      # Mode:
+      # "prefer-arp"  : Use ARP table data if available (Default)
+      # "prefer-edns0": Trust EDNS0 option 65001 if present in query
+      # "add"         : Add MAC to upstream query
+      # "remove"      : Remove MAC info before forwarding
+      mode: "prefer-arp"
+      # Source: Where to look for MAC info ("arp", "edns0", "both")
+      source: "arp"
+
+  # --- Response Manipulation ---
+  response:
+    # Remove Authority and Additional sections to reduce packet size
+    # Default: false
+    minimization: false
+    # Flatten CNAME chains into the final A/AAAA record
+    # Default: false
+    cname_flattening: false
+
+# --- ARP/NDP Configuration ---
+# Used to map IP addresses to MAC addresses for logging and rule matching.
+arp:
+  # Mode: "v4" (ARP), "v6" (NDP), "both", "none"
+  # Default: "both"
+  mode: "both"
+  # Timeout for system ARP command execution
+  # Default: "2s"
+  timeout: "2s"
+
+# --- Bootstrap DNS Configuration ---
+# DNS servers used ONLY to resolve hostnames of your Upstreams (e.g., dns.google).
+bootstrap:
+  servers:
+    - "1.1.1.1:53"
+    - "8.8.8.8:53"
+  # IP Version preference for bootstrap resolution: "ipv4", "ipv6", "both"
+  ip_version: "both"
+
+# --- Cache Configuration ---
+cache:
+  enabled: true
+  size: 10000 # Number of items to keep in memory
+  
+  # Disk Cache: Directory to store binary cache of processed hosts/blocklists.
+  # Significantly speeds up startup when using huge blocklists.
+  hosts_cache_dir: "/var/cache/dproxy"
+
+  # TTL (Time To Live) Overrides (in seconds)
+  min_ttl: 60       # Minimum TTL enforced on positive answers
+  max_ttl: 3600     # Maximum TTL allowed
+  min_neg_ttl: 10   # Minimum TTL for NXDOMAIN/NODATA
+  max_neg_ttl: 60   # Maximum TTL for NXDOMAIN/NODATA
+  hosts_ttl: 300    # TTL for records served from local hosts files
+
+  # TTL Strategy: Normalizes TTLs across multiple records in a response.
+  # Options: "none", "first", "last", "lowest", "highest", "average"
+  ttl_strategy: "none"
+
+  # Response Sorting: Reorders A/AAAA records.
+  # Options: "none", "round-robin" (randomize), "sorted" (lexical byte sort)
+  response_sorting: "none"
+
+  # --- Prefetching & Stale Cache ---
+  prefetch:
+    # Cross-Fetch: If a client asks for A, automatically fetch AAAA (or vice versa)
+    cross_fetch:
+      enabled: false
+      # Mode: "off", "on_a" (fetch others when A requested), "on_aaaa", "both"
+      mode: "off"
+      # Types to fetch in background
+      fetch_types: ["A", "AAAA", "HTTPS"]
+      max_concurrent: 10
+      timeout: "3s"
+    
+    # Stale Refresh: Background refresh of popular expired items
+    stale_refresh:
+      enabled: false
+      threshold_percent: 10  # Refresh if remaining TTL is < 10% of original
+      min_hits: 2            # Only refresh items requested at least 2 times
+      max_concurrent: 5
+      check_interval: "30s"
+
+    # Load Shedding: Protects the server by dropping background work under load
+    load_shedding:
+      enabled: true
+      max_goroutines: 10000   # Drop prefetch if goroutines > this
+      max_queue_usage_pct: 80 # Drop prefetch if worker queue is > 80% full
+
+# --- Routing Configuration ---
+routing:
+  # Define reusable groups of upstream servers
+  # Supported Protocols: udp://, tcp://, dot://, doq://, doh://, doh3://
+  # Append ?qps=N to any URL to rate-limit that specific upstream.
+  upstream_groups:
+    public_secure:
+      - "doh://cloudflare-dns.com/dns-query"
+      - "dot://dns.google:853"
+    isp_insecure:
+      - "udp://192.168.1.1:53?qps=50" # Rate limited to 50 QPS
+
+  # Routing Rules: Processed in order. First match wins.
+  # Uses a Trie for efficient Domain matching.
+  routing_rules:
+    - name: "Example Rule"
+      
+      # Match Conditions (All fields support lists)
+      # A rule matches if ALL non-empty criteria types match.
+      match:
+        # Client Identity
+        client_ip: ["192.168.1.100"]
+        client_cidr: ["192.168.2.0/24"]
+        client_mac: ["00:11:22:33:44:55", "?2:*:*:*:*:*"] # Supports wildcards
+        
+        # Server Identity (Ingress)
+        server_port: [853]
+        
+        # Query Data
+        query_domain: ["example.com", "*.example.net"]
+
+      # Upstreams: List of URLs OR a group name from upstream_groups
+      upstreams: public_secure
+      
+      # Strategy: How to pick an upstream from the list
+      # Options: "round-robin", "random", "failover", "fastest", "race"
+      strategy: "failover"
+      
+      # Hosts Files: Local overrides specific to this rule
+      hosts_files: ["/etc/hosts.example"]
+      hosts_urls: ["https://example.com/hosts.txt"]
+      
+      # Hosts options
+      hosts_wildcard: true  # Enable wildcard matching for these hosts files
+      hosts_optimize: true  # Deduplicate and optimize memory usage
+      refresh_interval: "24h" # How often to reload these hosts files
+
+  # Default Rule (REQUIRED): Fallback for queries not matching any rule above.
+  default:
+    upstreams: public_secure
+    strategy: "fastest"
+    hosts_files: ["/etc/hosts"]
+    refresh_interval: "1h"
+

@@ -1,206 +1,104 @@
 # ------------------------------------------------------------------------------
-# dproxy Configuration File (v3.2.0)
+# dproxy Example Configuration
 # ------------------------------------------------------------------------------
-# This configuration file controls all aspects of the dproxy server, including
-# network listeners, security settings, caching behavior, prefetching, 
-# traffic routing, and hardware address integration.
+# This file demonstrates common use cases.
+# See config.yaml for the full list of options.
 # ------------------------------------------------------------------------------
 
-# --- Logging Configuration ---
 logging:
-  # Log Level: DEBUG, INFO, WARN, ERROR
-  # Default: INFO
   level: "INFO"
-  
-  # Format: "text" (human readable) or "json" (structured for parsing)
-  # Default: "text"
-  # Note: "json" format ONLY applies to File output. Console and Syslog will always use Text.
-  format: "text"
-  
-  # Outputs: List of destinations. Options: "console", "file", "syslog"
-  # Default: ["console"]
-  outputs:
-    - "console"
-    # - "file"
-    # - "syslog"
+  outputs: ["console"]
 
-  # File configuration (only used if "file" is in outputs)
-  file:
-    path: "/var/log/dproxy.log"
-    permissions: 0644
-
-  # Syslog configuration (only used if "syslog" is in outputs)
-  syslog:
-    network: "udp"
-    address: "127.0.0.1:514"
-    tag: "dproxy"
-    facility: 16
-
-# --- Server Configuration ---
 server:
-  # --- Listeners (Recommended) ---
   listeners:
-    # Public Interface - Standard DNS
+    # Standard DNS for local network devices
     - address: "0.0.0.0"
       port: 53
       protocol: "udp"
-    - address: "0.0.0.0"
-      port: 53
-      protocol: "tcp"
     
-    # Public Interface - Encrypted DNS
+    # Encrypted DNS listener (DoT) for secure clients
     - address: "0.0.0.0"
       port: 853
       protocol: "dot"
-    - address: "0.0.0.0"
-      port: 443
-      protocol: "https"
 
-  # TLS Certificate settings (Required for DoT, DoQ, DoH, HTTPS)
+  # dproxy will generate a self-signed cert if these are empty
   tls:
     cert_file: ""
     key_file: ""
-  
-  # Log Client Name: If true, attempts to resolve client IPs to names using 
-  # local hosts files for logging purposes. (Useful for LANs)
-  log_client_name: true
-
-  # DDR (Discovery of Designated Resolvers) - RFC 9462
+    
+  # Enable DDR so clients can auto-upgrade to encrypted DNS
   ddr:
     enabled: true
-    # host_name: "dns.server.com"
 
-  # DoH (DNS over HTTPS) Specific Settings
-  doh:
-    allowed_paths:
-      - "/dns-query"
-    strict_path: true
-
-  # EDNS0 (Extension Mechanisms for DNS) Options
-  edns0:
-    ecs:
-      mode: "add"
-      ipv4_mask: 32
-      ipv6_mask: 128
-    mac:
-      mode: "prefer-arp"
-      source: "arp"
-
-  timeout: "5s"
-  insecure_upstream: false
-  drop_on_failure: false
-
-  # Response Manipulation
-  response:
-    minimization: false
-    cname_flattening: false
-
-# --- ARP/NDP Configuration ---
+# Use ARP to identify devices on the LAN by MAC address
 arp:
   mode: "both"
-  timeout: "2s"
 
-# --- Bootstrap DNS Configuration ---
-bootstrap:
-  servers:
-    - "1.1.1.1:53"
-    - "8.8.8.8:53"
-  ip_version: "both"
-
-# --- Cache Configuration ---
 cache:
   enabled: true
-  size: 10000 
-  
-  # Disk Cache: Directory to store binary cache of processed hosts/blocklists.
-  # Speeds up startup significantly for large blocklists.
-  hosts_cache_dir: "/var/cache/dproxy"
+  size: 50000
+  hosts_cache_dir: "/tmp/dproxy_cache" # Persist heavy blocklists to disk
+  min_ttl: 300 # Enforce a minimum 5-minute cache to reduce chatter
 
-  min_ttl: 60       
-  max_ttl: 3600     
-  min_neg_ttl: 10   
-  max_neg_ttl: 60   
-  hosts_ttl: 300
-  ttl_strategy: "none"
-  response_sorting: "none"
-
-  # Prefetch Configuration
-  prefetch:
-    cross_fetch:
-      enabled: false
-      mode: "off"
-      fetch_types: ["A", "AAAA", "HTTPS"]
-      max_concurrent: 10
-      timeout: "3s"
-    
-    stale_refresh:
-      enabled: false
-      threshold_percent: 10
-      min_hits: 2
-      check_interval: "30s"
-
-    # Load Shedding (New): Limits prefetching when system is under load
-    load_shedding:
-      enabled: true
-      max_goroutines: 10000   # Drop prefetch if goroutines exceed this count
-      max_queue_usage_pct: 80 # Drop prefetch if internal worker queue is > 80% full
-
-# --- Routing Configuration ---
 routing:
-  # Define reusable groups of upstream servers
-  # You can now append ?qps=N to any upstream URL to limit its rate.
-  # Example: udp://192.168.1.1:53?qps=50
+  # 1. Define your Upstreams
   upstream_groups:
-    public_secure:
-      - doh://cloudflare-dns.com/dns-query
-      - dot://dns.google:853
-    local_internal:
-      - udp://192.168.1.1:53
+    # Fast, encrypted public DNS
+    cloud_dns:
+      - "doh://1.1.1.1/dns-query"
+      - "doh://8.8.8.8/dns-query"
+    
+    # Internal company DNS (Plain UDP)
+    internal_dns:
+      - "udp://10.0.0.5:53"
+      - "udp://10.0.0.6:53"
 
-  # Routing Rules (Processed in order)
+    # Family Friendly DNS (Filters adult content)
+    family_safe:
+      - "doh://family.cloudflare-dns.com/dns-query"
+
+  # 2. Define Routing Logic
   routing_rules:
-    # Example 1: Blocklist (Ads/Trackers)
-    - name: "Blocklist"
+    # Scenario A: Ad-Blocking (The "Pi-hole" replacement)
+    # Blocks ads for everyone using a remote blocklist.
+    - name: "AdBlock"
       match:
-        query_domain:
-          - "*.ads.example.com"
-      upstreams: public_secure
-      hosts_files:
-        - "/etc/blocked.hosts"
+        # No specific match conditions = applies to all queries checking this list
+        # We rely on the hosts_files to return 0.0.0.0
+        query_domain: ["*"] 
+      # We don't actually forward these, the hosts file handles it. 
+      # But we need a fallback just in case the hosts file doesn't match.
+      upstreams: cloud_dns 
       hosts_urls:
         - "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
       hosts_wildcard: true
       hosts_optimize: true
-      # Refresh interval for this specific rule's hosts
       refresh_interval: "24h"
 
-    # Example 2: MAC Wildcards (Privacy/Randomized MACs)
-    # Matches MACs where the second char is '2', '6', 'A', or 'E' (locally administered)
-    # Or simple patterns like "00:11:*:*:*:*"
-    - name: "Randomized MACs"
+    # Scenario B: Split Horizon / Local Dev
+    # Routes any query for *.corp or *.lan to the internal DNS server.
+    - name: "Corporate VPN"
+      match:
+        query_domain: ["*.corp", "*.lan", "internal.company.com"]
+      upstreams: internal_dns
+      strategy: "failover" # Try first server, then second
+
+    # Scenario C: IoT Isolation
+    # Force specific devices (by MAC) to use the Family Safe DNS
+    # Useful for Kids' tablets or insecure IoT devices.
+    - name: "Kids & IoT"
       match:
         client_mac: 
-          - "?2:*:*:*:*:*"
-          - "?6:*:*:*:*:*"
-          - "?a:*:*:*:*:*"
-          - "?e:*:*:*:*:*"
-      upstreams: public_secure
-      strategy: random
+          - "aa:bb:cc:dd:ee:ff" # Tablet
+          - "12:34:56:*:*:*"    # All devices from this manufacturer OUI
+      upstreams: family_safe
+      strategy: "random"
 
-    # Example 3: Local Development
-    - name: "Local Dev"
-      match:
-        query_domain: ".dev.local"
-      upstreams: local_internal
-      hosts_files:
-        - "/etc/hosts.dev"
-      refresh_interval: "30s"
-
-  # Default Rule (REQUIRED)
+  # 3. Default Fallback
+  # If none of the above match, do this:
   default:
-    upstreams: public_secure
-    strategy: failover
-    hosts_files:
-      - "/etc/hosts"
-    refresh_interval: "1h"
+    upstreams: cloud_dns
+    strategy: "fastest" # Race them and pick the winner
+    hosts_files: 
+      - "/etc/hosts" # Always load local system hosts
 
