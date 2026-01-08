@@ -1,9 +1,10 @@
 /*
 File: recursive.go
-Version: 1.2.0
+Version: 1.4.0
 Description: Implements a full recursive (iterative) resolver with QNAME minimization,
              loop detection, and infrastructure caching (NS/Glue).
-             UPDATED: Added explicit Cache HIT/MISS logging for NS and Glue records.
+             UPDATED: Enhanced logging for QNAME minimization steps.
+             UPDATED: Minimization logic is robust; failures just stop priming and fall back to full resolution.
 */
 
 package main
@@ -147,21 +148,45 @@ func (r *RecursiveResolver) Resolve(ctx context.Context, req *dns.Msg, reqCtx *R
 	visited := make(map[string]int)
 
 	// QNAME Minimization Logic (RFC 7816)
+	// We walk down the labels from TLD to the full name.
 	if r.config.QNameMinimization && q.Qtype != dns.TypeNS {
 		labels := dns.SplitDomainName(qName)
 		// Iteratively resolve parents to prime the cache
+		// We start at the TLD (index len-1) and go down.
+		// Example: a.b.example.com.
+		// 1. com.
+		// 2. example.com.
+		// 3. b.example.com.
+		
 		for i := len(labels) - 1; i > 0; i-- {
 			// Construct partial name: e.g., "com.", "example.com."
 			partialName := dns.Fqdn(strings.Join(labels[len(labels)-1-i:], "."))
 
-			LogDebug("[RECURSION] [MINIMIZATION] Priming cache for partial: %s", partialName)
+			LogDebug("[RECURSION] [MINIMIZATION] Step: Querying partial label '%s' (NS) to prime cache", partialName)
+			
 			// Query for NS of the partial name
-			// We ignore the result; we just want the infrastructure cache populated
-			r.iterativeQuery(ctx, partialName, dns.TypeNS, 0, visited, reqCtx)
+			// We ignore the actual result object; we just want the infrastructure cache populated
+			// The smart fallback here is implicit: if this fails or returns NXDOMAIN,
+			// the infrastructure cache won't get updated for *this* level,
+			// and the next step (or the final full resolution) will pick up from the last known good zone.
+			resp, err := r.iterativeQuery(ctx, partialName, dns.TypeNS, 0, visited, reqCtx)
+			
+			if err != nil {
+				LogDebug("[RECURSION] [MINIMIZATION] Failed for '%s': %v. Stopping minimization, falling back to full resolution.", partialName, err)
+				break
+			}
+			
+			if resp != nil && resp.Rcode == dns.RcodeNameError {
+				// NXDOMAIN on a parent label implies the child doesn't exist either (usually).
+				// We stop here.
+				LogDebug("[RECURSION] [MINIMIZATION] Got NXDOMAIN for '%s'. Stopping minimization.", partialName)
+				break 
+			}
 		}
 	}
 
 	// Full resolution
+	LogDebug("[RECURSION] [FULL-RESOLVE] Starting full resolution for %s", qName)
 	resp, err := r.iterativeQuery(ctx, qName, q.Qtype, 0, visited, reqCtx)
 	if err != nil {
 		LogDebug("[RECURSION] [FAILED] Resolution failed for %s: %v", qName, err)
@@ -185,12 +210,10 @@ func (r *RecursiveResolver) iterativeQuery(ctx context.Context, qName string, qT
 	}
 	visited[loopKey]++
 
-	LogDebug("[RECURSION] [STEP %d] Querying %s %s", depth, qName, dns.TypeToString[qType])
-
 	// 1. Find closest zone with known NS servers
 	zone, nsList, hit := r.getClosestNS(qName)
 	if !hit {
-		LogDebug("[RECURSION] [NS-MISS] No cached NS found for %s, falling back to ROOT hints.", qName)
+		LogDebug("[RECURSION] [NS-MISS] No cached NS found for %s, falling back to ROOT hints", qName)
 		nsList = r.rootHints
 	} else {
 		LogDebug("[RECURSION] [NS-HIT] Found cached NS for closest zone '%s' (%d servers). Shortcut taken.", zone, len(nsList))
@@ -203,7 +226,10 @@ func (r *RecursiveResolver) iterativeQuery(ctx context.Context, qName string, qT
 	rand.Shuffle(len(nsList), func(i, j int) { nsList[i], nsList[j] = nsList[j], nsList[i] })
 
 	for i, ns := range nsList {
-		LogDebug("[RECURSION] [ATTEMPT %d/%d] Trying NS %s for zone %s", i+1, len(nsList), ns.Name, zone)
+		// Avoid overly verbose logs for deep retries, but keep top-level attempts clear
+		if i < 3 { 
+			LogDebug("[RECURSION] [ATTEMPT %d/%d] Trying NS %s for zone %s", i+1, len(nsList), ns.Name, zone)
+		}
 
 		// Resolve NS IP if missing (Glue logic)
 		ips := r.getIPsForNS(ctx, ns, depth, visited, reqCtx)
@@ -220,16 +246,13 @@ func (r *RecursiveResolver) iterativeQuery(ctx context.Context, qName string, qT
 		}
 
 		// 2. Query the Authoritative Server
-		LogDebug("[RECURSION] Sending query to %s (%s)", targetIP, ns.Name)
+		// Log less verbosely for the exchange itself unless error
 		response, err := r.exchange(ctx, targetIP, qName, qType)
 		if err != nil {
 			LogDebug("[RECURSION] Exchange failed with %s (%s): %v", ns.Name, targetIP, err)
 			lastErr = err
 			continue
 		}
-
-		LogDebug("[RECURSION] Received response from %s: %s (Answer: %d, Auth: %d, Extra: %d)",
-			targetIP, dns.RcodeToString[response.Rcode], len(response.Answer), len(response.Ns), len(response.Extra))
 
 		// 3. Analyze Response
 		switch response.Rcode {
@@ -248,14 +271,14 @@ func (r *RecursiveResolver) iterativeQuery(ctx context.Context, qName string, qT
 					return r.iterativeQuery(ctx, qName, qType, depth+1, visited, reqCtx)
 				}
 				// NODATA (Success RCode but no answer and no useful referral)
-				LogDebug("[RECURSION] NODATA received for %s", qName)
+				LogDebug("[RECURSION] NODATA received for %s from %s", qName, ns.Name)
 				return response, nil
 			}
 
 			// CNAME Handling
 			if len(response.Answer) > 0 && response.Answer[0].Header().Rrtype == dns.TypeCNAME && qType != dns.TypeCNAME {
 				cnameRR := response.Answer[0].(*dns.CNAME)
-				LogDebug("[RECURSION] CNAME found: %s -> %s. Restarting recursion for target.", qName, cnameRR.Target)
+				LogDebug("[RECURSION] CNAME found: %s -> %s [Restarting recursion]", qName, cnameRR.Target)
 				
 				// Restart recursion for the CNAME target
 				targetResp, err := r.iterativeQuery(ctx, cnameRR.Target, qType, depth+1, visited, reqCtx)
@@ -269,11 +292,11 @@ func (r *RecursiveResolver) iterativeQuery(ctx context.Context, qName string, qT
 			}
 
 			// Actual Answer
-			LogDebug("[RECURSION] Final answer received for %s", qName)
+			LogDebug("[RECURSION] Final answer received for %s from %s", qName, ns.Name)
 			return response, nil
 
 		case dns.RcodeNameError:
-			LogDebug("[RECURSION] NXDOMAIN received for %s", qName)
+			LogDebug("[RECURSION] NXDOMAIN received for %s from %s", qName, ns.Name)
 			return response, nil
 
 		default:
