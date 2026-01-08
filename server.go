@@ -608,7 +608,17 @@ type dotResponseWriter struct {
 func (w *dotResponseWriter) WriteMsg(msg *dns.Msg) error {
 	w.writeMu.Lock()
 	defer w.writeMu.Unlock()
-	return w.Conn.WriteMsg(msg)
+
+	buf := bufPool.Get().([]byte)
+	out, err := msg.PackBuffer(buf[:0])
+	if err != nil {
+		bufPool.Put(buf)
+		return err
+	}
+	
+	_, err = w.Conn.Write(out)
+	bufPool.Put(out)
+	return err
 }
 
 func (w *dotResponseWriter) Hijack() {
@@ -626,24 +636,27 @@ type doqResponseWriter struct {
 func (w *doqResponseWriter) LocalAddr() net.Addr  { return nil }
 func (w *doqResponseWriter) RemoteAddr() net.Addr { return w.remoteAddr }
 func (w *doqResponseWriter) WriteMsg(msg *dns.Msg) error {
-	buf, err := msg.Pack()
+	buf := bufPool.Get().([]byte)
+	
+	// Reserve 2 bytes for length prefix
+	// Ensure capacity
+	if cap(buf) < 2 {
+		buf = make([]byte, 2, 4096)
+	}
+	out := buf[:2]
+	
+	packed, err := msg.PackBuffer(out)
 	if err != nil {
+		bufPool.Put(buf)
 		return err
 	}
 
-	fullLen := 2 + len(buf)
-	sendBuf := bufPool.Get().([]byte)
-	if cap(sendBuf) < fullLen {
-		sendBuf = make([]byte, fullLen)
-	} else {
-		sendBuf = sendBuf[:fullLen]
-	}
-	defer bufPool.Put(sendBuf)
+	// Calculate DNS message length (total length - 2 prefix bytes)
+	dnsLen := len(packed) - 2
+	binary.BigEndian.PutUint16(packed[:2], uint16(dnsLen))
 
-	binary.BigEndian.PutUint16(sendBuf[:2], uint16(len(buf)))
-	copy(sendBuf[2:], buf)
-
-	_, err = w.stream.Write(sendBuf)
+	_, err = w.stream.Write(packed)
+	bufPool.Put(packed)
 	return err
 }
 func (w *doqResponseWriter) Write(b []byte) (int, error) { return w.stream.Write(b) }
@@ -665,12 +678,16 @@ func (w *dohResponseWriter) RemoteAddr() net.Addr {
 	return addr
 }
 func (w *dohResponseWriter) WriteMsg(msg *dns.Msg) error {
-	buf, err := msg.Pack()
+	buf := bufPool.Get().([]byte)
+	out, err := msg.PackBuffer(buf[:0])
 	if err != nil {
+		bufPool.Put(buf)
 		return err
 	}
+	
 	w.w.Header().Set("Content-Type", "application/dns-message")
-	_, err = w.w.Write(buf)
+	_, err = w.w.Write(out)
+	bufPool.Put(out)
 	return err
 }
 func (w *dohResponseWriter) Write(b []byte) (int, error) { return w.w.Write(b) }

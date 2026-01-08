@@ -230,19 +230,44 @@ func parseReader(sourceName string, r io.Reader, forward map[string][]net.IP, re
 			continue
 		}
 
-		line := string(lineBytes)
-		fields := strings.Fields(line)
-		if len(fields) == 0 {
-			continue
+		// Find first field delimiter
+		splitIdx := -1
+		for i, b := range lineBytes {
+			if b == ' ' || b == '\t' {
+				splitIdx = i
+				break
+			}
 		}
 
-		ipStr := fields[0]
-		ip := net.ParseIP(ipStr)
+		var firstField, rest []byte
+		if splitIdx == -1 {
+			firstField = lineBytes
+			rest = nil
+		} else {
+			firstField = lineBytes[:splitIdx]
+			rest = lineBytes[splitIdx+1:]
+		}
+
+		// Check if first field is IP
+		ip := net.ParseIP(string(firstField))
 
 		if ip != nil {
-			if len(fields) < 2 {
+			// --- HOSTS FORMAT (IP Hostname...) ---
+			// Need at least one hostname
+			// Scan 'rest' to see if there is any non-whitespace content
+			hasHosts := false
+			if len(rest) > 0 {
+				for _, b := range rest {
+					if b != ' ' && b != '\t' {
+						hasHosts = true
+						break
+					}
+				}
+			}
+			if !hasHosts {
 				continue
 			}
+
 			hostsCount++
 			isBlocked := isBlockedIP(ip)
 			ipKey := ip.String()
@@ -251,24 +276,52 @@ func parseReader(sourceName string, r io.Reader, forward map[string][]net.IP, re
 					addedIPs++
 				}
 			}
-			for _, originalHost := range fields[1:] {
-				host := strings.ToLower(strings.Trim(originalHost, "."))
+
+			// Iterate over hostnames in 'rest' without allocating a slice
+			pos := 0
+			end := len(rest)
+			for pos < end {
+				// Skip whitespace
+				for pos < end && (rest[pos] == ' ' || rest[pos] == '\t') {
+					pos++
+				}
+				if pos >= end {
+					break
+				}
+
+				// Find end of token
+				tokenStart := pos
+				for pos < end && rest[pos] != ' ' && rest[pos] != '\t' {
+					pos++
+				}
+				hostBytes := rest[tokenStart:pos]
+
+				// Process hostname
+				// Note: strings.Trim/ToLower allocates, but it's unavoidable for the map key.
+				host := string(hostBytes)
+				host = strings.ToLower(strings.Trim(host, "."))
+
 				if host == "" {
 					continue
 				}
+				// Skip if hostname looks like an IP
 				if net.ParseIP(host) != nil {
 					continue
 				}
+
 				forward[host] = append(forward[host], ip)
 				if !isBlocked {
 					reverse[ipKey] = append(reverse[ipKey], host)
 				}
 				addedNames++
 			}
+
 		} else {
+			// --- DOMAINS FORMAT (Domain) ---
 			domainsCount++
-			originalHost := fields[0]
-			host := strings.ToLower(strings.Trim(originalHost, "."))
+			host := string(firstField)
+			host = strings.ToLower(strings.Trim(host, "."))
+
 			if host != "" {
 				if net.ParseIP(host) != nil {
 					continue

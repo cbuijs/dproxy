@@ -10,7 +10,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"hash/fnv"
+	"hash/maphash"
 	"sync"
 	"time"
 	"crypto/tls"
@@ -25,13 +25,8 @@ const (
 	poolShardCount  = 256 // Number of shards for connection pools
 )
 
-// packBufPool is a buffer pool to minimize allocations during DoQ framing.
-var packBufPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, 0, 4096)
-		return &b
-	},
-}
+// Global seed for maphash to ensure consistent hashing per process run
+var poolHasherSeed = maphash.MakeSeed()
 
 // --- Sharded TCP/DoT Connection Pool ---
 
@@ -57,9 +52,10 @@ func newTCPConnPool() *TCPConnPool {
 }
 
 func (p *TCPConnPool) getShard(key string) *tcpPoolShard {
-	h := fnv.New32a()
-	h.Write([]byte(key))
-	return p.shards[h.Sum32()%uint32(poolShardCount)]
+	var h maphash.Hash
+	h.SetSeed(poolHasherSeed)
+	h.WriteString(key)
+	return p.shards[h.Sum64()&(poolShardCount-1)]
 }
 
 func (p *TCPConnPool) Get(key string) *dns.Conn {
@@ -121,9 +117,10 @@ func newDoQPool() *DoQPool {
 }
 
 func (p *DoQPool) getShard(key string) *doqPoolShard {
-	h := fnv.New32a()
-	h.Write([]byte(key))
-	return p.shards[h.Sum32()%uint32(poolShardCount)]
+	var h maphash.Hash
+	h.SetSeed(poolHasherSeed)
+	h.WriteString(key)
+	return p.shards[h.Sum64()&(poolShardCount-1)]
 }
 
 func (p *DoQPool) Get(ctx context.Context, addr string, tlsConf *tls.Config) (quic.Connection, error) {

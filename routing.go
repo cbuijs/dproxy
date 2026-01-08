@@ -405,18 +405,15 @@ func macEqual(a, b net.HardwareAddr) bool {
 }
 
 // Simple wildcard matcher for strings (supports * and ?)
+// OPTIMIZED: Works on bytes for ASCII strings (MACs/Hex) to avoid rune allocation.
 func matchWildcard(s, pattern string) bool {
-	// Simple greedy glob match
 	// Fast path for exact match
 	if s == pattern {
 		return true
 	}
 	
-	// Convert to runes to handle potential unicode, though MACs are ASCII
-	rs := []rune(s)
-	rp := []rune(pattern)
-	lenS := len(rs)
-	lenP := len(rp)
+	lenS := len(s)
+	lenP := len(pattern)
 	
 	// Index in string, Index in pattern
 	si := 0
@@ -428,10 +425,10 @@ func matchWildcard(s, pattern string) bool {
 	
 	for si < lenS {
 		// Single character match or exact match
-		if pi < lenP && (rp[pi] == '?' || rp[pi] == rs[si]) {
+		if pi < lenP && (pattern[pi] == '?' || pattern[pi] == s[si]) {
 			si++
 			pi++
-		} else if pi < lenP && rp[pi] == '*' {
+		} else if pi < lenP && pattern[pi] == '*' {
 			// Star match - record position and assume zero chars first
 			starIdx = pi
 			matchIdx = si
@@ -447,7 +444,7 @@ func matchWildcard(s, pattern string) bool {
 	}
 	
 	// Consume remaining stars in pattern
-	for pi < lenP && rp[pi] == '*' {
+	for pi < lenP && pattern[pi] == '*' {
 		pi++
 	}
 	

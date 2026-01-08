@@ -414,12 +414,11 @@ func parseUpstream(raw string, ipVersion string, insecure bool, timeout string) 
 }
 
 func resolveHostnameWithBootstrap(ctx context.Context, hostname string, preferredVersion string) ([]net.IP, error) {
-	// This function now just wraps the logic to query the bootstrap servers
-	// It is called by the background refresher
+	if len(bootstrapServers) == 0 {
+		return nil, errors.New("no bootstrap servers configured")
+	}
 
-	var allIPs []net.IP
-	var lastErr error
-
+	// Determine query types based on preference
 	var qTypes []uint16
 	if preferredVersion == "ipv4" || preferredVersion == "both" {
 		qTypes = append(qTypes, dns.TypeA)
@@ -428,46 +427,109 @@ func resolveHostnameWithBootstrap(ctx context.Context, hostname string, preferre
 		qTypes = append(qTypes, dns.TypeAAAA)
 	}
 
-	for _, bootstrap := range bootstrapServers {
-		// Use a very short timeout for individual bootstrap queries
-		// We don't want to stall the refresher for too long
-		c := &dns.Client{Net: "udp", Timeout: 2 * time.Second}
+	// Result container
+	type result struct {
+		ips []net.IP
+		err error
+	}
 
-		for _, qType := range qTypes {
-			msg := getMsg()
-			msg.SetQuestion(dns.Fqdn(hostname), qType)
+	// We use a buffered channel to avoid leaking goroutines
+	resultCh := make(chan result, len(bootstrapServers))
+	
+	// Create a child context to cancel other requests once one succeeds
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-			// Use the passed context to allow cancellation
-			resp, _, err := c.ExchangeContext(ctx, msg, bootstrap)
-			putMsg(msg)
+	// Launch a goroutine for each bootstrap server
+	for _, server := range bootstrapServers {
+		go func(bootstrapServer string) {
+			// Check context before starting (fail fast)
+			if ctx.Err() != nil {
+				return
+			}
 
-			if err == nil && resp != nil {
-				for _, ans := range resp.Answer {
-					switch r := ans.(type) {
-					case *dns.A:
-						allIPs = append(allIPs, r.A)
-					case *dns.AAAA:
-						allIPs = append(allIPs, r.AAAA)
+			var ips []net.IP
+			var err error
+			
+			// Try all required query types against this server
+			c := &dns.Client{Net: "udp", Timeout: 2 * time.Second}
+			
+			for _, qType := range qTypes {
+				// Check context again between queries
+				if ctx.Err() != nil {
+					return
+				}
+
+				msg := getMsg()
+				msg.SetQuestion(dns.Fqdn(hostname), qType)
+
+				r, _, e := c.ExchangeContext(ctx, msg, bootstrapServer)
+				putMsg(msg)
+
+				if e != nil {
+					err = e
+					// If one type fails, we might still want the other? 
+					// Usually if a server is down, both fail. 
+					// But let's continue to try to get partial results if possible?
+					// The original logic required Success for the loop to continue adding IPs.
+					continue
+				}
+
+				if r != nil {
+					for _, ans := range r.Answer {
+						switch rec := ans.(type) {
+						case *dns.A:
+							ips = append(ips, rec.A)
+						case *dns.AAAA:
+							ips = append(ips, rec.AAAA)
+						}
 					}
 				}
-			} else {
-				lastErr = err
 			}
-		}
 
-		if len(allIPs) > 0 {
-			break
+			// If we found IPs, it's a success
+			if len(ips) > 0 {
+				select {
+				case resultCh <- result{ips: ips, err: nil}:
+					cancel() // Cancel others immediately
+				case <-ctx.Done():
+				}
+			} else {
+				// If no IPs, report error (or nil if it was just empty response)
+				if err == nil {
+					err = fmt.Errorf("no IPs found on %s", bootstrapServer)
+				}
+				select {
+				case resultCh <- result{ips: nil, err: err}:
+				case <-ctx.Done():
+				}
+			}
+		}(server)
+	}
+
+	// Wait for results
+	var lastErr error
+	failureCount := 0
+
+	for i := 0; i < len(bootstrapServers); i++ {
+		select {
+		case res := <-resultCh:
+			if res.ips != nil {
+				return res.ips, nil
+			}
+			if res.err != nil {
+				lastErr = res.err
+			}
+			failureCount++
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
 	}
 
-	if len(allIPs) == 0 {
-		if lastErr != nil {
-			return nil, lastErr
-		}
-		return nil, fmt.Errorf("no IPs found")
+	if lastErr != nil {
+		return nil, fmt.Errorf("all bootstrap servers failed: %w", lastErr)
 	}
-
-	return allIPs, nil
+	return nil, fmt.Errorf("no IPs found from any bootstrap server")
 }
 
 // --- Exchange ---
@@ -645,23 +707,27 @@ func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetAddr str
 	}
 	defer stream.Close()
 
-	buf, err := req.Pack()
+	// Use bufPool for packing
+	buf := bufPool.Get().([]byte)
+	
+	// Ensure capacity for at least header + some body
+	if cap(buf) < 2 {
+		buf = make([]byte, 0, 4096)
+	}
+	
+	// Start with 2 placeholder bytes for length
+	out := buf[:2]
+	
+	// Pack message into buffer (PackBuffer appends)
+	packed, err := req.PackBuffer(out)
 	if err != nil {
+		bufPool.Put(buf)
 		return nil, err
 	}
-
-	// DoQ Framing
-	fullLen := 2 + len(buf)
-	sendBuf := packBufPool.Get().(*[]byte)
-	if cap(*sendBuf) < fullLen {
-		*sendBuf = make([]byte, fullLen)
-	} else {
-		*sendBuf = (*sendBuf)[:fullLen]
-	}
-	defer packBufPool.Put(sendBuf)
-
-	binary.BigEndian.PutUint16(*sendBuf, uint16(len(buf)))
-	copy((*sendBuf)[2:], buf)
+	
+	// Calculate and write length
+	dnsLen := len(packed) - 2
+	binary.BigEndian.PutUint16(packed[:2], uint16(dnsLen))
 
 	deadline, ok := ctx.Deadline()
 	if !ok {
@@ -669,9 +735,15 @@ func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetAddr str
 	}
 	stream.SetDeadline(deadline)
 
-	if _, err := stream.Write(*sendBuf); err != nil {
+	if _, err := stream.Write(packed); err != nil {
+		bufPool.Put(packed)
 		return nil, err
 	}
+	
+	// We can reuse 'packed' (which is 'buf' backing array) if we want, 
+	// but for simplicity and safety against async socket behavior, 
+	// we put it back and get a fresh one for reading.
+	bufPool.Put(packed)
 
 	lBuf := make([]byte, 2)
 	if _, err := io.ReadFull(stream, lBuf); err != nil {
@@ -684,20 +756,20 @@ func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetAddr str
 		return nil, fmt.Errorf("upstream response too large: %d", length)
 	}
 
-	respBuf := packBufPool.Get().(*[]byte)
-	if cap(*respBuf) < int(length) {
-		*respBuf = make([]byte, length)
+	respBuf := bufPool.Get().([]byte)
+	if cap(respBuf) < int(length) {
+		respBuf = make([]byte, length)
 	} else {
-		*respBuf = (*respBuf)[:length]
+		respBuf = respBuf[:length]
 	}
-	defer packBufPool.Put(respBuf)
+	defer bufPool.Put(respBuf)
 
-	if _, err := io.ReadFull(stream, *respBuf); err != nil {
+	if _, err := io.ReadFull(stream, respBuf); err != nil {
 		return nil, err
 	}
 
 	resp := getMsg()
-	if err := resp.Unpack(*respBuf); err != nil {
+	if err := resp.Unpack(respBuf); err != nil {
 		putMsg(resp)
 		return nil, err
 	}
@@ -712,12 +784,21 @@ func (u *Upstream) exchangeDoH(ctx context.Context, req *dns.Msg, reqCtx *Reques
 
 	// OPTIMIZATION: Use bufPool for packing
 	buf := bufPool.Get().([]byte)
-	defer bufPool.Put(buf)
-
-	packed, err := req.PackBuffer(buf)
+	
+	// Fix: Reset buffer length to 0 so PackBuffer uses it as scratch and doesn't append after garbage
+	packed, err := req.PackBuffer(buf[:0])
 	if err != nil {
+		bufPool.Put(buf)
 		return nil, err
 	}
+	
+	// Note: We cannot defer Put(buf) here because 'packed' might alias 'buf' or be a new slice.
+	// We need to Put 'packed' (or the original buf if packed didn't grow).
+	// Simplest safe way: Put 'packed' after request is sent, but body reading is async?
+	// No, bytes.NewReader uses the slice. http.NewRequestWithContext doesn't read immediately.
+	// client.Do reads it.
+	// So we must hold the buffer until client.Do returns.
+	defer bufPool.Put(packed)
 
 	dynHost, dynPath := u.getDynamicConfig(reqCtx)
 	urlStr := fmt.Sprintf("https://%s:%s%s", dynHost, u.Port, dynPath)
@@ -749,29 +830,46 @@ func (u *Upstream) exchangeDoH(ctx context.Context, req *dns.Msg, reqCtx *Reques
 	defer bufPool.Put(respBuf)
 
 	// Ensure we have capacity and reset slice length
+	// We want to read INTO the buffer, so we need a slice with length/cap.
+	// But we don't know the content length sometimes (chunked).
+	// We start with full cap.
 	if cap(respBuf) < 4096 {
 		respBuf = make([]byte, 4096)
 	}
-	respBuf = respBuf[:cap(respBuf)]
-
-	// Read directly into pooled buffer to avoid intermediate allocations
+	// We use the buffer as a scratch space to read.
+	// Actually, we want to append read data.
+	// Let's reset to 0 length and append? No, Read needs a target.
+	// We will read into the buffer up to its capacity.
+	
+	// Better: ReadAll-like logic but into pooled buffer
+	// We'll treat respBuf as the container.
+	// Reslice to full capacity to allow reading.
+	readTarget := respBuf[:cap(respBuf)]
 	bytesRead := 0
+	
 	for {
-		// If we filled the buffer, we need to grow
-		if bytesRead == len(respBuf) {
-			if len(respBuf) >= 65535 {
+		if bytesRead == len(readTarget) {
+			// Grow
+			if len(readTarget) >= 65535 {
 				return nil, fmt.Errorf("response too large")
 			}
-			newCap := len(respBuf) * 2
+			newCap := len(readTarget) * 2
 			if newCap > 65535 {
 				newCap = 65535
 			}
 			newBuf := make([]byte, newCap)
-			copy(newBuf, respBuf)
-			respBuf = newBuf
+			copy(newBuf, readTarget)
+			readTarget = newBuf
+			// If we grew, we can't Put the old 'respBuf' if we overwrote the var.
+			// But 'defer bufPool.Put(respBuf)' captures the original slice header?
+			// No, arguments are evaluated at call time. It captures the original.
+			// If we grow, we lose the ability to pool the *new* buffer unless we update logic.
+			// This is complex for a simple optimization.
+			// Let's stick to simple pooling: if it fits, good. If not, alloc.
+			// But we must NOT panic or corrupt.
 		}
 
-		n, err := limitReader.Read(respBuf[bytesRead:])
+		n, err := limitReader.Read(readTarget[bytesRead:])
 		bytesRead += n
 		if err != nil {
 			if err == io.EOF {
@@ -782,7 +880,7 @@ func (u *Upstream) exchangeDoH(ctx context.Context, req *dns.Msg, reqCtx *Reques
 	}
 
 	resp := getMsg()
-	if err := resp.Unpack(respBuf[:bytesRead]); err != nil {
+	if err := resp.Unpack(readTarget[:bytesRead]); err != nil {
 		putMsg(resp)
 		return nil, err
 	}

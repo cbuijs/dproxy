@@ -11,7 +11,7 @@ package main
 import (
 	"container/list"
 	"context"
-	"hash/fnv"
+	"hash/maphash"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +20,9 @@ import (
 )
 
 const shardCount = 256
+
+// Global seed for maphash to ensure consistent hashing per process run
+var hasherSeed = maphash.MakeSeed()
 
 type CacheItem struct {
 	Key         string
@@ -62,9 +65,11 @@ func newDNSCache() *DNSCache {
 }
 
 func (c *DNSCache) getShard(key string) *CacheShard {
-	h := fnv.New32a()
-	h.Write([]byte(key))
-	return c.shards[h.Sum32()%uint32(shardCount)]
+	var h maphash.Hash
+	h.SetSeed(hasherSeed)
+	h.WriteString(key)
+	// shardCount is 256 (power of 2), so we can use bitwise AND for modulo
+	return c.shards[h.Sum64()&(shardCount-1)]
 }
 
 func maintainDNSCache(ctx context.Context) {
