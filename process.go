@@ -1,9 +1,9 @@
 /*
 File: process.go
-Version: 3.2.0
-Last Update: 2026-01-07
+Version: 3.3.0
+Last Update: 2026-01-08
 Description: Handles the core processing logic for DNS requests.
-             UPDATED: Pass 'ruleName' and client info to HOSTS lookup for better logging.
+             UPDATED: Added branching logic for Recursive Resolver in processDNSRequest.
 */
 
 package main
@@ -170,11 +170,18 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		}
 	}
 
-	// --- UPSTREAM FORWARDING ---
+	// --- UPSTREAM FORWARDING / RECURSION ---
 	// This block executes ONLY on a CACHE MISS (or expiration).
+
+	// Check if this is a recursive lookup
+	isRecursive := false
+	if len(selectedUpstreams) == 1 && selectedUpstreams[0].Proto == "recursive" {
+		isRecursive = true
+	}
+
 	msg := r.Copy()
 	addEDNS0Options(msg, ip, mac)
-	
+
 	// Only build upstream info if we log debug or if we log info
 	upstreamQInfo := ""
 	if IsDebugEnabled() || IsInfoEnabled() {
@@ -186,12 +193,29 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	}
 
 	// --- Singleflight Optimization with Pipelining Potential ---
-	
+
 	// Create a safe clone for the async singleflight operation
 	safeReqCtx := reqCtx.Clone()
 
 	// Use cacheKey as the suppression key
 	ch := requestGroup.DoChan(cacheKey, func() (interface{}, error) {
+		// RECURSIVE RESOLUTION BRANCH
+		if isRecursive {
+			if !config.Recursion.Enabled {
+				return nil, fmt.Errorf("recursion selected for %s but disabled in config", safeReqCtx.QueryName)
+			}
+			if recursiveResolver == nil {
+				return nil, fmt.Errorf("recursive resolver not initialized")
+			}
+
+			resp, err := recursiveResolver.Resolve(context.Background(), msg, safeReqCtx)
+			if err != nil {
+				return nil, err
+			}
+			return queryResult{msg: resp, upstreamStr: "RECURSIVE", rtt: 0}, nil
+		}
+
+		// STANDARD UPSTREAM FORWARDING
 		upstreamTimeout := getTimeout()
 		if upstreamTimeout == 0 {
 			upstreamTimeout = 5 * time.Second
@@ -199,7 +223,6 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		uCtx, cancel := context.WithTimeout(context.Background(), upstreamTimeout)
 		defer cancel()
 
-		// PASS ruleName to strategy
 		resp, upstreamStr, rtt, err := forwardToUpstreams(uCtx, msg, selectedUpstreams, selectedStrategy, ruleName, safeReqCtx)
 		if err != nil {
 			return nil, err
@@ -219,13 +242,13 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 
 	if result.Err != nil {
 		if errors.Is(result.Err, context.DeadlineExceeded) || errors.Is(result.Err, context.Canceled) {
-			LogWarn("Query timeout for %s from %s (Upstreams busy/slow)", qInfo, ip)
+			LogWarn("Query timeout for %s from %s", qInfo, ip)
 		} else {
-			LogError("Error forwarding %s from %s: %v", qInfo, ip, result.Err)
+			LogError("Error resolving %s from %s: %v", qInfo, ip, result.Err)
 		}
 
 		if config.Server.DropOnFailure {
-			LogDebug("[PROCESS] Dropping query %s due to upstream failure (drop_on_failure=true).", qInfo)
+			LogDebug("[PROCESS] Dropping query %s due to failure (drop_on_failure=true).", qInfo)
 		} else {
 			dns.HandleFailed(w, r)
 		}
@@ -241,7 +264,7 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	}
 
 	if resp != nil {
-		// Pipelining Prep: All processing happens BEFORE response
+		// Post-processing
 		cleanResponse(resp)
 
 		if config.Server.Response.CNAMEFlattening {
@@ -256,23 +279,17 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	if config.Cache.Enabled && resp != nil {
 		addToCache(cacheKey, resp)
 
-		// Prefetch Pipelining: Fire and forget
-		// REQUIREMENT: Cross-fetching only happens after a CACHE-MISS (we are here).
-		// REQUIREMENT: Check if it is an A or AAAA record.
+		// Prefetch Pipelining (Only for A/AAAA queries and Forwarding modes, not recursion usually needed)
 		if config.Cache.Prefetch.CrossFetch.Enabled && resp.Rcode == dns.RcodeSuccess && len(resp.Answer) > 0 {
 			mode := config.Cache.Prefetch.CrossFetch.Mode
 			shouldPrefetch := false
 
-			// Only trigger if the current query matches the configured mode for A/AAAA
 			switch mode {
 			case "on_a":
 				shouldPrefetch = (qType == dns.TypeA)
 			case "on_aaaa":
 				shouldPrefetch = (qType == dns.TypeAAAA)
 			case "both":
-				shouldPrefetch = (qType == dns.TypeA || qType == dns.TypeAAAA)
-			default:
-				// Fallback to strict "both" if mode is weird but enabled
 				shouldPrefetch = (qType == dns.TypeA || qType == dns.TypeAAAA)
 			}
 
@@ -284,7 +301,6 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 					upstreams:  selectedUpstreams,
 					strategy:   selectedStrategy,
 				}
-
 				if len(reqCtx.ClientIP) > 0 {
 					req.clientIP = make(net.IP, len(reqCtx.ClientIP))
 					copy(req.clientIP, reqCtx.ClientIP)
@@ -293,9 +309,7 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 					req.clientMAC = make(net.HardwareAddr, len(reqCtx.ClientMAC))
 					copy(req.clientMAC, reqCtx.ClientMAC)
 				}
-
 				AttemptCrossFetch(req)
-				LogDebug("[PROCESS] Triggered Cross-Fetch for %s (Type: %s, Mode: %s)", reqCtx.QueryName, dns.TypeToString[qType], mode)
 			}
 		}
 	}

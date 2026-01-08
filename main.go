@@ -1,9 +1,8 @@
 /*
 File: main.go
-Version: 1.3.0
+Version: 1.4.0
 Description: Entry point for the dproxy application. Initializes globals, parses flags, and starts the system.
-             UPDATED: Starts auto-refresh routines using configured intervals.
-             UPDATED: Pass Cache Dir to hosts loader.
+             UPDATED: Initializes Recursive Resolver if enabled.
 */
 
 package main
@@ -44,7 +43,6 @@ var msgPool = sync.Pool{
 func getMsg() *dns.Msg {
 	m := msgPool.Get().(*dns.Msg)
 	// Completely reset the message to reuse the struct
-	// We preserve the underlying slice capacity to reduce future allocations
 	m.MsgHdr = dns.MsgHdr{}
 	m.Compress = false
 	m.Question = m.Question[:0]
@@ -59,8 +57,6 @@ func putMsg(m *dns.Msg) {
 	if m == nil {
 		return
 	}
-	// Clear potential references to help GC before pooling
-	// Note: We don't nil the slices, just reset length in getMsg
 	msgPool.Put(m)
 }
 
@@ -124,8 +120,15 @@ Usage: %s -config <config.yaml>
 	// Start background maintenance routines
 	startBackgroundTasks()
 
+	// --- INITIALIZE RECURSIVE RESOLVER ---
+	if config.Recursion.Enabled {
+		recursiveResolver = NewRecursiveResolver(config.Recursion)
+		LogInfo("[RECURSION] Recursive resolver initialized (QNameMin: %v, IP: %s)",
+			config.Recursion.QNameMinimization, config.Recursion.IPVersion)
+	}
+
 	// --- START HOSTS FILE REFRESHERS ---
-	
+
 	// Helper to determine interval
 	getInterval := func(configured time.Duration, hasRemote bool) time.Duration {
 		if configured > 0 {
@@ -142,16 +145,16 @@ Usage: %s -config <config.yaml>
 		hc := config.Routing.DefaultRule.parsedHosts
 		// Assign cache dir to the instance so it can be used for reloading
 		hc.cacheDir = config.Cache.HostsCacheDir
-		
+
 		interval := getInterval(config.Routing.DefaultRule.parsedRefresh, hc.HasRemote())
-		
+
 		shutdownWg.Add(1)
 		go func() {
 			defer shutdownWg.Done()
 			hc.StartAutoRefresh(shutdownContext, interval)
 		}()
 	}
-	
+
 	// Check specific Routing Rules
 	for i := range config.Routing.RoutingRules {
 		rule := &config.Routing.RoutingRules[i]
@@ -256,35 +259,22 @@ func startBackgroundTasks() {
 }
 
 // isARPRequired checks if ARP is actually needed by the configuration.
-// It returns true if ARP is enabled AND at least one rule uses MAC matching
-// OR if EDNS0 MAC addition is enabled.
 func isARPRequired() bool {
 	if config.ARP.Mode == "none" {
 		return false
 	}
 
-	// Check EDNS0 MAC settings
-	// If mode is 'add', 'replace', or 'prefer-arp', we need ARP data to add it to the packet.
 	macMode := config.Server.EDNS0.MAC.Mode
 	if macMode == "add" || macMode == "replace" || macMode == "prefer-arp" {
 		return true
 	}
 
-	// Check Routing Rules
 	for _, rule := range config.Routing.RoutingRules {
 		if len(rule.Match.ClientMAC) > 0 {
 			return true
 		}
-		if len(rule.Match.ClientEDNSMAC) > 0 {
-			// EDNS0 MAC is inside the packet, but we might want ARP to verify? 
-			// Actually ClientEDNSMAC matching relies on the packet, not ARP.
-			// But for safety, let's assume strict ARP isn't needed *just* for EDNS0 MAC matching
-			// unless we are validating it against ARP (which we don't do explicitly here).
-			// So this case alone doesn't strictly require ARP.
-		}
 	}
 
-	// Default to false if no specific need found
 	return false
 }
 

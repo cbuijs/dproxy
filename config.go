@@ -1,10 +1,8 @@
 /*
 File: config.go
-Version: 2.8.0
+Version: 2.9.1
 Description: Defines configuration structures and handles YAML parsing and validation.
-             UPDATED: Added LoadSheddingConfig to PrefetchConfig to limit background work under load.
-             UPDATED: Fixed struct field names to match usage (parsedClientMACs -> parsedClientMACs).
-             UPDATED: Ensures MatchConditions struct has all required fields.
+             UPDATED: Removed duplicate resolveUpstreams (moved logic to routing.go).
 */
 
 package main
@@ -28,7 +26,16 @@ type Config struct {
 	Bootstrap BootstrapConfig `yaml:"bootstrap"`
 	Cache     CacheConfig     `yaml:"cache"`
 	Routing   RoutingConfig   `yaml:"routing"`
+	Recursion RecursionConfig `yaml:"recursion"`
 	ARP       ARPConfig       `yaml:"arp"`
+}
+
+type RecursionConfig struct {
+	Enabled           bool   `yaml:"enabled"`
+	RootHintsFile     string `yaml:"root_hints_file"`
+	IPVersion         string `yaml:"ip_version"` // ipv4, ipv6, both
+	QNameMinimization bool   `yaml:"qname_minimization"`
+	MaxDepth          int    `yaml:"max_depth"`
 }
 
 type ARPConfig struct {
@@ -76,7 +83,7 @@ type ServerConfig struct {
 	} `yaml:"tls"`
 
 	LogLevel string `yaml:"log_level"` // Deprecated
-	
+
 	// Logging enhancements
 	LogClientName bool `yaml:"log_client_name"` // Resolve client IPs to names from local hosts
 
@@ -144,7 +151,7 @@ type PrefetchConfig struct {
 
 type LoadSheddingConfig struct {
 	Enabled          bool `yaml:"enabled"`
-	MaxGoroutines    int  `yaml:"max_goroutines"`     // Drop prefetch if runtime.NumGoroutine > this
+	MaxGoroutines    int  `yaml:"max_goroutines"`      // Drop prefetch if runtime.NumGoroutine > this
 	MaxQueueUsagePct int  `yaml:"max_queue_usage_pct"` // Drop prefetch if worker queue > X% full
 }
 
@@ -180,15 +187,15 @@ type DefaultRule struct {
 	Strategy    string      `yaml:"strategy"`
 	HostsFiles  []string    `yaml:"hosts_files"`
 	HostsURLs   []string    `yaml:"hosts_urls"`
-	
+
 	// Compatibility fields for singular keys
 	HostFilesSingular []string `yaml:"host_files"`
 	HostURLsSingular  []string `yaml:"host_urls"`
 
-	HostsWildcard bool   `yaml:"hosts_wildcard"`
-	HostsOptimize bool   `yaml:"hosts_optimize"`
-	
-	RefreshInterval string `yaml:"refresh_interval"` 
+	HostsWildcard bool `yaml:"hosts_wildcard"`
+	HostsOptimize bool `yaml:"hosts_optimize"`
+
+	RefreshInterval string `yaml:"refresh_interval"`
 
 	parsedUpstreams []*Upstream
 	parsedHosts     *HostsCache
@@ -207,10 +214,10 @@ type RoutingRule struct {
 	HostFilesSingular []string `yaml:"host_files"`
 	HostURLsSingular  []string `yaml:"host_urls"`
 
-	HostsWildcard bool   `yaml:"hosts_wildcard"`
-	HostsOptimize bool   `yaml:"hosts_optimize"`
-	
-	RefreshInterval string `yaml:"refresh_interval"` 
+	HostsWildcard bool `yaml:"hosts_wildcard"`
+	HostsOptimize bool `yaml:"hosts_optimize"`
+
+	RefreshInterval string `yaml:"refresh_interval"`
 
 	parsedUpstreams []*Upstream
 	parsedHosts     *HostsCache
@@ -282,10 +289,10 @@ type MatchConditions struct {
 	parsedClientECSs     []*net.IPNet
 	parsedClientEDNSMACs []net.HardwareAddr
 	parsedServerIPs      []net.IP
-	
+
 	// Helper to store raw MAC strings for wildcard matching
-	rawClientMACs        []string 
-	rawClientEDNSMACs    []string
+	rawClientMACs     []string
+	rawClientEDNSMACs []string
 }
 
 // --- Configuration Loading ---
@@ -357,13 +364,13 @@ func LoadConfig(path string) error {
 	if len(cfg.Logging.Outputs) == 0 {
 		cfg.Logging.Outputs = []string{"console"}
 	}
-	
+
 	// Syslog Defaults
 	if cfg.Logging.Syslog.Address == "" {
 		cfg.Logging.Syslog.Address = "127.0.0.1:514"
 	}
-	
-	// Auto-detect unixgram for local paths if network not specified or is udp (default assumption from empty)
+
+	// Auto-detect unixgram for local paths
 	if strings.HasPrefix(cfg.Logging.Syslog.Address, "/") && (cfg.Logging.Syslog.Network == "" || cfg.Logging.Syslog.Network == "udp") {
 		cfg.Logging.Syslog.Network = "unixgram"
 	}
@@ -371,7 +378,7 @@ func LoadConfig(path string) error {
 	if cfg.Logging.Syslog.Network == "" {
 		cfg.Logging.Syslog.Network = "udp"
 	}
-	
+
 	if cfg.Logging.Syslog.Tag == "" {
 		cfg.Logging.Syslog.Tag = "dproxy"
 	}
@@ -382,6 +389,14 @@ func LoadConfig(path string) error {
 	// Initialize logger
 	if err := InitLogger(cfg.Logging); err != nil {
 		return fmt.Errorf("failed to initialize logger: %w", err)
+	}
+
+	// Recursion Defaults
+	if cfg.Recursion.MaxDepth == 0 {
+		cfg.Recursion.MaxDepth = 20
+	}
+	if cfg.Recursion.IPVersion == "" {
+		cfg.Recursion.IPVersion = "both"
 	}
 
 	// DoH Defaults
@@ -504,7 +519,7 @@ func LoadConfig(path string) error {
 		if rule.Strategy == "" {
 			rule.Strategy = "failover"
 		}
-		
+
 		// Detailed Rule Logging
 		LogInfo("--- Rule: %s ---", rule.Name)
 		logMatchConditions(&rule.Match)
@@ -555,7 +570,7 @@ func LoadConfig(path string) error {
 
 	// --- Global Deduplicated Hosts Loading ---
 	LogInfo("--- Loading Hosts (Global Deduplication Phase) ---")
-	
+
 	// 1. Collect all unique paths and URLs
 	uniquePaths := make([]string, 0)
 	uniqueUrls := make([]string, 0)
@@ -737,21 +752,13 @@ func parsePrefetchConfig(p *PrefetchConfig) error {
 
 	// Load Shedding Defaults
 	ls := &p.LoadShedding
-	// Enable by default if not explicitly disabled in config (assuming user wants stability)
-	// We check if it was present in YAML, but since bool defaults to false, we can't easily distinguish "not set" from "false".
-	// For safety, we will assume if max_goroutines or max_queue is set, it's enabled.
-	// Or we just default it to enabled = true if it's 0/false but MaxGoroutines is set?
-	// Let's just set reasonable defaults if values are missing.
-	
 	if ls.MaxGoroutines == 0 {
 		ls.MaxGoroutines = 10000 // High default limit
 	}
 	if ls.MaxQueueUsagePct == 0 {
 		ls.MaxQueueUsagePct = 80 // Start shedding at 80% capacity
 	}
-	// Note: We don't force ls.Enabled = true here to allow user to explicitly disable it if they want.
-	// But in InitPrefetch or main logic we can treat it accordingly.
-	
+
 	LogInfo("=== Prefetch Configuration ===")
 	LogInfo("Cross-Fetch: Enabled=%v, Mode=%s", cf.Enabled, cf.Mode)
 	if cf.Enabled {

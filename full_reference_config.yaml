@@ -1,5 +1,5 @@
 # ------------------------------------------------------------------------------
-# dproxy Reference Configuration (v3.2.0)
+# dproxy Reference Configuration (v3.3.0)
 # ------------------------------------------------------------------------------
 # This is the master configuration file documenting ALL available options.
 # Use this as a reference manual. For practical examples, see example_config.yaml.
@@ -11,13 +11,13 @@ logging:
   # Log Level: DEBUG, INFO, WARN, ERROR
   # Default: "INFO"
   level: "INFO"
-  
+
   # Format: "text" (human readable) or "json" (structured for parsing).
   # Note: "json" format ONLY applies to File output. Console and Syslog always use Text.
   # Default: "text"
   format: "text"
-  
-  # Outputs: List of destinations. 
+
+  # Outputs: List of destinations.
   # Options: "console", "file", "syslog"
   # Default: ["console"]
   outputs:
@@ -47,16 +47,16 @@ server:
     - address: "0.0.0.0"  # Can be a single string or a list of strings ["0.0.0.0", "::"]
       port: 53            # Can be a single int or a list of ints [53, 5353]
       protocol: "udp"     # Options: "udp", "tcp", "dns" (both)
-    
+
     - address: "0.0.0.0"
       port: 53
       protocol: "tcp"
-    
+
     # DNS over TLS (DoT)
     - address: "0.0.0.0"
       port: 853
       protocol: "dot"     # Options: "dot", "tls"
-    
+
     # DNS over QUIC (DoQ)
     - address: "0.0.0.0"
       port: 853
@@ -74,8 +74,8 @@ server:
   tls:
     cert_file: "/path/to/fullchain.pem"
     key_file: "/path/to/privkey.pem"
-  
-  # Log Client Name: 
+
+  # Log Client Name:
   # If true, attempts to resolve client IPs to hostnames using local hosts files
   # (and system resolver) for richer logging. Useful for LAN environments.
   # Default: false
@@ -90,8 +90,8 @@ server:
   # Default: false
   insecure_upstream: false
 
-  # Drop On Failure: 
-  # If true, dproxy silently drops the client query if all upstreams fail, 
+  # Drop On Failure:
+  # If true, dproxy silently drops the client query if all upstreams fail,
   # instead of returning SERVFAIL. This can force clients to retry faster.
   # Default: false
   drop_on_failure: false
@@ -101,7 +101,7 @@ server:
   ddr:
     enabled: true
     # DNS name of this encrypted server. If empty, tries to extract from TLS cert.
-    host_name: "dns.your-server.com" 
+    host_name: "dns.your-server.com"
 
   # --- DNS over HTTPS (DoH) Specifics ---
   doh:
@@ -116,7 +116,7 @@ server:
   # Controls how dproxy handles Client Subnet (ECS) and MAC address data options.
   edns0:
     ecs:
-      # Mode: 
+      # Mode:
       # "add"     : Add client IP subnet if missing (Default)
       # "preserve": Keep existing ECS option if present
       # "replace" : Overwrite existing ECS option
@@ -126,7 +126,7 @@ server:
       ipv4_mask: 32
       ipv6_mask: 128
       # source_mask: overrides both if set
-    
+
     mac:
       # Mode:
       # "prefer-arp"  : Use ARP table data if available (Default)
@@ -145,6 +145,24 @@ server:
     # Flatten CNAME chains into the final A/AAAA record
     # Default: false
     cname_flattening: false
+
+# --- Recursion Configuration ---
+# Configures the built-in iterative resolver.
+# To use this, set 'upstreams: RECURSIVE' in any routing rule.
+recursion:
+  enabled: false
+  # Path to a standard Bind-style root hints file.
+  # If empty, built-in IANA root hints are used.
+  root_hints_file: "/var/lib/dproxy/root.hints"
+
+  # IP Version preference for recursion steps: "ipv4", "ipv6", "both"
+  ip_version: "both"
+
+  # Enable QNAME Minimization (RFC 7816) for privacy
+  qname_minimization: true
+
+  # Max recursion depth to prevent loops
+  max_depth: 20
 
 # --- ARP/NDP Configuration ---
 # Used to map IP addresses to MAC addresses for logging and rule matching.
@@ -169,7 +187,7 @@ bootstrap:
 cache:
   enabled: true
   size: 10000 # Number of items to keep in memory
-  
+
   # Disk Cache: Directory to store binary cache of processed hosts/blocklists.
   # Significantly speeds up startup when using huge blocklists.
   hosts_cache_dir: "/var/cache/dproxy"
@@ -200,7 +218,7 @@ cache:
       fetch_types: ["A", "AAAA", "HTTPS"]
       max_concurrent: 10
       timeout: "3s"
-    
+
     # Stale Refresh: Background refresh of popular expired items
     stale_refresh:
       enabled: false
@@ -230,37 +248,17 @@ routing:
   # Routing Rules: Processed in order. First match wins.
   # Uses a Trie for efficient Domain matching.
   routing_rules:
-    - name: "Example Rule"
-      
-      # Match Conditions (All fields support lists)
-      # A rule matches if ALL non-empty criteria types match.
+    - name: "Local Recursion Rule"
       match:
-        # Client Identity
-        client_ip: ["192.168.1.100"]
-        client_cidr: ["192.168.2.0/24"]
-        client_mac: ["00:11:22:33:44:55", "?2:*:*:*:*:*"] # Supports wildcards
-        
-        # Server Identity (Ingress)
-        server_port: [853]
-        
-        # Query Data
-        query_domain: ["example.com", "*.example.net"]
+        query_domain: ["internal.corp", "*.local"]
+      # Use the special keyword "RECURSIVE" to use the internal iterator
+      upstreams: "RECURSIVE"
 
-      # Upstreams: List of URLs OR a group name from upstream_groups
+    - name: "Example Rule"
+      match:
+        client_ip: ["192.168.1.100"]
       upstreams: public_secure
-      
-      # Strategy: How to pick an upstream from the list
-      # Options: "round-robin", "random", "failover", "fastest", "race"
       strategy: "failover"
-      
-      # Hosts Files: Local overrides specific to this rule
-      hosts_files: ["/etc/hosts.example"]
-      hosts_urls: ["https://example.com/hosts.txt"]
-      
-      # Hosts options
-      hosts_wildcard: true  # Enable wildcard matching for these hosts files
-      hosts_optimize: true  # Deduplicate and optimize memory usage
-      refresh_interval: "24h" # How often to reload these hosts files
 
   # Default Rule (REQUIRED): Fallback for queries not matching any rule above.
   default:

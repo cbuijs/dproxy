@@ -1,9 +1,9 @@
 /*
 File: routing.go
-Version: 1.4.0
+Version: 1.5.0
 Description: High-performance routing logic using Domain Trie (Radix-style) for rapid lookups.
              OPTIMIZED: Trie Search now walks the string from TLD backwards without string splitting or slice allocations.
-             UPDATED: Added wildcard MAC matching logic.
+             UPDATED: Added resolveUpstreams to handle config parsing and "RECURSIVE" keyword.
 */
 
 package main
@@ -83,12 +83,12 @@ func (t *DomainTrie) Search(qName string) *RoutingRule {
 
 	// We iterate from the end of the string backwards to the beginning
 	// qName: "www.example.com" -> "com", "example", "www"
-	
+
 	end := len(qName)
 	for end > 0 {
 		// Find the dot preceding the current part
 		start := strings.LastIndexByte(qName[:end], '.')
-		
+
 		// Extract part: qName[start+1 : end]
 		// If start is -1, it means we are at the first label (e.g. "www" in "www.example.com")
 		part := qName[start+1 : end]
@@ -107,7 +107,7 @@ func (t *DomainTrie) Search(qName string) *RoutingRule {
 			return lastValidRule
 		}
 		node = next
-		
+
 		// Move pointers for next iteration
 		if start == -1 {
 			break // We just processed the last part (left-most label)
@@ -142,17 +142,17 @@ func BuildRoutingTable(rules []RoutingRule) {
 
 	for i := range rules {
 		rule := &rules[i]
-		
+
 		if len(rule.Match.QueryDomain) > 0 {
 			for _, domain := range rule.Match.QueryDomain {
 				trie.Insert(strings.ToLower(domain), rule)
 			}
-			
+
 			if !hasNonDomainConditions(&rule.Match) {
 				continue
 			}
 		}
-		
+
 		generic = append(generic, *rule)
 	}
 
@@ -180,6 +180,11 @@ func hasNonDomainConditions(m *MatchConditions) bool {
 func resolveUpstreams(upstreams interface{}, groups map[string][]string) ([]string, error) {
 	switch v := upstreams.(type) {
 	case string:
+		// Special keyword for Recursive resolution
+		if strings.ToUpper(v) == "RECURSIVE" {
+			return []string{"RECURSIVE"}, nil
+		}
+
 		group, exists := groups[v]
 		if !exists {
 			return nil, fmt.Errorf("upstream group '%s' not found", v)
@@ -224,11 +229,11 @@ func SelectUpstreams(ctx *RequestContext) ([]*Upstream, string, string, *HostsCa
 		}
 	}
 
-	return config.Routing.DefaultRule.parsedUpstreams, 
-	       config.Routing.DefaultRule.Strategy, 
-	       "DEFAULT", 
-	       config.Routing.DefaultRule.parsedHosts, 
-	       config.Routing.DefaultRule.HostsWildcard
+	return config.Routing.DefaultRule.parsedUpstreams,
+		config.Routing.DefaultRule.Strategy,
+		"DEFAULT",
+		config.Routing.DefaultRule.parsedHosts,
+		config.Routing.DefaultRule.HostsWildcard
 }
 
 func matchRule(m *MatchConditions, ctx *RequestContext) (bool, string) {
@@ -411,18 +416,18 @@ func matchWildcard(s, pattern string) bool {
 	if s == pattern {
 		return true
 	}
-	
+
 	lenS := len(s)
 	lenP := len(pattern)
-	
+
 	// Index in string, Index in pattern
 	si := 0
 	pi := 0
-	
+
 	// Last star positions
 	starIdx := -1
 	matchIdx := 0
-	
+
 	for si < lenS {
 		// Single character match or exact match
 		if pi < lenP && (pattern[pi] == '?' || pattern[pi] == s[si]) {
@@ -442,12 +447,12 @@ func matchWildcard(s, pattern string) bool {
 			return false
 		}
 	}
-	
+
 	// Consume remaining stars in pattern
 	for pi < lenP && pattern[pi] == '*' {
 		pi++
 	}
-	
+
 	return pi == lenP
 }
 

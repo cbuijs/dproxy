@@ -1,11 +1,9 @@
 /*
 FILENAME:    upstream.go
-VERSION:     1.8.0
-LAST UPDATE: 2026-01-08 10:08 CET
+VERSION:     1.9.0
+LAST UPDATE: 2026-01-08 13:20 CET
 SUMMARY:     Defines the Upstream struct and handles downstream protocol exchange.
-CHANGES:     - UPDATED: Switched HTTP User-Agent to a generic Chrome identifier to prevent upstream blocking.
-             - REFACTORED: Connection pools moved to upstream_pool.go.
-             - OPTIMIZED: Fixed buffer reuse in exchangeDoH to prevent double allocation.
+CHANGES:     - UPDATED: Added handling for "RECURSIVE" protocol type in parseUpstream.
 */
 
 package main
@@ -40,10 +38,9 @@ const (
 	cbFailureThreshold = 3                // Number of failures before opening circuit
 	cbProbeInterval    = 10 * time.Second // Faster probe interval
 	bootstrapRefresh   = 10 * time.Minute // Interval to refresh upstream IPs
-	
+
 	// Generic User-Agent to mimic a standard browser.
-	// Some upstream DoH providers block custom or Go-default agents.
-	GenericUserAgent   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+	GenericUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
 // Global TLS Session Cache to enable Session Resumption (Fast Handshakes)
@@ -79,6 +76,9 @@ type Upstream struct {
 }
 
 func (u *Upstream) String() string {
+	if u.Proto == "recursive" {
+		return "RECURSIVE"
+	}
 	s := fmt.Sprintf("%s://%s:%s%s", u.Proto, u.Host, u.Port, u.Path)
 	if u.BootstrapIP != "" {
 		s += fmt.Sprintf("#%s", u.BootstrapIP)
@@ -88,6 +88,9 @@ func (u *Upstream) String() string {
 
 // DynamicString returns the upstream URL with variables replaced.
 func (u *Upstream) DynamicString(rc *RequestContext) string {
+	if u.Proto == "recursive" {
+		return "RECURSIVE"
+	}
 	host, path := u.getDynamicConfig(rc)
 	s := fmt.Sprintf("%s://%s:%s%s", u.Proto, host, u.Port, path)
 	if u.BootstrapIP != "" {
@@ -139,6 +142,10 @@ func (u *Upstream) getDynamicConfig(rc *RequestContext) (string, string) {
 // --- Circuit Breaker Logic ---
 
 func (u *Upstream) IsHealthy() bool {
+	if u.Proto == "recursive" {
+		return true
+	}
+
 	// If circuit is closed, it's healthy
 	if !u.cbOpen.Load() {
 		return true
@@ -218,7 +225,6 @@ func (u *Upstream) getLastProbeTime() time.Time {
 // --- Bootstrap DNS Logic ---
 
 // resolveIPs returns the cached IPs or refreshes them if empty.
-// This is non-blocking if IPs are available.
 func (u *Upstream) resolveIPs() []net.IP {
 	u.resolvedIPsLock.RLock()
 	ips := u.resolvedIPs
@@ -259,7 +265,6 @@ func (u *Upstream) refreshIPs() {
 	}
 
 	// Perform Lookup
-	// Use a short timeout for bootstrap to avoid hanging
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
@@ -282,6 +287,10 @@ func (u *Upstream) setIPs(ips []net.IP) {
 
 // startBootstrapRefresher starts the background loop
 func (u *Upstream) startBootstrapRefresher() {
+	if u.Proto == "recursive" {
+		return
+	}
+
 	// Initial resolution
 	go u.refreshIPs()
 
@@ -302,6 +311,14 @@ func (u *Upstream) startBootstrapRefresher() {
 // --- Upstream Parsing ---
 
 func parseUpstream(raw string, ipVersion string, insecure bool, timeout string) (*Upstream, error) {
+	// Handle special recursive keyword
+	if strings.ToUpper(raw) == "RECURSIVE" {
+		return &Upstream{
+			Proto: "recursive",
+			Host:  "internal",
+		}, nil
+	}
+
 	parts := strings.Split(raw, "#")
 	uString := parts[0]
 	bootstrap := ""
@@ -440,7 +457,7 @@ func resolveHostnameWithBootstrap(ctx context.Context, hostname string, preferre
 
 	// We use a buffered channel to avoid leaking goroutines
 	resultCh := make(chan result, len(bootstrapServers))
-	
+
 	// Create a child context to cancel other requests once one succeeds
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -455,10 +472,10 @@ func resolveHostnameWithBootstrap(ctx context.Context, hostname string, preferre
 
 			var ips []net.IP
 			var err error
-			
+
 			// Try all required query types against this server
 			c := &dns.Client{Net: "udp", Timeout: 2 * time.Second}
-			
+
 			for _, qType := range qTypes {
 				// Check context again between queries
 				if ctx.Err() != nil {
@@ -473,10 +490,9 @@ func resolveHostnameWithBootstrap(ctx context.Context, hostname string, preferre
 
 				if e != nil {
 					err = e
-					// If one type fails, we might still want the other? 
-					// Usually if a server is down, both fail. 
+					// If one type fails, we might still want the other?
+					// Usually if a server is down, both fail.
 					// But let's continue to try to get partial results if possible?
-					// The original logic required Success for the loop to continue adding IPs.
 					continue
 				}
 
@@ -540,6 +556,11 @@ func resolveHostnameWithBootstrap(ctx context.Context, hostname string, preferre
 // --- Exchange ---
 
 func (u *Upstream) executeExchange(ctx context.Context, req *dns.Msg, reqCtx *RequestContext) (*dns.Msg, string, time.Duration, error) {
+	// Recursive Bypass
+	if u.Proto == "recursive" {
+		return nil, "RECURSIVE", 0, errors.New("upstream is recursive holder")
+	}
+
 	// Check QPS Limit
 	if !u.Allow() {
 		return nil, "", 0, fmt.Errorf("QPS limit exceeded for %s", u.String())
@@ -714,22 +735,22 @@ func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetAddr str
 
 	// Use bufPool for packing
 	buf := bufPool.Get().([]byte)
-	
+
 	// Ensure capacity for at least header + some body
 	if cap(buf) < 2 {
 		buf = make([]byte, 0, 4096)
 	}
-	
+
 	// Start with 2 placeholder bytes for length
 	out := buf[:2]
-	
+
 	// Pack message into buffer (PackBuffer appends)
 	packed, err := req.PackBuffer(out)
 	if err != nil {
 		bufPool.Put(buf)
 		return nil, err
 	}
-	
+
 	// Calculate and write length
 	dnsLen := len(packed) - 2
 	binary.BigEndian.PutUint16(packed[:2], uint16(dnsLen))
@@ -744,9 +765,9 @@ func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetAddr str
 		bufPool.Put(packed)
 		return nil, err
 	}
-	
-	// We can reuse 'packed' (which is 'buf' backing array) if we want, 
-	// but for simplicity and safety against async socket behavior, 
+
+	// We can reuse 'packed' (which is 'buf' backing array) if we want,
+	// but for simplicity and safety against async socket behavior,
 	// we put it back and get a fresh one for reading.
 	bufPool.Put(packed)
 
@@ -789,20 +810,15 @@ func (u *Upstream) exchangeDoH(ctx context.Context, req *dns.Msg, reqCtx *Reques
 
 	// OPTIMIZATION: Use bufPool for packing
 	buf := bufPool.Get().([]byte)
-	
+
 	// Fix: Reset buffer length to 0 so PackBuffer uses it as scratch and doesn't append after garbage
 	packed, err := req.PackBuffer(buf[:0])
 	if err != nil {
 		bufPool.Put(buf)
 		return nil, err
 	}
-	
+
 	// Note: We cannot defer Put(buf) here because 'packed' might alias 'buf' or be a new slice.
-	// We need to Put 'packed' (or the original buf if packed didn't grow).
-	// Simplest safe way: Put 'packed' after request is sent, but body reading is async?
-	// No, bytes.NewReader uses the slice. http.NewRequestWithContext doesn't read immediately.
-	// client.Do reads it.
-	// So we must hold the buffer until client.Do returns.
 	defer bufPool.Put(packed)
 
 	dynHost, dynPath := u.getDynamicConfig(reqCtx)
@@ -842,7 +858,7 @@ func (u *Upstream) exchangeDoH(ctx context.Context, req *dns.Msg, reqCtx *Reques
 
 	readTarget := respBuf[:cap(respBuf)]
 	bytesRead := 0
-	
+
 	for {
 		if bytesRead == len(readTarget) {
 			// Grow
