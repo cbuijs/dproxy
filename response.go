@@ -399,6 +399,9 @@ func generateDDRResponse(req *dns.Msg, serverIP net.IP) *dns.Msg {
 				}
 
 				if dohPath != "" {
+					if !strings.Contains(dohPath, "{?dns}") {
+						dohPath += "{?dns}"
+					}
 					svcb.Value = append(svcb.Value, &dns.SVCBDoHPath{Template: dohPath})
 				}
 
