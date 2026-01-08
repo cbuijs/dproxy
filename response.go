@@ -390,15 +390,17 @@ func generateDDRResponse(req *dns.Msg, serverIP net.IP) *dns.Msg {
 				svcb.Value = append(svcb.Value, &dns.SVCBAlpn{Alpn: alpn})
 				svcb.Value = append(svcb.Value, &dns.SVCBPort{Port: uint16(port)})
 
+				// Add IP Hints to the SVCB Record (Action Section)
 				if serverIP != nil {
-					if serverIP.To4() != nil {
-						svcb.Value = append(svcb.Value, &dns.SVCBIPv4Hint{Hint: []net.IP{serverIP}})
+					if ip4 := serverIP.To4(); ip4 != nil {
+						svcb.Value = append(svcb.Value, &dns.SVCBIPv4Hint{Hint: []net.IP{ip4}})
 					} else {
 						svcb.Value = append(svcb.Value, &dns.SVCBIPv6Hint{Hint: []net.IP{serverIP}})
 					}
 				}
 
 				if dohPath != "" {
+					// Ensure URI Template for GET support is present
 					if !strings.Contains(dohPath, "{?dns}") {
 						dohPath += "{?dns}"
 					}
@@ -415,6 +417,32 @@ func generateDDRResponse(req *dns.Msg, serverIP net.IP) *dns.Msg {
 	}
 
 	resp.Answer = answers
+
+	// NEW: Add Additional Section with A/AAAA records for the DDR Hostname
+	if target != "." && serverIP != nil {
+		if ip4 := serverIP.To4(); ip4 != nil {
+			resp.Extra = append(resp.Extra, &dns.A{
+				Hdr: dns.RR_Header{
+					Name:   dns.Fqdn(target),
+					Rrtype: dns.TypeA,
+					Class:  dns.ClassINET,
+					Ttl:    60,
+				},
+				A: ip4,
+			})
+		} else {
+			resp.Extra = append(resp.Extra, &dns.AAAA{
+				Hdr: dns.RR_Header{
+					Name:   dns.Fqdn(target),
+					Rrtype: dns.TypeAAAA,
+					Class:  dns.ClassINET,
+					Ttl:    60,
+				},
+				AAAA: serverIP,
+			})
+		}
+	}
+
 	return resp
 }
 
