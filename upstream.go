@@ -1,10 +1,11 @@
 /*
-File: upstream.go
-Version: 1.7.1
-Last Update: 2026-01-07
-Description: Defines the Upstream struct and handles downstream protocol exchange.
-             REFACTORED: Connection pools moved to upstream_pool.go.
-             OPTIMIZED: Fixed buffer reuse in exchangeDoH to prevent double allocation.
+FILENAME:    upstream.go
+VERSION:     1.8.0
+LAST UPDATE: 2026-01-08 10:08 CET
+SUMMARY:     Defines the Upstream struct and handles downstream protocol exchange.
+CHANGES:     - UPDATED: Switched HTTP User-Agent to a generic Chrome identifier to prevent upstream blocking.
+             - REFACTORED: Connection pools moved to upstream_pool.go.
+             - OPTIMIZED: Fixed buffer reuse in exchangeDoH to prevent double allocation.
 */
 
 package main
@@ -39,6 +40,10 @@ const (
 	cbFailureThreshold = 3                // Number of failures before opening circuit
 	cbProbeInterval    = 10 * time.Second // Faster probe interval
 	bootstrapRefresh   = 10 * time.Minute // Interval to refresh upstream IPs
+	
+	// Generic User-Agent to mimic a standard browser.
+	// Some upstream DoH providers block custom or Go-default agents.
+	GenericUserAgent   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
 // Global TLS Session Cache to enable Session Resumption (Fast Handshakes)
@@ -810,7 +815,8 @@ func (u *Upstream) exchangeDoH(ctx context.Context, req *dns.Msg, reqCtx *Reques
 
 	hReq.Header.Set("Content-Type", "application/dns-message")
 	hReq.Header.Set("Accept", "application/dns-message")
-	hReq.Header.Set("User-Agent", "dproxy/3.0")
+	// UPDATED: Use generic Chrome agent to avoid blocking
+	hReq.Header.Set("User-Agent", GenericUserAgent)
 
 	hResp, err := client.Do(hReq)
 	if err != nil {
@@ -830,20 +836,10 @@ func (u *Upstream) exchangeDoH(ctx context.Context, req *dns.Msg, reqCtx *Reques
 	defer bufPool.Put(respBuf)
 
 	// Ensure we have capacity and reset slice length
-	// We want to read INTO the buffer, so we need a slice with length/cap.
-	// But we don't know the content length sometimes (chunked).
-	// We start with full cap.
 	if cap(respBuf) < 4096 {
 		respBuf = make([]byte, 4096)
 	}
-	// We use the buffer as a scratch space to read.
-	// Actually, we want to append read data.
-	// Let's reset to 0 length and append? No, Read needs a target.
-	// We will read into the buffer up to its capacity.
-	
-	// Better: ReadAll-like logic but into pooled buffer
-	// We'll treat respBuf as the container.
-	// Reslice to full capacity to allow reading.
+
 	readTarget := respBuf[:cap(respBuf)]
 	bytesRead := 0
 	
@@ -860,13 +856,6 @@ func (u *Upstream) exchangeDoH(ctx context.Context, req *dns.Msg, reqCtx *Reques
 			newBuf := make([]byte, newCap)
 			copy(newBuf, readTarget)
 			readTarget = newBuf
-			// If we grew, we can't Put the old 'respBuf' if we overwrote the var.
-			// But 'defer bufPool.Put(respBuf)' captures the original slice header?
-			// No, arguments are evaluated at call time. It captures the original.
-			// If we grow, we lose the ability to pool the *new* buffer unless we update logic.
-			// This is complex for a simple optimization.
-			// Let's stick to simple pooling: if it fits, good. If not, alloc.
-			// But we must NOT panic or corrupt.
 		}
 
 		n, err := limitReader.Read(readTarget[bytesRead:])
