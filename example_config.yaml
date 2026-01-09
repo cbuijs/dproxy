@@ -2,7 +2,6 @@
 # dproxy Example Configuration
 # ------------------------------------------------------------------------------
 # This file demonstrates common use cases.
-# See config.yaml for the full list of options.
 # ------------------------------------------------------------------------------
 
 logging:
@@ -29,6 +28,12 @@ server:
   # Enable DDR so clients can auto-upgrade to encrypted DNS
   ddr:
     enabled: true
+
+# Enable Recursive Resolver with DNSSEC Validation
+recursion:
+  enabled: true
+  dnssec_enabled: true
+  qname_minimization: true
 
 # Use ARP to identify devices on the LAN by MAC address
 arp:
@@ -83,16 +88,12 @@ routing:
       upstreams: internal_dns
       strategy: "failover" # Try first server, then second
 
-    # Scenario C: IoT Isolation
-    # Force specific devices (by MAC) to use the Family Safe DNS
-    # Useful for Kids' tablets or insecure IoT devices.
-    - name: "Kids & IoT"
+    # Scenario C: Full Recursion
+    # Routes queries for specific secure zones to the internal recursive resolver
+    - name: "Secure Zone"
       match:
-        client_mac: 
-          - "aa:bb:cc:dd:ee:ff" # Tablet
-          - "12:34:56:*:*:*"    # All devices from this manufacturer OUI
-      upstreams: family_safe
-      strategy: "random"
+        query_domain: ["*.secure.example.com"]
+      upstreams: "RECURSIVE"
 
   # 3. Default Fallback
   # If none of the above match, do this:
