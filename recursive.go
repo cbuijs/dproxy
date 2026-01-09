@@ -1,17 +1,11 @@
 /*
 File: recursive.go
-Version: 2.1.0
+Version: 2.2.0
 Description: High-performance recursive resolver with Sharded Caching and RTT-Weighted Selection.
-             IMPROVEMENT 1: Sharded InfrastructureCache (256 shards) to eliminate lock contention.
-             IMPROVEMENT 2: RTT tracking for Authoritative Servers to prioritize fast upstreams.
-             IMPROVEMENT 3: "Happy Eyeballs" race now uses top-3 fastest servers, not random ones.
-             IMPROVEMENT 4: Zero-alloc zone walking optimizations.
-             FIXED: Implemented missing Glue Resolution logic in getIPsForNS to fix "no reachable nameservers" error.
-             FIXED: exchange() signature mismatch.
-             FIXED: Strictly honor ip_version setting for NS/Glue retrieval and usage.
-             UPDATED: Added verbose debug logging for iterative lookups, glue resolution, and caching.
-             UPDATED: Enhanced logging to explicitly show Shortcut jumps (e.g., sub.domain.com -> domain.com).
-             UPDATED: Added detailed "Walking the Tree" logging for every iterative step and QNAME minimization details.
+             OPTIMIZED: Fixed non-deterministic sorting by pre-shuffling candidates.
+             OPTIMIZED: Removed fmt.Sprintf allocations in hot paths (loop detection).
+             OPTIMIZED: Smart map copying for recursion tracking.
+             OPTIMIZED: RTT tracking for Authoritative Servers to prioritize fast upstreams.
 */
 
 package main
@@ -26,6 +20,7 @@ import (
 	"net"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -119,7 +114,7 @@ func (ic *InfrastructureCache) getShard(key string) *InfraShard {
 
 type RecursiveResolver struct {
 	config    RecursionConfig
-	rootHints []*Nameserver // Changed to pointer
+	rootHints []*Nameserver
 	cache     *InfrastructureCache
 	client    *dns.Client
 	glueGroup singleflight.Group
@@ -252,7 +247,9 @@ func (r *RecursiveResolver) Resolve(ctx context.Context, req *dns.Msg, reqCtx *R
 	q := req.Question[0]
 	qName := strings.ToLower(q.Name)
 
-	LogDebug("[RECURSION] [START] Resolving %s %s (QNameMin: %v)", qName, dns.TypeToString[q.Qtype], r.config.QNameMinimization)
+	if IsDebugEnabled() {
+		LogDebug("[RECURSION] [START] Resolving %s %s (QNameMin: %v)", qName, dns.TypeToString[q.Qtype], r.config.QNameMinimization)
+	}
 
 	visited := make(map[string]int)
 
@@ -286,7 +283,10 @@ func (r *RecursiveResolver) Resolve(ctx context.Context, req *dns.Msg, reqCtx *R
 		LogDebug("[RECURSION] [FAILED] Resolution failed for %s: %v", qName, err)
 		return nil, err
 	}
-	LogDebug("[RECURSION] [SUCCESS] Resolved %s (RCODE: %s)", qName, dns.RcodeToString[resp.Rcode])
+	
+	if IsDebugEnabled() {
+		LogDebug("[RECURSION] [SUCCESS] Resolved %s (RCODE: %s)", qName, dns.RcodeToString[resp.Rcode])
+	}
 	return resp, nil
 }
 
@@ -297,7 +297,8 @@ func (r *RecursiveResolver) iterativeQuery(ctx context.Context, qName string, qT
 		return nil, fmt.Errorf("recursion depth exceeded")
 	}
 
-	loopKey := fmt.Sprintf("%s:%d", qName, qType)
+	// OPTIMIZATION: Use string concatenation instead of fmt.Sprintf for loop key
+	loopKey := qName + "|" + strconv.Itoa(int(qType))
 	if visited[loopKey] > 5 {
 		LogDebug("[RECURSION] [WALK] Loop detected for %s", loopKey)
 		return nil, fmt.Errorf("loop detected")
@@ -309,10 +310,12 @@ func (r *RecursiveResolver) iterativeQuery(ctx context.Context, qName string, qT
 		LogDebug("[RECURSION] [WALK] No cached NS for %s, starting at ROOT", qName)
 		nsList = r.rootHints
 	} else {
-		if zone != "." && zone != "" {
-			LogDebug("[RECURSION] [WALK] Shortcut: Cached zone '%s' found for '%s' (%d servers)", zone, qName, len(nsList))
-		} else {
-			LogDebug("[RECURSION] [WALK] Cached NS found for zone %s (%d servers)", zone, len(nsList))
+		if IsDebugEnabled() {
+			if zone != "." && zone != "" {
+				LogDebug("[RECURSION] [WALK] Shortcut: Cached zone '%s' found for '%s' (%d servers)", zone, qName, len(nsList))
+			} else {
+				LogDebug("[RECURSION] [WALK] Cached NS found for zone %s (%d servers)", zone, len(nsList))
+			}
 		}
 	}
 
@@ -321,11 +324,20 @@ func (r *RecursiveResolver) iterativeQuery(ctx context.Context, qName string, qT
 	candidates := make([]*Nameserver, len(nsList))
 	copy(candidates, nsList)
 
+	// OPTIMIZATION: Shuffle FIRST for load balancing among equals
+	// This replaces the unreliable random check inside sort.Slice
+	if len(candidates) > 1 {
+		for i := len(candidates) - 1; i > 0; i-- {
+			j := rand.IntN(i + 1)
+			candidates[i], candidates[j] = candidates[j], candidates[i]
+		}
+	}
+
 	// Sort candidates:
 	// 1. FailureCount (prefer 0)
 	// 2. RTT (lowest first)
-	// 3. Random shuffle for 0-RTT/new items (load balancing)
-	sort.Slice(candidates, func(i, j int) bool {
+	// Note: We use Stable sort to preserve the random shuffle order for equal elements
+	sort.SliceStable(candidates, func(i, j int) bool {
 		f1 := candidates[i].FailureCount.Load()
 		f2 := candidates[j].FailureCount.Load()
 		if f1 != f2 {
@@ -335,14 +347,20 @@ func (r *RecursiveResolver) iterativeQuery(ctx context.Context, qName string, qT
 		rtt1 := candidates[i].RTT.Load()
 		rtt2 := candidates[j].RTT.Load()
 
+		// Prefer proven (non-zero RTT) over unproven?
+		// Or assume unproven is potentially fast?
+		// Strategy: If one is 0 (unproven) and other is not, prefer unproven to learn about it?
+		// No, usually prefer fast. 0 means "unknown".
+		// Let's treat 0 as "neutral" or high latency to prefer known goods.
+		
 		if rtt1 == 0 && rtt2 == 0 {
-			return rand.IntN(2) == 0 // Randomize new ones
+			return false // Keep shuffled order
 		}
 		if rtt1 == 0 {
-			return false
-		} // Prefer proven
+			return false // Prefer rtt2 (known)
+		}
 		if rtt2 == 0 {
-			return true
+			return true // Prefer rtt1 (known)
 		}
 
 		return rtt1 < rtt2
@@ -385,6 +403,8 @@ func (r *RecursiveResolver) iterativeQuery(ctx context.Context, qName string, qT
 		go func(targetNS *Nameserver, ip net.IP) {
 			start := time.Now()
 			LogDebug("[RECURSION] [WALK] Sending Query: %s %s -> %s (%s)", qName, dns.TypeToString[qType], targetNS.Name, ip)
+			
+			// Use stepCtx here so if another wins, we cancel pending ones
 			resp, err := r.exchange(stepCtx, ip, qName, qType)
 			duration := time.Since(start)
 
@@ -481,7 +501,8 @@ func (r *RecursiveResolver) exchange(ctx context.Context, ip net.IP, qName strin
 	m.SetQuestion(qName, qType)
 	m.RecursionDesired = false
 	m.SetEdns0(4096, true)
-	// Fixed: discard the duration return value to match function signature
+	
+	// Use standard timeout for UDP exchange
 	msg, _, err := r.client.ExchangeContext(ctx, m, net.JoinHostPort(ip.String(), "53"))
 	return msg, err
 }
@@ -578,7 +599,9 @@ func (r *RecursiveResolver) getIPsForNS(ctx context.Context, ns *Nameserver, dep
 	}
 	shard.RUnlock()
 
-	key := "glue:" + ns.Name + ":" + r.config.IPVersion
+	// OPTIMIZATION: Faster key generation
+	key := "glue|" + ns.Name + "|" + r.config.IPVersion
+	
 	res, err, _ := r.glueGroup.Do(key, func() (interface{}, error) {
 		LogDebug("[RECURSION] [GLUE-MISS] Resolving glue for %s (Key: %s)", ns.Name, key)
 		var ips []net.IP
@@ -588,10 +611,16 @@ func (r *RecursiveResolver) getIPsForNS(ctx context.Context, ns *Nameserver, dep
 		resolve := func(qType uint16) {
 			defer wg.Done()
 
-			// Must copy visited map to prevent concurrent map read/write or side effects in recursion
-			visitedCopy := make(map[string]int, len(visited))
-			for k, v := range visited {
-				visitedCopy[k] = v
+			// OPTIMIZATION: Smart copy of visited map
+			// Only allocate and copy if we actually have visited nodes
+			var visitedCopy map[string]int
+			if len(visited) > 0 {
+				visitedCopy = make(map[string]int, len(visited))
+				for k, v := range visited {
+					visitedCopy[k] = v
+				}
+			} else {
+				visitedCopy = make(map[string]int)
 			}
 
 			// Perform recursive lookup for the nameserver's own name

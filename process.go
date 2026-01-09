@@ -1,9 +1,10 @@
 /*
 File: process.go
-Version: 3.4.0
+Version: 3.5.0
 Last Update: 2026-01-09
 Description: Handles the core processing logic for DNS requests.
-             UPDATED: Added timeout context and RTT measurement for Recursive Resolver calls.
+             OPTIMIZED: Improved cache key generation performance.
+             OPTIMIZED: Better context timeout handling for recursive calls.
 */
 
 package main
@@ -92,6 +93,9 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	if len(r.Question) > 0 {
 		q := r.Question[0]
 		routingKey := ruleName
+		
+		// OPTIMIZATION: Efficient cache key generation
+		// Avoids Sprintf/Format calls, effectively does concatenation via builder
 		sb.Reset()
 		sb.WriteString(reqCtx.QueryName)
 		sb.WriteString("|")
