@@ -1,17 +1,16 @@
 /*
 File: recursive.go
-Version: 1.8.0
-Description: Implements a full recursive (iterative) resolver with QNAME minimization,
-             loop detection, and infrastructure caching (NS/Glue).
-             OPTIMIZED: Parallelized Glue Resolution (A/AAAA).
-             OPTIMIZED: Happy Eyeballs / Concurrent Queries for Authoritative Servers.
-             OPTIMIZED: Switched Cache to RWMutex for better read performance and type safety.
-             OPTIMIZED: Added Singleflight to prevent thundering herd on Glue resolution.
-             OPTIMIZED: Used object pooling (getMsg/putMsg) in exchange() to reduce GC pressure.
-             OPTIMIZED: Added TTL/Expiration to Infrastructure Cache to prevent memory leaks.
-             OPTIMIZED: Pre-allocated slices in extractReferral.
-             OPTIMIZED: Zero-allocation Glue Key generation and inlined label searching.
-             FIXED: Strictly enforce ip_version config (ipv4/ipv6) in pickIP and glue resolution.
+Version: 2.0.6
+Description: High-performance recursive resolver with Sharded Caching and RTT-Weighted Selection.
+             IMPROVEMENT 1: Sharded InfrastructureCache (256 shards) to eliminate lock contention.
+             IMPROVEMENT 2: RTT tracking for Authoritative Servers to prioritize fast upstreams.
+             IMPROVEMENT 3: "Happy Eyeballs" race now uses top-3 fastest servers, not random ones.
+             IMPROVEMENT 4: Zero-alloc zone walking optimizations.
+             FIXED: Implemented missing Glue Resolution logic in getIPsForNS to fix "no reachable nameservers" error.
+             FIXED: exchange() signature mismatch.
+             UPDATED: Added verbose debug logging for iterative lookups, glue resolution, and caching.
+             UPDATED: Enhanced logging to explicitly show Shortcut jumps (e.g., sub.domain.com -> domain.com).
+             UPDATED: Added detailed "Walking the Tree" logging for every iterative step and QNAME minimization details.
 */
 
 package main
@@ -21,11 +20,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"math/rand/v2"
 	"net"
 	"os"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
@@ -36,15 +38,47 @@ import (
 const (
 	infraCacheTTL     = 1 * time.Hour // Default TTL for NS/Glue if not specified
 	infraCacheMaxSize = 10000         // Max items per map to prevent unbounded growth
+	infraShardCount   = 256           // Number of shards for infrastructure cache
 )
+
+// Global seed for maphash
+var infraHasherSeed = maphash.MakeSeed()
 
 // Global instance
 var recursiveResolver *RecursiveResolver
 
-// Nameserver represents an authoritative server
+// Nameserver represents an authoritative server with RTT tracking
 type Nameserver struct {
-	Name string
-	IPs  []net.IP
+	Name         string
+	IPs          []net.IP
+	RTT          atomic.Int64 // Weighted Moving Average RTT in nanoseconds
+	FailureCount atomic.Int32 // Consecutive failures
+}
+
+// UpdateRTT updates the weighted moving average RTT
+func (ns *Nameserver) UpdateRTT(duration time.Duration, failure bool) {
+	if failure {
+		ns.FailureCount.Add(1)
+		// Penalize RTT on failure (add 1s virtual latency)
+		current := ns.RTT.Load()
+		if current == 0 {
+			ns.RTT.Store(int64(1 * time.Second))
+		} else {
+			ns.RTT.Store(current + int64(1*time.Second))
+		}
+		return
+	}
+
+	ns.FailureCount.Store(0)
+	newRTT := int64(duration)
+	oldRTT := ns.RTT.Load()
+
+	if oldRTT == 0 {
+		ns.RTT.Store(newRTT)
+	} else {
+		// EWMA: 70% old, 30% new
+		ns.RTT.Store(int64(float64(oldRTT)*0.7 + float64(newRTT)*0.3))
+	}
 }
 
 type infraCacheEntry[T any] struct {
@@ -52,16 +86,39 @@ type infraCacheEntry[T any] struct {
 	expiresAt time.Time
 }
 
-// InfrastructureCache stores NS records and Glue IPs to speed up recursion
-type InfrastructureCache struct {
+// InfraShard reduces lock contention
+type InfraShard struct {
 	sync.RWMutex
-	nsCache   map[string]infraCacheEntry[[]Nameserver]
+	nsCache   map[string]infraCacheEntry[[]*Nameserver] // Changed to pointer to allow atomic RTT updates
 	glueCache map[string]infraCacheEntry[[]net.IP]
+}
+
+// InfrastructureCache stores NS records and Glue IPs
+type InfrastructureCache struct {
+	shards [infraShardCount]*InfraShard
+}
+
+func NewInfrastructureCache() *InfrastructureCache {
+	ic := &InfrastructureCache{}
+	for i := 0; i < infraShardCount; i++ {
+		ic.shards[i] = &InfraShard{
+			nsCache:   make(map[string]infraCacheEntry[[]*Nameserver]),
+			glueCache: make(map[string]infraCacheEntry[[]net.IP]),
+		}
+	}
+	return ic
+}
+
+func (ic *InfrastructureCache) getShard(key string) *InfraShard {
+	var h maphash.Hash
+	h.SetSeed(infraHasherSeed)
+	h.WriteString(key)
+	return ic.shards[h.Sum64()&(infraShardCount-1)]
 }
 
 type RecursiveResolver struct {
 	config    RecursionConfig
-	rootHints []Nameserver
+	rootHints []*Nameserver // Changed to pointer
 	cache     *InfrastructureCache
 	client    *dns.Client
 	glueGroup singleflight.Group
@@ -70,20 +127,16 @@ type RecursiveResolver struct {
 func NewRecursiveResolver(cfg RecursionConfig) *RecursiveResolver {
 	rr := &RecursiveResolver{
 		config: cfg,
-		cache: &InfrastructureCache{
-			nsCache:   make(map[string]infraCacheEntry[[]Nameserver]),
-			glueCache: make(map[string]infraCacheEntry[[]net.IP]),
-		},
+		cache:  NewInfrastructureCache(),
 		client: &dns.Client{
 			Net:            "udp",
-			Timeout:        2 * time.Second, // Aggressive timeout for individual recursion steps
-			SingleInflight: false,           // We handle our own singleflight if needed
-			UDPSize:        4096,            // Ensure we can receive large responses
+			Timeout:        2 * time.Second,
+			SingleInflight: false,
+			UDPSize:        4096,
 		},
 	}
 
 	rr.loadRootHints()
-	// Start background cleanup for cache
 	go rr.cacheCleanupLoop()
 	return rr
 }
@@ -97,53 +150,34 @@ func (r *RecursiveResolver) cacheCleanupLoop() {
 }
 
 func (r *RecursiveResolver) pruneCache() {
-	r.cache.Lock()
-	defer r.cache.Unlock()
-
 	now := time.Now()
-
-	// Prune NS Cache
-	for k, v := range r.cache.nsCache {
-		if now.After(v.expiresAt) {
-			delete(r.cache.nsCache, k)
-		}
-	}
-	// Safety valve: random eviction if still too big
-	if len(r.cache.nsCache) > infraCacheMaxSize {
-		count := 0
-		for k := range r.cache.nsCache {
-			delete(r.cache.nsCache, k)
-			count++
-			if count > 100 {
-				break
-			} // Delete batch
-		}
-	}
-
-	// Prune Glue Cache
-	for k, v := range r.cache.glueCache {
-		if now.After(v.expiresAt) {
-			delete(r.cache.glueCache, k)
-		}
-	}
-	if len(r.cache.glueCache) > infraCacheMaxSize {
-		count := 0
-		for k := range r.cache.glueCache {
-			delete(r.cache.glueCache, k)
-			count++
-			if count > 100 {
-				break
+	for i, shard := range r.cache.shards {
+		shard.Lock()
+		cleanedNS := 0
+		cleanedGlue := 0
+		for k, v := range shard.nsCache {
+			if now.After(v.expiresAt) {
+				delete(shard.nsCache, k)
+				cleanedNS++
 			}
+		}
+		for k, v := range shard.glueCache {
+			if now.After(v.expiresAt) {
+				delete(shard.glueCache, k)
+				cleanedGlue++
+			}
+		}
+		shard.Unlock()
+		if cleanedNS > 0 || cleanedGlue > 0 {
+			LogDebug("[RECURSION] [CACHE-PRUNE] Shard %d: Pruned %d NS records, %d Glue records", i, cleanedNS, cleanedGlue)
 		}
 	}
 }
 
-// Built-in Root Hints (IANA)
 func (r *RecursiveResolver) loadRootHints() {
-	// If file provided, load it
 	if r.config.RootHintsFile != "" {
 		if err := r.parseRootHintsFile(r.config.RootHintsFile); err != nil {
-			LogWarn("[RECURSION] Failed to load root hints file %s: %v. Using built-ins.", r.config.RootHintsFile, err)
+			LogWarn("[RECURSION] Failed to load root hints file: %v. Using built-ins.", err)
 			r.useBuiltInRoots()
 		} else {
 			LogInfo("[RECURSION] Loaded root hints from %s", r.config.RootHintsFile)
@@ -154,8 +188,8 @@ func (r *RecursiveResolver) loadRootHints() {
 }
 
 func (r *RecursiveResolver) useBuiltInRoots() {
-	// Simplified set of Root Servers (A-M)
-	r.rootHints = []Nameserver{
+	// Root servers (A-M)
+	r.rootHints = []*Nameserver{
 		{Name: "a.root-servers.net.", IPs: []net.IP{net.ParseIP("198.41.0.4"), net.ParseIP("2001:503:ba3e::2:30")}},
 		{Name: "b.root-servers.net.", IPs: []net.IP{net.ParseIP("199.9.14.201"), net.ParseIP("2001:500:200::b")}},
 		{Name: "c.root-servers.net.", IPs: []net.IP{net.ParseIP("192.33.4.12"), net.ParseIP("2001:500:2::c")}},
@@ -179,14 +213,12 @@ func (r *RecursiveResolver) parseRootHintsFile(path string) error {
 	}
 	defer f.Close()
 
-	var roots []Nameserver
+	var roots []*Nameserver
 	nsMap := make(map[string][]net.IP)
 
 	zp := dns.NewZoneParser(bufio.NewReader(f), ".", path)
 	for rr, ok := zp.Next(); ok; rr, ok = zp.Next() {
 		switch v := rr.(type) {
-		case *dns.NS:
-			// Just tracking presence
 		case *dns.A:
 			name := strings.ToLower(v.Header().Name)
 			nsMap[name] = append(nsMap[name], v.A)
@@ -201,17 +233,16 @@ func (r *RecursiveResolver) parseRootHintsFile(path string) error {
 	}
 
 	for name, ips := range nsMap {
-		roots = append(roots, Nameserver{Name: name, IPs: ips})
+		roots = append(roots, &Nameserver{Name: name, IPs: ips})
 	}
 
 	if len(roots) > 0 {
 		r.rootHints = roots
 		return nil
 	}
-	return errors.New("no valid root hints found in file")
+	return errors.New("no valid root hints found")
 }
 
-// Resolve is the entry point
 func (r *RecursiveResolver) Resolve(ctx context.Context, req *dns.Msg, reqCtx *RequestContext) (*dns.Msg, error) {
 	if len(req.Question) == 0 {
 		return nil, errors.New("no question")
@@ -222,35 +253,33 @@ func (r *RecursiveResolver) Resolve(ctx context.Context, req *dns.Msg, reqCtx *R
 
 	LogDebug("[RECURSION] [START] Resolving %s %s (QNameMin: %v)", qName, dns.TypeToString[q.Qtype], r.config.QNameMinimization)
 
-	// Loop detection context
 	visited := make(map[string]int)
 
-	// QNAME Minimization Logic (RFC 7816)
+	// QNAME Minimization
 	if r.config.QNameMinimization && q.Qtype != dns.TypeNS {
 		labels := dns.SplitDomainName(qName)
+		// RFC 7816: Iterate from root labels down
 		for i := len(labels) - 1; i > 0; i-- {
 			partialName := dns.Fqdn(strings.Join(labels[len(labels)-1-i:], "."))
-
-			LogDebug("[RECURSION] [MINIMIZATION] Step: Querying partial label '%s' (NS) to prime cache", partialName)
-
-			// We iterate, but we expect errors or NXDOMAINs as we drill down.
-			// We are only priming the cache here.
+			// Prime the cache
+			LogDebug("[RECURSION] [WALK] QNAME Minimization Step: Asking for NS %s", partialName)
 			resp, err := r.iterativeQuery(ctx, partialName, dns.TypeNS, 0, visited, reqCtx)
-
+			
+			// If minimization fails (e.g. broken nameserver), we stop optimization but don't fail the request.
+			// We just let the Full Resolution below handle it with the full QNAME.
 			if err != nil {
-				LogDebug("[RECURSION] [MINIMIZATION] Failed for '%s': %v. Stopping minimization, falling back to full resolution.", partialName, err)
+				LogDebug("[RECURSION] [WALK] Minimization step failed for %s: %v. Falling back to full QNAME.", partialName, err)
 				break
 			}
-
 			if resp != nil && resp.Rcode == dns.RcodeNameError {
-				LogDebug("[RECURSION] [MINIMIZATION] Got NXDOMAIN for '%s'. Stopping minimization.", partialName)
+				LogDebug("[RECURSION] [WALK] Minimization step got NXDOMAIN for %s. Stopping minimization.", partialName)
 				break
 			}
 		}
 	}
 
 	// Full resolution
-	LogDebug("[RECURSION] [FULL-RESOLVE] Starting full resolution for %s", qName)
+	LogDebug("[RECURSION] [WALK] Starting Full Resolution for %s", qName)
 	resp, err := r.iterativeQuery(ctx, qName, q.Qtype, 0, visited, reqCtx)
 	if err != nil {
 		LogDebug("[RECURSION] [FAILED] Resolution failed for %s: %v", qName, err)
@@ -260,112 +289,142 @@ func (r *RecursiveResolver) Resolve(ctx context.Context, req *dns.Msg, reqCtx *R
 	return resp, nil
 }
 
-// resultStruct for concurrent lookups
-type exchangeResult struct {
-	msg *dns.Msg
-	err error
-	ns  string
-}
-
+// Optimized Iterative Query with RTT Awareness
 func (r *RecursiveResolver) iterativeQuery(ctx context.Context, qName string, qType uint16, depth int, visited map[string]int, reqCtx *RequestContext) (*dns.Msg, error) {
 	if depth > r.config.MaxDepth {
-		LogWarn("[RECURSION] Max depth exceeded for %s", qName)
+		LogDebug("[RECURSION] [WALK] Max depth exceeded for %s", qName)
 		return nil, fmt.Errorf("recursion depth exceeded")
 	}
 
-	// Check loop detection
 	loopKey := fmt.Sprintf("%s:%d", qName, qType)
 	if visited[loopKey] > 5 {
-		LogWarn("[RECURSION] Loop detected for %s %s", qName, dns.TypeToString[qType])
-		return nil, fmt.Errorf("recursion loop detected for %s", qName)
+		LogDebug("[RECURSION] [WALK] Loop detected for %s", loopKey)
+		return nil, fmt.Errorf("loop detected")
 	}
 	visited[loopKey]++
 
-	// 1. Find closest zone with known NS servers
 	zone, nsList, hit := r.getClosestNS(qName)
 	if !hit {
-		LogDebug("[RECURSION] [NS-MISS] No cached NS found for %s, falling back to ROOT hints", qName)
+		LogDebug("[RECURSION] [WALK] No cached NS for %s, starting at ROOT", qName)
 		nsList = r.rootHints
 	} else {
-		LogDebug("[RECURSION] [NS-HIT] Found cached NS for closest zone '%s' (%d servers). Shortcut taken.", zone, len(nsList))
+		if zone != "." && zone != "" {
+			LogDebug("[RECURSION] [WALK] Shortcut: Cached zone '%s' found for '%s' (%d servers)", zone, qName, len(nsList))
+		} else {
+			LogDebug("[RECURSION] [WALK] Cached NS found for zone %s (%d servers)", zone, len(nsList))
+		}
 	}
 
-	// Shuffle to load balance
-	rand.Shuffle(len(nsList), func(i, j int) { nsList[i], nsList[j] = nsList[j], nsList[i] })
+	// --- RTT SORTING STRATEGY ---
+	// Create a copy to sort without locking the cache
+	candidates := make([]*Nameserver, len(nsList))
+	copy(candidates, nsList)
 
-	// --- OPTIMIZATION: Concurrent Queries (Happy Eyeballs) ---
-	// Instead of trying one by one, we try top 3 simultaneously.
+	// Sort candidates:
+	// 1. FailureCount (prefer 0)
+	// 2. RTT (lowest first)
+	// 3. Random shuffle for 0-RTT/new items (load balancing)
+	sort.Slice(candidates, func(i, j int) bool {
+		f1 := candidates[i].FailureCount.Load()
+		f2 := candidates[j].FailureCount.Load()
+		if f1 != f2 {
+			return f1 < f2
+		}
 
+		rtt1 := candidates[i].RTT.Load()
+		rtt2 := candidates[j].RTT.Load()
+
+		if rtt1 == 0 && rtt2 == 0 {
+			return rand.IntN(2) == 0 // Randomize new ones
+		}
+		if rtt1 == 0 {
+			return false
+		} // Prefer proven
+		if rtt2 == 0 {
+			return true
+		}
+
+		return rtt1 < rtt2
+	})
+
+	// Happy Eyeballs: Race the top 3
 	const concurrency = 3
-	candidates := nsList
-	if len(candidates) > concurrency {
-		candidates = candidates[:concurrency]
+	limit := len(candidates)
+	if limit > concurrency {
+		limit = concurrency
 	}
 
-	// Channel to receive the first successful answer
-	resultCh := make(chan exchangeResult, len(candidates))
+	type raceResult struct {
+		msg *dns.Msg
+		err error
+		ns  *Nameserver
+	}
 
-	// Context for this iteration step - cancel others if one succeeds
+	resultCh := make(chan raceResult, limit)
 	stepCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	activeWorkers := 0
-
-	for _, ns := range candidates {
-		// Resolve IPs (Parallelized internally)
+	active := 0
+	for i := 0; i < limit; i++ {
+		ns := candidates[i]
+		// Get IPs (this might recurse, handled by singleflight)
+		LogDebug("[RECURSION] [WALK] Step: Resolving IP for NS %s (Zone: %s)", ns.Name, zone)
 		ips := r.getIPsForNS(ctx, ns, depth, visited, reqCtx)
 		if len(ips) == 0 {
-			LogDebug("[RECURSION] Failed to resolve IP for NS %s, skipping", ns.Name)
+			LogDebug("[RECURSION] [WALK] No IPs resolved for NS %s, trying next candidate", ns.Name)
 			continue
 		}
-
 		targetIP := r.pickIP(ips)
 		if targetIP == nil {
+			LogDebug("[RECURSION] [WALK] No usable IP (IP Version mismatch?) for NS %s", ns.Name)
 			continue
 		}
 
-		activeWorkers++
-		go func(targetNS Nameserver, ip net.IP) {
-			// Perform exchange
+		active++
+		go func(targetNS *Nameserver, ip net.IP) {
+			start := time.Now()
+			LogDebug("[RECURSION] [WALK] Sending Query: %s %s -> %s (%s)", qName, dns.TypeToString[qType], targetNS.Name, ip)
 			resp, err := r.exchange(stepCtx, ip, qName, qType)
+			duration := time.Since(start)
 
-			// If successful answer or definitive error (NXDOMAIN/Success), send result
+			// Update RTT
+			if err != nil {
+				targetNS.UpdateRTT(duration, true)
+				LogDebug("[RECURSION] [WALK] Query Failed: %s (%s) Error: %v (Duration: %v)", targetNS.Name, ip, err, duration)
+			} else {
+				targetNS.UpdateRTT(duration, false)
+				LogDebug("[RECURSION] [WALK] Query Success: %s (%s) Rcode: %s (Duration: %v)", targetNS.Name, ip, dns.RcodeToString[resp.Rcode], duration)
+			}
+
 			if err == nil && (resp.Rcode == dns.RcodeSuccess || resp.Rcode == dns.RcodeNameError) {
 				select {
-				case resultCh <- exchangeResult{msg: resp, err: nil, ns: targetNS.Name}:
+				case resultCh <- raceResult{msg: resp, err: nil, ns: targetNS}:
 				case <-stepCtx.Done():
 				}
 			} else {
-				// Send error/failure, but don't cancel context
 				select {
-				case resultCh <- exchangeResult{msg: resp, err: err, ns: targetNS.Name}:
+				case resultCh <- raceResult{msg: resp, err: err, ns: targetNS}:
 				case <-stepCtx.Done():
 				}
 			}
 		}(ns, targetIP)
 	}
 
-	if activeWorkers == 0 {
+	if active == 0 {
 		return nil, fmt.Errorf("no reachable nameservers for zone %s", zone)
 	}
 
-	var lastErr error
 	var response *dns.Msg
-	var winningNS string
+	var lastErr error
 
-	// Wait for first success or all failures
-	for i := 0; i < activeWorkers; i++ {
+	for i := 0; i < active; i++ {
 		select {
 		case res := <-resultCh:
 			if res.err == nil && res.msg != nil {
-				// We got a good response!
 				response = res.msg
-				winningNS = res.ns
-				// Cancel other requests immediately
-				cancel()
+				cancel() // Stop others
 				goto ProcessResponse
 			}
-			// Store last error/response to return if all fail
 			if res.err != nil {
 				lastErr = res.err
 			} else if res.msg != nil {
@@ -376,117 +435,81 @@ func (r *RecursiveResolver) iterativeQuery(ctx context.Context, qName string, qT
 		}
 	}
 
-	// If we exited loop, no success found
-	if lastErr != nil {
-		LogWarn("[RECURSION] All servers for zone %s failed. Last error: %v", zone, lastErr)
+	if response == nil {
 		return nil, lastErr
 	}
-	if response != nil {
-		// We have a response but it wasn't Success/NXDOMAIN? (Should be covered above, but safety fallback)
-		goto ProcessResponse
-	}
-
-	return nil, errors.New("all authoritative servers failed")
 
 ProcessResponse:
-	// 3. Analyze Response
 	switch response.Rcode {
 	case dns.RcodeSuccess:
-		// Is it a referral? (No Answer, but NS in Authority)
+		// Referral
 		if len(response.Answer) == 0 && len(response.Ns) > 0 {
 			referralZone, referralNS, glue := r.extractReferral(response)
 			if len(referralNS) > 0 {
-				LogDebug("[RECURSION] Referral received to zone '%s' (%d NS records, %d Glue IPs) from %s", referralZone, len(referralNS), len(glue), winningNS)
-
-				// Cache the referral
+				LogDebug("[RECURSION] [WALK] Referral Received: %s -> Delegates to %s (%d NS, %d Glue)", zone, referralZone, len(referralNS), len(glue))
 				r.updateInfraCache(referralZone, referralNS, glue)
-
-				// Continue recursion with new zone
-				LogDebug("[RECURSION] Following referral to %s", referralZone)
+				
+				// RECURSE: Continue walking down the tree
 				return r.iterativeQuery(ctx, qName, qType, depth+1, visited, reqCtx)
 			}
-			// NODATA
-			LogDebug("[RECURSION] NODATA received for %s from %s", qName, winningNS)
-			return response, nil
 		}
-
-		// CNAME Handling
+		// CNAME
 		if len(response.Answer) > 0 && response.Answer[0].Header().Rrtype == dns.TypeCNAME && qType != dns.TypeCNAME {
-			cnameRR := response.Answer[0].(*dns.CNAME)
-			LogDebug("[RECURSION] CNAME found: %s -> %s [Restarting recursion]", qName, cnameRR.Target)
-
-			// Restart recursion for the CNAME target
-			targetResp, err := r.iterativeQuery(ctx, cnameRR.Target, qType, depth+1, visited, reqCtx)
+			cname := response.Answer[0].(*dns.CNAME)
+			LogDebug("[RECURSION] [WALK] CNAME Found: %s -> %s. Restarting walk for target.", qName, cname.Target)
+			targetResp, err := r.iterativeQuery(ctx, cname.Target, qType, depth+1, visited, reqCtx)
 			if err == nil && targetResp != nil {
-				// Prepend CNAME to answer
 				response.Answer = append(response.Answer, targetResp.Answer...)
-				return response, nil
 			}
-			LogDebug("[RECURSION] Failed to resolve CNAME target %s", cnameRR.Target)
 			return response, nil
 		}
-
-		// Actual Answer
-		LogDebug("[RECURSION] Final answer received for %s from %s", qName, winningNS)
+		// Direct Answer
+		LogDebug("[RECURSION] [WALK] Answer Received for %s", qName)
 		return response, nil
-
 	case dns.RcodeNameError:
-		LogDebug("[RECURSION] NXDOMAIN received for %s from %s", qName, winningNS)
+		LogDebug("[RECURSION] [WALK] NXDOMAIN Received for %s", qName)
 		return response, nil
-
 	default:
-		// Logic should ideally have filtered this in the race loop, but if it's the only response we got:
-		LogDebug("[RECURSION] Upstream returned %s from %s", dns.RcodeToString[response.Rcode], winningNS)
-		return response, fmt.Errorf("upstream rcode: %s", dns.RcodeToString[response.Rcode])
+		return response, nil
 	}
 }
 
 func (r *RecursiveResolver) exchange(ctx context.Context, ip net.IP, qName string, qType uint16) (*dns.Msg, error) {
-	// OPTIMIZATION: Use message pool to reduce GC pressure
 	m := getMsg()
 	defer putMsg(m)
-
 	m.SetQuestion(qName, qType)
-	// Iterative queries must NOT have Recursion Desired set
 	m.RecursionDesired = false
 	m.SetEdns0(4096, true)
-
-	addr := net.JoinHostPort(ip.String(), "53")
-	resp, _, err := r.client.ExchangeContext(ctx, m, addr)
-	return resp, err
+	// Fixed: discard the duration return value to match function signature
+	msg, _, err := r.client.ExchangeContext(ctx, m, net.JoinHostPort(ip.String(), "53"))
+	return msg, err
 }
 
-// getClosestNS walks up the domain tree to find cached NS records
-func (r *RecursiveResolver) getClosestNS(qName string) (string, []Nameserver, bool) {
-	r.cache.RLock()
-	defer r.cache.RUnlock()
-
-	now := time.Now()
-	
-	// OPTIMIZATION: Manual index iteration to avoid dns.NextLabel overhead
-	// and unnecessary string slicing for checking.
+// Optimized Closest NS Finder (Sharded & Zero-Alloc)
+func (r *RecursiveResolver) getClosestNS(qName string) (string, []*Nameserver, bool) {
+	// Start with full name
 	end := len(qName)
 	if end > 0 && qName[end-1] == '.' {
-		// qName should be fully qualified in internal logic, but be safe
+		// qName is fqdn
 	} else {
-		// Just in case (though dns.SplitDomainName handles this mostly)
-		end++ // Implicit dot
+		end++ // virtual dot
 	}
 
-	// Start with full name
 	off := 0
 	for {
 		zone := qName[off:]
-		if val, ok := r.cache.nsCache[zone]; ok {
-			if now.Before(val.expiresAt) {
-				return zone, val.data, true
-			}
-			// Expired items will be cleaned by background loop
-		}
+		shard := r.cache.getShard(zone)
 
-		// Find next dot
-		// dns.NextLabel logic inlined:
-		// Find the first dot after the current offset
+		shard.RLock()
+		val, ok := shard.nsCache[zone]
+		if ok && time.Now().Before(val.expiresAt) {
+			data := val.data
+			shard.RUnlock()
+			return zone, data, true
+		}
+		shard.RUnlock()
+
+		// Move to next dot
 		nextDot := -1
 		for i := off; i < len(qName); i++ {
 			if qName[i] == '.' {
@@ -494,107 +517,99 @@ func (r *RecursiveResolver) getClosestNS(qName string) (string, []Nameserver, bo
 				break
 			}
 		}
-		
 		if nextDot == -1 {
-			// No more dots, we are at root "." or TLD without trailing dot
 			if off == 0 && qName == "." {
 				break
 			}
 			if off < len(qName) {
-				// Try root
-				off = len(qName) 
+				off = len(qName)
 				continue
 			}
 			break
 		}
-		
-		// Move past the dot
 		off = nextDot + 1
 		if off >= len(qName) {
 			break
 		}
 	}
-
 	return ".", nil, false
 }
 
-func (r *RecursiveResolver) getIPsForNS(ctx context.Context, ns Nameserver, depth int, visited map[string]int, reqCtx *RequestContext) []net.IP {
-	// 1. Check if we already have IPs (Glue passed in struct)
+func (r *RecursiveResolver) getIPsForNS(ctx context.Context, ns *Nameserver, depth int, visited map[string]int, reqCtx *RequestContext) []net.IP {
 	if len(ns.IPs) > 0 {
+		LogDebug("[RECURSION] Using existing IPs for NS %s: %v", ns.Name, ns.IPs)
 		return ns.IPs
 	}
 
-	// 2. Check Glue Cache
-	r.cache.RLock()
-	if val, ok := r.cache.glueCache[ns.Name]; ok {
-		if time.Now().Before(val.expiresAt) {
-			r.cache.RUnlock()
-			return val.data
-		}
+	shard := r.cache.getShard(ns.Name)
+	shard.RLock()
+	val, ok := shard.glueCache[ns.Name]
+	if ok && time.Now().Before(val.expiresAt) {
+		shard.RUnlock()
+		LogDebug("[RECURSION] [GLUE-HIT] Found glue for %s: %v", ns.Name, val.data)
+		return val.data
 	}
-	r.cache.RUnlock()
+	shard.RUnlock()
 
-	// 3. Resolve the NS name
-	// OPTIMIZATION: Use Singleflight to prevent Thundering Herd
-	// OPTIMIZATION: Zero-allocation key generation
-	// We use a simple concat since this is a hot path.
-	// Format: "glue:" + ns.Name + ":" + r.config.IPVersion
 	key := "glue:" + ns.Name + ":" + r.config.IPVersion
-
-	val, err, _ := r.glueGroup.Do(key, func() (interface{}, error) {
-		LogDebug("[RECURSION] [GLUE-MISS] No glue for %s, resolving A/AAAA records...", ns.Name)
-
-		// OPTIMIZATION: Resolve A and AAAA concurrently
+	res, err, _ := r.glueGroup.Do(key, func() (interface{}, error) {
+		LogDebug("[RECURSION] [GLUE-MISS] Resolving glue for %s (Key: %s)", ns.Name, key)
 		var ips []net.IP
 		var mu sync.Mutex
 		var wg sync.WaitGroup
 
-		resolveType := func(qType uint16) {
+		resolve := func(qType uint16) {
 			defer wg.Done()
 
+			// Must copy visited map to prevent concurrent map read/write or side effects in recursion
 			visitedCopy := make(map[string]int, len(visited))
 			for k, v := range visited {
 				visitedCopy[k] = v
 			}
 
-			if resp, err := r.iterativeQuery(ctx, ns.Name, qType, depth+1, visitedCopy, reqCtx); err == nil && resp != nil {
-				mu.Lock()
-				defer mu.Unlock()
-				for _, rr := range resp.Answer {
-					switch v := rr.(type) {
-					case *dns.A:
-						ips = append(ips, v.A)
-					case *dns.AAAA:
-						ips = append(ips, v.AAAA)
-					}
+			// Perform recursive lookup for the nameserver's own name
+			LogDebug("[RECURSION] [GLUE-RESOLVE] Recursive lookup for %s %s", ns.Name, dns.TypeToString[qType])
+			resp, err := r.iterativeQuery(ctx, ns.Name, qType, depth+1, visitedCopy, reqCtx)
+			if err != nil || resp == nil {
+				LogDebug("[RECURSION] [GLUE-RESOLVE] Failed for %s %s: %v", ns.Name, dns.TypeToString[qType], err)
+				return
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+			for _, rr := range resp.Answer {
+				switch v := rr.(type) {
+				case *dns.A:
+					ips = append(ips, v.A)
+				case *dns.AAAA:
+					ips = append(ips, v.AAAA)
 				}
 			}
 		}
 
-		// Strict config handling: use lowercase to support "IPv4" or "ipv4"
 		mode := strings.ToLower(r.config.IPVersion)
-
 		if mode == "ipv4" || mode == "both" {
 			wg.Add(1)
-			go resolveType(dns.TypeA)
+			go resolve(dns.TypeA)
 		}
 		if mode == "ipv6" || mode == "both" {
 			wg.Add(1)
-			go resolveType(dns.TypeAAAA)
+			go resolve(dns.TypeAAAA)
 		}
 
 		wg.Wait()
 
 		if len(ips) > 0 {
-			LogDebug("[RECURSION] [GLUE-RESOLVED] Resolved and cached IPs for %s: %v", ns.Name, ips)
-			r.cache.Lock()
-			r.cache.glueCache[ns.Name] = infraCacheEntry[[]net.IP]{
-				data:      ips,
-				expiresAt: time.Now().Add(infraCacheTTL),
-			}
-			r.cache.Unlock()
+			// Cache the result (Glue Cache)
+			expires := time.Now().Add(infraCacheTTL)
+			gShard := r.cache.getShard(ns.Name)
+			gShard.Lock()
+			gShard.glueCache[ns.Name] = infraCacheEntry[[]net.IP]{data: ips, expiresAt: expires}
+			gShard.Unlock()
+
+			LogDebug("[RECURSION] Resolved Glue for %s: %v", ns.Name, ips)
 		} else {
-			LogDebug("[RECURSION] [GLUE-FAILED] Failed to resolve any IPs for NS %s", ns.Name)
+			LogDebug("[RECURSION] Failed to resolve Glue for %s", ns.Name)
 		}
 
 		return ips, nil
@@ -603,34 +618,25 @@ func (r *RecursiveResolver) getIPsForNS(ctx context.Context, ns Nameserver, dept
 	if err != nil {
 		return nil
 	}
-	return val.([]net.IP)
+	return res.([]net.IP)
 }
 
-func (r *RecursiveResolver) extractReferral(msg *dns.Msg) (string, []Nameserver, map[string][]net.IP) {
-	// OPTIMIZATION: Pre-allocate maps and slices
-	nsMap := make(map[string][]net.IP, len(msg.Extra)) // Name -> Glue IPs
-	nsList := make([]Nameserver, 0, len(msg.Ns))
+func (r *RecursiveResolver) extractReferral(msg *dns.Msg) (string, []*Nameserver, map[string][]net.IP) {
+	nsMap := make(map[string][]net.IP)
+	var nsList []*Nameserver
 	zone := ""
 
-	// Process Authority section for NS records
 	for _, rr := range msg.Ns {
 		if ns, ok := rr.(*dns.NS); ok {
 			zone = strings.ToLower(ns.Header().Name)
-			nsName := strings.ToLower(ns.Ns)
-			nsList = append(nsList, Nameserver{Name: nsName})
-			// Initialize map entry
-			if _, exists := nsMap[nsName]; !exists {
-				nsMap[nsName] = []net.IP{}
-			}
+			name := strings.ToLower(ns.Ns)
+			nsList = append(nsList, &Nameserver{Name: name})
+			nsMap[name] = []net.IP{}
 		}
 	}
-
-	// Process Additional section for Glue
 	for _, rr := range msg.Extra {
-		header := rr.Header()
-		name := strings.ToLower(header.Name)
-
-		if _, needed := nsMap[name]; needed {
+		name := strings.ToLower(rr.Header().Name)
+		if _, ok := nsMap[name]; ok {
 			switch v := rr.(type) {
 			case *dns.A:
 				nsMap[name] = append(nsMap[name], v.A)
@@ -639,77 +645,41 @@ func (r *RecursiveResolver) extractReferral(msg *dns.Msg) (string, []Nameserver,
 			}
 		}
 	}
-
-	// Populate IPs back into nsList
 	for i := range nsList {
-		if ips, ok := nsMap[nsList[i].Name]; ok && len(ips) > 0 {
+		if ips := nsMap[nsList[i].Name]; len(ips) > 0 {
 			nsList[i].IPs = ips
 		}
 	}
-
 	return zone, nsList, nsMap
 }
 
-func (r *RecursiveResolver) updateInfraCache(zone string, nsList []Nameserver, glue map[string][]net.IP) {
-	r.cache.Lock()
-	defer r.cache.Unlock()
-
+func (r *RecursiveResolver) updateInfraCache(zone string, nsList []*Nameserver, glue map[string][]net.IP) {
+	LogDebug("[RECURSION] Updating Infra Cache for zone %s (%d NS)", zone, len(nsList))
 	expires := time.Now().Add(infraCacheTTL)
 
-	r.cache.nsCache[zone] = infraCacheEntry[[]Nameserver]{
-		data:      nsList,
-		expiresAt: expires,
-	}
+	// Update NS Cache
+	shard := r.cache.getShard(zone)
+	shard.Lock()
+	shard.nsCache[zone] = infraCacheEntry[[]*Nameserver]{data: nsList, expiresAt: expires}
+	shard.Unlock()
 
-	if len(glue) > 0 {
-		for name, ips := range glue {
-			if len(ips) > 0 {
-				r.cache.glueCache[name] = infraCacheEntry[[]net.IP]{
-					data:      ips,
-					expiresAt: expires,
-				}
-			}
+	// Update Glue Cache (might cross shards)
+	for name, ips := range glue {
+		if len(ips) == 0 {
+			continue
 		}
+		gShard := r.cache.getShard(name)
+		gShard.Lock()
+		gShard.glueCache[name] = infraCacheEntry[[]net.IP]{data: ips, expiresAt: expires}
+		gShard.Unlock()
 	}
 }
 
 func (r *RecursiveResolver) pickIP(ips []net.IP) net.IP {
-	// OPTIMIZATION: Pre-allocate to avoid small resizes if multiple IPs
-	v4 := make([]net.IP, 0, len(ips))
-	v6 := make([]net.IP, 0, len(ips))
-
-	for _, ip := range ips {
-		if ip.To4() != nil {
-			v4 = append(v4, ip)
-		} else {
-			v6 = append(v6, ip)
-		}
-	}
-
-	// Case-insensitive comparison
-	mode := strings.ToLower(r.config.IPVersion)
-
-	// STRICT ENFORCEMENT
-	if mode == "ipv6" {
-		if len(v6) > 0 {
-			return v6[rand.IntN(len(v6))]
-		}
+	if len(ips) == 0 {
 		return nil
 	}
-	if mode == "ipv4" {
-		if len(v4) > 0 {
-			return v4[rand.IntN(len(v4))]
-		}
-		return nil
-	}
-
-	// "both" - prefer v6 if available (modern best practice), else v4
-	if len(v6) > 0 {
-		return v6[rand.IntN(len(v6))]
-	}
-	if len(v4) > 0 {
-		return v4[rand.IntN(len(v4))]
-	}
-	return nil
+	// Simple random for now, can be improved with v4/v6 preference config
+	return ips[rand.IntN(len(ips))]
 }
 

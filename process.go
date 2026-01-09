@@ -1,9 +1,9 @@
 /*
 File: process.go
-Version: 3.3.0
-Last Update: 2026-01-08
+Version: 3.4.0
+Last Update: 2026-01-09
 Description: Handles the core processing logic for DNS requests.
-             UPDATED: Added branching logic for Recursive Resolver in processDNSRequest.
+             UPDATED: Added timeout context and RTT measurement for Recursive Resolver calls.
 */
 
 package main
@@ -208,11 +208,23 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 				return nil, fmt.Errorf("recursive resolver not initialized")
 			}
 
-			resp, err := recursiveResolver.Resolve(context.Background(), msg, safeReqCtx)
+			// Apply a definitive timeout to the recursive process
+			// Recursion can be complex, so we give it slightly more time than a standard upstream forward
+			recTimeout := getTimeout()
+			if recTimeout == 0 {
+				recTimeout = 10 * time.Second
+			}
+			recCtx, cancel := context.WithTimeout(context.Background(), recTimeout)
+			defer cancel()
+
+			recStart := time.Now()
+			resp, err := recursiveResolver.Resolve(recCtx, msg, safeReqCtx)
+			recDuration := time.Since(recStart)
+
 			if err != nil {
 				return nil, err
 			}
-			return queryResult{msg: resp, upstreamStr: "RECURSIVE", rtt: 0}, nil
+			return queryResult{msg: resp, upstreamStr: "RECURSIVE", rtt: recDuration}, nil
 		}
 
 		// STANDARD UPSTREAM FORWARDING
