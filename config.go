@@ -1,8 +1,8 @@
 /*
 File: config.go
-Version: 2.9.1
+Version: 2.10.0
 Description: Defines configuration structures and handles YAML parsing and validation.
-             UPDATED: Removed duplicate resolveUpstreams (moved logic to routing.go).
+             UPDATED: Added HardenBelowNXDOMAIN to CacheConfig.
 */
 
 package main
@@ -90,7 +90,7 @@ type ServerConfig struct {
 	// DDR (Discovery of Designated Resolvers) - RFC 9462
 	DDR struct {
 		Enabled  bool   `yaml:"enabled"`
-		HostName string `yaml:"host_name"` // DNS name of the encrypted DNS server (optional)
+		HostName string `yaml:"host_name"` // DNS name of the encrypted server (optional)
 	} `yaml:"ddr"`
 
 	DOH struct {
@@ -139,6 +139,9 @@ type CacheConfig struct {
 	// Response Sorting Strategy for Cache Hits
 	// options: "none", "round-robin", "sorted"
 	ResponseSorting string `yaml:"response_sorting"`
+
+	// HardenBelowNXDOMAIN: If true, stops queries for subdomains if parent is NXDOMAIN.
+	HardenBelowNXDOMAIN bool `yaml:"harden_below_nxdomain"`
 
 	Prefetch PrefetchConfig `yaml:"prefetch"`
 }

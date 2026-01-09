@@ -207,6 +207,11 @@ cache:
   # Options: "none", "round-robin" (randomize), "sorted" (lexical byte sort)
   response_sorting: "none"
 
+  # Harden Below NXDOMAIN:
+  # If true, dproxy will stop querying upstream if a parent domain is known
+  # to be NXDOMAIN in the cache. Matches functionality of Unbound's harden-below-nxdomain.
+  harden_below_nxdomain: true
+
   # --- Prefetching & Stale Cache ---
   prefetch:
     # Cross-Fetch: If a client asks for A, automatically fetch AAAA (or vice versa)

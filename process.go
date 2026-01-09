@@ -1,8 +1,10 @@
 /*
 File: process.go
-Version: 3.5.0
+Version: 3.6.1
 Last Update: 2026-01-09
 Description: Handles the core processing logic for DNS requests.
+             UPDATED: Fixed Harden-Below-NXDOMAIN domain formatting (FQDN mismatch).
+             UPDATED: Added verbose debug logging for Harden-Below-NXDOMAIN.
              OPTIMIZED: Improved cache key generation performance.
              OPTIMIZED: Better context timeout handling for recursive calls.
 */
@@ -169,6 +171,39 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 				if IsInfoEnabled() {
 					logRequest(r.Id, reqCtx, ruleName, qInfo, "", "NXDOMAIN (HOSTS)", "HOSTS", 0, time.Since(start), resp)
 				}
+			}
+			return
+		}
+	}
+
+	// --- HARDEN BELOW NXDOMAIN CHECK (Third) ---
+	// If the parent of this domain is already known to be NXDOMAIN, assume this one is too.
+	// This saves upstream resources and improves performance for random-subdomain attacks.
+	if config.Cache.Enabled && config.Cache.HardenBelowNXDOMAIN && len(r.Question) > 0 {
+		// FIX: Use FQDN (with trailing dot) for cache key to match how responses are likely stored/keyed in addToCache
+		checkName := dns.Fqdn(reqCtx.QueryName)
+		
+		isNX, remainingTTL := CheckParentNXDomain(checkName, ruleName)
+		
+		if IsDebugEnabled() {
+			LogDebug("[PROCESS] HardenNX Check: %s (Rule: %s) -> Hit: %v", checkName, ruleName, isNX)
+		}
+
+		if isNX {
+			LogDebug("[PROCESS] HardenNX triggered for %s (Rule: %s)", checkName, ruleName)
+
+			resp := new(dns.Msg)
+			resp.SetReply(r)
+			resp.Rcode = dns.RcodeNameError
+			
+			// We synthesize a basic NXDOMAIN response.
+			// Ideally we would include the SOA, but for a proxy block, this is sufficient.
+			// Clients will cache this result based on a default negative TTL or MinNegTTL.
+			
+			w.WriteMsg(resp)
+			if IsInfoEnabled() {
+				status := fmt.Sprintf("NXDOMAIN (HARDENED, TTL:%ds)", remainingTTL)
+				logRequest(r.Id, reqCtx, ruleName, qInfo, "", status, "CACHE", 0, time.Since(start), resp)
 			}
 			return
 		}

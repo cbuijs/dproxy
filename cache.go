@@ -1,9 +1,10 @@
 /*
 File: cache.go
-Version: 2.3.0
+Version: 2.4.0
 Description: Thread-safe in-memory DNS cache using Sharded LRU eviction.
-OPTIMIZED: Switched to RWMutex to allow non-blocking reads for background scans.
-OPTIMIZED: Moved expensive msg.Unpack() OUTSIDE the lock to reduce contention.
+             UPDATED: Added NXCache (Negative Intelligence) for "harden-below-nxdomain".
+             UPDATED: Added Debug Logging when Harden-Below-NXDOMAIN triggers.
+             OPTIMIZED: Switched to RWMutex to allow non-blocking reads for background scans.
 */
 
 package main
@@ -41,8 +42,15 @@ type CacheShard struct {
 	lruList *list.List
 }
 
+// NXCacheShard is a lightweight store for NXDOMAIN facts
+type NXCacheShard struct {
+	sync.RWMutex
+	items map[string]time.Time // Key (Domain|RoutingKey) -> Expiration
+}
+
 type DNSCache struct {
 	shards    [shardCount]*CacheShard
+	nxShards  [shardCount]*NXCacheShard
 	capacity  int // Total capacity
 	shardCap  int // Capacity per shard
 	enabled   bool
@@ -60,6 +68,9 @@ func newDNSCache() *DNSCache {
 			items:   make(map[string]*list.Element),
 			lruList: list.New(),
 		}
+		c.nxShards[i] = &NXCacheShard{
+			items: make(map[string]time.Time),
+		}
 	}
 	return c
 }
@@ -68,8 +79,14 @@ func (c *DNSCache) getShard(key string) *CacheShard {
 	var h maphash.Hash
 	h.SetSeed(hasherSeed)
 	h.WriteString(key)
-	// shardCount is 256 (power of 2), so we can use bitwise AND for modulo
 	return c.shards[h.Sum64()&(shardCount-1)]
+}
+
+func (c *DNSCache) getNXShard(key string) *NXCacheShard {
+	var h maphash.Hash
+	h.SetSeed(hasherSeed)
+	h.WriteString(key)
+	return c.nxShards[h.Sum64()&(shardCount-1)]
 }
 
 func maintainDNSCache(ctx context.Context) {
@@ -100,6 +117,10 @@ func maintainDNSCache(ctx context.Context) {
 	// Log TTL Strategy if enabled
 	if config.Cache.TTLStrategy != "" && config.Cache.TTLStrategy != "none" {
 		LogInfo("[CACHE] TTL Strategy: %s", config.Cache.TTLStrategy)
+	}
+
+	if config.Cache.HardenBelowNXDOMAIN {
+		LogInfo("[CACHE] Harden Below NXDOMAIN: Enabled (Stopping sub-queries for non-existent parents)")
 	}
 
 	// Initialize prefetch subsystem
@@ -214,14 +235,17 @@ func addToCache(key string, msg *dns.Msg) {
 		return
 	}
 
-	if msg.Rcode != dns.RcodeSuccess && msg.Rcode != dns.RcodeNameError {
-		return
-	}
-	if msg.Truncated {
-		return
+	// --- Harden NXDOMAIN Logic ---
+	// If the response is NXDOMAIN, we cache this fact separately to support "harden-below-nxdomain"
+	// We extract the RoutingKey from the main cache key to ensure we don't bleed NX facts across views.
+	// Key format: Name|Type|Class|RoutingKey
+	var routingKey string
+	parts := strings.Split(key, "|")
+	if len(parts) >= 4 {
+		routingKey = parts[3]
 	}
 
-	// Determine minTTL
+	// Calculate minTTL for the record
 	minTTL := uint32(3600)
 	foundTTL := false
 	checkRR := func(rrs []dns.RR) {
@@ -245,8 +269,25 @@ func addToCache(key string, msg *dns.Msg) {
 		} else {
 			minTTL = 60
 		}
-	} else if !foundTTL {
+	}
+
+	// If this is an NXDOMAIN response, store it in the lightweight NXCache
+	if msg.Rcode == dns.RcodeNameError && len(msg.Question) > 0 {
+		qName := msg.Question[0].Name
+		addNXDomain(qName, routingKey, minTTL)
+	}
+
+	// --- Standard Caching Logic ---
+
+	if msg.Rcode != dns.RcodeSuccess && msg.Rcode != dns.RcodeNameError {
 		return
+	}
+	if msg.Truncated {
+		return
+	}
+
+	if !foundTTL && msg.Rcode != dns.RcodeNameError {
+		return // Don't cache success without TTLs (unless we default them, but risky)
 	}
 
 	if minTTL == 0 {
@@ -264,16 +305,10 @@ func addToCache(key string, msg *dns.Msg) {
 
 	var qName string
 	var qType, qClass uint16
-	var routingKey string
 	if len(msg.Question) > 0 {
 		qName = msg.Question[0].Name
 		qType = msg.Question[0].Qtype
 		qClass = msg.Question[0].Qclass
-	}
-
-	parts := strings.Split(key, "|")
-	if len(parts) >= 4 {
-		routingKey = parts[3]
 	}
 
 	expiration := time.Now().Add(time.Duration(minTTL) * time.Second)
@@ -321,10 +356,68 @@ func addToCache(key string, msg *dns.Msg) {
 	shard.items[key] = elem
 }
 
+// addNXDomain adds a domain to the NX cache
+func addNXDomain(qName, routingKey string, ttl uint32) {
+	if ttl == 0 {
+		return
+	}
+	
+	key := qName + "|" + routingKey
+	shard := dnsCache.getNXShard(key)
+	
+	shard.Lock()
+	shard.items[key] = time.Now().Add(time.Duration(ttl) * time.Second)
+	shard.Unlock()
+}
+
+// CheckParentNXDomain checks if the domain or any of its parents are known to be NXDOMAIN.
+// Returns true and the remaining TTL if found.
+func CheckParentNXDomain(qName, routingKey string) (bool, uint32) {
+	// Start with the full domain (harden "at" nxdomain) and walk up
+	// e.g., a.b.c.com -> a.b.c.com, b.c.com, c.com, com
+	
+	current := qName
+	now := time.Now()
+
+	for {
+		// Key format matches addNXDomain
+		key := current + "|" + routingKey
+		
+		shard := dnsCache.getNXShard(key)
+		shard.RLock()
+		expires, found := shard.items[key]
+		shard.RUnlock()
+
+		if found {
+			if now.Before(expires) {
+				remaining := uint32(expires.Sub(now).Seconds())
+				// DEBUG LOG ADDED HERE
+				LogDebug("[CACHE] HardenNX: Parent %s is NXDOMAIN (TTL: %d), blocking %s", current, remaining, qName)
+				return true, remaining
+			} else {
+				// Lazy cleanup on read miss (can be skipped, prune handles it)
+			}
+		}
+
+		// Move up one label
+		idx := strings.IndexByte(current, '.')
+		if idx == -1 || idx == len(current)-1 {
+			// No more parents (or just root left)
+			break
+		}
+		current = current[idx+1:]
+	}
+
+	return false, 0
+}
+
+
 func pruneExpired() {
 	now := time.Now()
 	cleaned := 0
+	cleanedNX := 0
 
+	// Prune Standard Cache
 	for _, shard := range dnsCache.shards {
 		shard.Lock()
 		for i := 0; i < 5; i++ {
@@ -345,8 +438,22 @@ func pruneExpired() {
 		shard.Unlock()
 	}
 
-	if cleaned > 0 {
-		LogDebug("[CACHE] Pruned %d expired items across shards", cleaned)
+	// Prune NX Cache (Random sampling or full scan? Map doesn't support order, so strict iteration is expensive)
+	// We'll just do a quick pass if enabled, maybe limiting the number of keys we check per interval
+	// For simplicity in this version, we scan all (since it's per minute)
+	for _, shard := range dnsCache.nxShards {
+		shard.Lock()
+		for k, expires := range shard.items {
+			if now.After(expires) {
+				delete(shard.items, k)
+				cleanedNX++
+			}
+		}
+		shard.Unlock()
+	}
+
+	if cleaned > 0 || cleanedNX > 0 {
+		LogDebug("[CACHE] Pruned %d expired items and %d NX facts", cleaned, cleanedNX)
 	}
 }
 
