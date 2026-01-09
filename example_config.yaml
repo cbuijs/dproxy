@@ -29,7 +29,6 @@ server:
   ddr:
     enabled: true
 
-# Enable Recursive Resolver with DNSSEC Validation
 recursion:
   enabled: true
   qname_minimization: true
