@@ -1,10 +1,10 @@
 /*
 File: process.go
-Version: 3.6.1
+Version: 3.6.2
 Last Update: 2026-01-09
 Description: Handles the core processing logic for DNS requests.
+             UPDATED: Added QType to HardenNX debug logging to distinguish between concurrent A/AAAA requests.
              UPDATED: Fixed Harden-Below-NXDOMAIN domain formatting (FQDN mismatch).
-             UPDATED: Added verbose debug logging for Harden-Below-NXDOMAIN.
              OPTIMIZED: Improved cache key generation performance.
              OPTIMIZED: Better context timeout handling for recursive calls.
 */
@@ -186,7 +186,8 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		isNX, remainingTTL := CheckParentNXDomain(checkName, ruleName)
 		
 		if IsDebugEnabled() {
-			LogDebug("[PROCESS] HardenNX Check: %s (Rule: %s) -> Hit: %v", checkName, ruleName, isNX)
+			// UPDATED: Added QType to log message to distinguish concurrent A/AAAA requests
+			LogDebug("[PROCESS] HardenNX Check: %s (%s) (Rule: %s) -> Hit: %v", checkName, dns.TypeToString[qType], ruleName, isNX)
 		}
 
 		if isNX {
