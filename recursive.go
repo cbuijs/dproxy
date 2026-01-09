@@ -1,6 +1,6 @@
 /*
 File: recursive.go
-Version: 2.0.6
+Version: 2.1.0
 Description: High-performance recursive resolver with Sharded Caching and RTT-Weighted Selection.
              IMPROVEMENT 1: Sharded InfrastructureCache (256 shards) to eliminate lock contention.
              IMPROVEMENT 2: RTT tracking for Authoritative Servers to prioritize fast upstreams.
@@ -8,6 +8,7 @@ Description: High-performance recursive resolver with Sharded Caching and RTT-We
              IMPROVEMENT 4: Zero-alloc zone walking optimizations.
              FIXED: Implemented missing Glue Resolution logic in getIPsForNS to fix "no reachable nameservers" error.
              FIXED: exchange() signature mismatch.
+             FIXED: Strictly honor ip_version setting for NS/Glue retrieval and usage.
              UPDATED: Added verbose debug logging for iterative lookups, glue resolution, and caching.
              UPDATED: Enhanced logging to explicitly show Shortcut jumps (e.g., sub.domain.com -> domain.com).
              UPDATED: Added detailed "Walking the Tree" logging for every iterative step and QNAME minimization details.
@@ -264,7 +265,7 @@ func (r *RecursiveResolver) Resolve(ctx context.Context, req *dns.Msg, reqCtx *R
 			// Prime the cache
 			LogDebug("[RECURSION] [WALK] QNAME Minimization Step: Asking for NS %s", partialName)
 			resp, err := r.iterativeQuery(ctx, partialName, dns.TypeNS, 0, visited, reqCtx)
-			
+
 			// If minimization fails (e.g. broken nameserver), we stop optimization but don't fail the request.
 			// We just let the Full Resolution below handle it with the full QNAME.
 			if err != nil {
@@ -448,7 +449,7 @@ ProcessResponse:
 			if len(referralNS) > 0 {
 				LogDebug("[RECURSION] [WALK] Referral Received: %s -> Delegates to %s (%d NS, %d Glue)", zone, referralZone, len(referralNS), len(glue))
 				r.updateInfraCache(referralZone, referralNS, glue)
-				
+
 				// RECURSE: Continue walking down the tree
 				return r.iterativeQuery(ctx, qName, qType, depth+1, visited, reqCtx)
 			}
@@ -536,9 +537,32 @@ func (r *RecursiveResolver) getClosestNS(qName string) (string, []*Nameserver, b
 }
 
 func (r *RecursiveResolver) getIPsForNS(ctx context.Context, ns *Nameserver, depth int, visited map[string]int, reqCtx *RequestContext) []net.IP {
+	mode := strings.ToLower(r.config.IPVersion)
+
+	// Helper to filter IPs
+	filterIPs := func(input []net.IP) []net.IP {
+		if mode == "both" {
+			return input
+		}
+		var filtered []net.IP
+		for _, ip := range input {
+			isV4 := ip.To4() != nil
+			if mode == "ipv4" && isV4 {
+				filtered = append(filtered, ip)
+			} else if mode == "ipv6" && !isV4 {
+				filtered = append(filtered, ip)
+			}
+		}
+		return filtered
+	}
+
 	if len(ns.IPs) > 0 {
-		LogDebug("[RECURSION] Using existing IPs for NS %s: %v", ns.Name, ns.IPs)
-		return ns.IPs
+		filtered := filterIPs(ns.IPs)
+		if len(filtered) > 0 {
+			LogDebug("[RECURSION] Using existing IPs for NS %s: %v", ns.Name, filtered)
+			return filtered
+		}
+		// If filtering removed all IPs, fall through to resolve them (maybe we need A but only have AAAA glue)
 	}
 
 	shard := r.cache.getShard(ns.Name)
@@ -546,8 +570,11 @@ func (r *RecursiveResolver) getIPsForNS(ctx context.Context, ns *Nameserver, dep
 	val, ok := shard.glueCache[ns.Name]
 	if ok && time.Now().Before(val.expiresAt) {
 		shard.RUnlock()
-		LogDebug("[RECURSION] [GLUE-HIT] Found glue for %s: %v", ns.Name, val.data)
-		return val.data
+		filtered := filterIPs(val.data)
+		if len(filtered) > 0 {
+			LogDebug("[RECURSION] [GLUE-HIT] Found glue for %s: %v", ns.Name, filtered)
+			return filtered
+		}
 	}
 	shard.RUnlock()
 
@@ -580,14 +607,17 @@ func (r *RecursiveResolver) getIPsForNS(ctx context.Context, ns *Nameserver, dep
 			for _, rr := range resp.Answer {
 				switch v := rr.(type) {
 				case *dns.A:
-					ips = append(ips, v.A)
+					if mode == "ipv4" || mode == "both" {
+						ips = append(ips, v.A)
+					}
 				case *dns.AAAA:
-					ips = append(ips, v.AAAA)
+					if mode == "ipv6" || mode == "both" {
+						ips = append(ips, v.AAAA)
+					}
 				}
 			}
 		}
 
-		mode := strings.ToLower(r.config.IPVersion)
 		if mode == "ipv4" || mode == "both" {
 			wg.Add(1)
 			go resolve(dns.TypeA)
