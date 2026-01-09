@@ -1,12 +1,10 @@
 /*
 File: process.go
-Version: 3.6.2
+Version: 3.7.0
 Last Update: 2026-01-09
 Description: Handles the core processing logic for DNS requests.
-             UPDATED: Added QType to HardenNX debug logging to distinguish between concurrent A/AAAA requests.
-             UPDATED: Fixed Harden-Below-NXDOMAIN domain formatting (FQDN mismatch).
-             OPTIMIZED: Improved cache key generation performance.
-             OPTIMIZED: Better context timeout handling for recursive calls.
+             UPDATED: Added Panic Recovery middleware to prevent server crashes on malformed requests.
+             UPDATED: Added QType to HardenNX debug logging.
 */
 
 package main
@@ -16,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -37,6 +36,15 @@ type queryResult struct {
 }
 
 func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, reqCtxFromHandler *RequestContext) {
+	// --- PANIC RECOVERY ---
+	// Protect the main server loop from crashing due to unexpected panics in request processing
+	defer func() {
+		if rec := recover(); rec != nil {
+			LogError("Panic in processDNSRequest: %v\nStack: %s", rec, debug.Stack())
+			dns.HandleFailed(w, r)
+		}
+	}()
+
 	start := time.Now()
 
 	reqCtx := reqCtxPool.Get().(*RequestContext)
@@ -186,8 +194,14 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		isNX, remainingTTL := CheckParentNXDomain(checkName, ruleName)
 		
 		if IsDebugEnabled() {
-			// UPDATED: Added QType to log message to distinguish concurrent A/AAAA requests
-			LogDebug("[PROCESS] HardenNX Check: %s (%s) (Rule: %s) -> Hit: %v", checkName, dns.TypeToString[qType], ruleName, isNX)
+			// Helper to avoid map panic (just in case, though TypeToString is usually safe)
+			typeName := "UNKNOWN"
+			if t, ok := dns.TypeToString[qType]; ok {
+				typeName = t
+			} else {
+				typeName = strconv.Itoa(int(qType))
+			}
+			LogDebug("[PROCESS] HardenNX Check: %s (%s) (Rule: %s) -> Hit: %v", checkName, typeName, ruleName, isNX)
 		}
 
 		if isNX {
@@ -352,14 +366,8 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 					routingKey: ruleName,
 					upstreams:  selectedUpstreams,
 					strategy:   selectedStrategy,
-				}
-				if len(reqCtx.ClientIP) > 0 {
-					req.clientIP = make(net.IP, len(reqCtx.ClientIP))
-					copy(req.clientIP, reqCtx.ClientIP)
-				}
-				if len(reqCtx.ClientMAC) > 0 {
-					req.clientMAC = make(net.HardwareAddr, len(reqCtx.ClientMAC))
-					copy(req.clientMAC, reqCtx.ClientMAC)
+					clientIP:   reqCtx.ClientIP,
+					clientMAC:  reqCtx.ClientMAC,
 				}
 				AttemptCrossFetch(req)
 			}

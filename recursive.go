@@ -1,7 +1,8 @@
 /*
 File: recursive.go
-Version: 2.2.0
+Version: 2.3.0
 Description: High-performance recursive resolver with Sharded Caching and RTT-Weighted Selection.
+             UPDATED: Added Global Concurrency Limiter (Semaphore) to prevent goroutine explosion / IO starvation.
              OPTIMIZED: Fixed non-deterministic sorting by pre-shuffling candidates.
              OPTIMIZED: Removed fmt.Sprintf allocations in hot paths (loop detection).
              OPTIMIZED: Smart map copying for recursion tracking.
@@ -32,9 +33,10 @@ import (
 
 // Constants for Cache Management
 const (
-	infraCacheTTL     = 1 * time.Hour // Default TTL for NS/Glue if not specified
-	infraCacheMaxSize = 10000         // Max items per map to prevent unbounded growth
-	infraShardCount   = 256           // Number of shards for infrastructure cache
+	infraCacheTTL       = 1 * time.Hour // Default TTL for NS/Glue if not specified
+	infraCacheMaxSize   = 10000         // Max items per map to prevent unbounded growth
+	infraShardCount     = 256           // Number of shards for infrastructure cache
+	maxConcurrentQueries = 4096          // Hard limit on concurrent outbound recursive queries
 )
 
 // Global seed for maphash
@@ -113,11 +115,12 @@ func (ic *InfrastructureCache) getShard(key string) *InfraShard {
 }
 
 type RecursiveResolver struct {
-	config    RecursionConfig
-	rootHints []*Nameserver
-	cache     *InfrastructureCache
-	client    *dns.Client
-	glueGroup singleflight.Group
+	config       RecursionConfig
+	rootHints    []*Nameserver
+	cache        *InfrastructureCache
+	client       *dns.Client
+	glueGroup    singleflight.Group
+	queryLimiter chan struct{} // Semaphore to limit concurrent outbound queries
 }
 
 func NewRecursiveResolver(cfg RecursionConfig) *RecursiveResolver {
@@ -130,6 +133,7 @@ func NewRecursiveResolver(cfg RecursionConfig) *RecursiveResolver {
 			SingleInflight: false,
 			UDPSize:        4096,
 		},
+		queryLimiter: make(chan struct{}, maxConcurrentQueries),
 	}
 
 	rr.loadRootHints()
@@ -399,8 +403,19 @@ func (r *RecursiveResolver) iterativeQuery(ctx context.Context, qName string, qT
 			continue
 		}
 
+		// LIMITER CHECK: Prevent goroutine explosion
+		select {
+		case r.queryLimiter <- struct{}{}:
+			// Acquired
+		default:
+			LogDebug("[RECURSION] [WALK] Max concurrent outbound queries reached, skipping candidate %s", ns.Name)
+			continue
+		}
+
 		active++
 		go func(targetNS *Nameserver, ip net.IP) {
+			defer func() { <-r.queryLimiter }() // Release semaphore
+
 			start := time.Now()
 			LogDebug("[RECURSION] [WALK] Sending Query: %s %s -> %s (%s)", qName, dns.TypeToString[qType], targetNS.Name, ip)
 			
@@ -432,7 +447,7 @@ func (r *RecursiveResolver) iterativeQuery(ctx context.Context, qName string, qT
 	}
 
 	if active == 0 {
-		return nil, fmt.Errorf("no reachable nameservers for zone %s", zone)
+		return nil, fmt.Errorf("no reachable nameservers for zone %s (or query limit reached)", zone)
 	}
 
 	var response *dns.Msg
