@@ -161,11 +161,6 @@ recursion:
   # Enable QNAME Minimization (RFC 7816) for privacy
   qname_minimization: true
 
-  # Enable DNSSEC Validation (RFC 4033)
-  # When enabled, the resolver will perform full chain of trust validation
-  # starting from the Root Anchors.
-  dnssec_enabled: true
-
   # Max recursion depth to prevent loops
   max_depth: 20
 

@@ -32,7 +32,6 @@ server:
 # Enable Recursive Resolver with DNSSEC Validation
 recursion:
   enabled: true
-  dnssec_enabled: true
   qname_minimization: true
 
 # Use ARP to identify devices on the LAN by MAC address
