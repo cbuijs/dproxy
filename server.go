@@ -1,10 +1,11 @@
 /*
 File: server.go
-Version: 2.3.0
+Version: 2.4.0
 Last Update: 2026-01-10
 Description: Implements the protocol listeners with strict RFC 9250 (DoQ) compliance.
              UPDATED: Removed unused import "encoding/binary".
              UPDATED: Relaxed empty path check to allow root "/" if explicitly configured.
+             UPDATED: Added mismatch_behavior support for DoH (404 or drop).
 */
 
 package main
@@ -434,11 +435,36 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	remoteAddr := r.RemoteAddr
 
+	// Helper to handle mismatches
+	rejectMismatch := func(reason string) {
+		LogWarn(reason)
+		if config.Server.DOH.MismatchBehavior == "drop" {
+			// Dropping in HTTP means closing connection without response or 444-like behavior.
+			// Hijacking is cleanest "drop", but panic-prone if not supported.
+			// Simple close: http.Error sends a response.
+			// We can try to hijack if possible, else return 404/403.
+			// For simplicity and safety, we just don't write anything and let the server/client timeout or 
+			// if we return without writing, standard net/http might send 200 OK empty or 404 depending on handler.
+			// To strictly "drop", hijacking is best.
+			if hj, ok := w.(http.Hijacker); ok {
+				conn, _, err := hj.Hijack()
+				if err == nil {
+					conn.Close()
+					return
+				}
+			}
+			// Fallback: 404 if drop fails
+			http.Error(w, "Not Found", http.StatusNotFound)
+		} else {
+			// Default 404
+			http.Error(w, "Not Found", http.StatusNotFound)
+		}
+	}
+
 	// --- PATH VALIDATION LOGIC ---
 	// Strictly prohibit empty path. Root path "/" is allowed if validated below.
 	if r.URL.Path == "" {
-		LogWarn("DoH Empty Path from %s", remoteAddr)
-		http.Error(w, "Not Found", http.StatusNotFound)
+		rejectMismatch(fmt.Sprintf("DoH Empty Path from %s", remoteAddr))
 		return
 	}
 
@@ -451,8 +477,7 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if !allowed {
-			LogWarn("DoH Path mismatch from %s: %s", remoteAddr, r.URL.Path)
-			http.Error(w, "Not Found", http.StatusNotFound)
+			rejectMismatch(fmt.Sprintf("DoH Path mismatch from %s: %s", remoteAddr, r.URL.Path))
 			return
 		}
 	}

@@ -1,8 +1,8 @@
 /*
 File: config.go
-Version: 2.11.0
+Version: 2.12.0
 Description: Defines configuration structures and handles YAML parsing and validation.
-             OPTIMIZED: Removed RecursionConfig and related fields.
+             UPDATED: Added MismatchBehavior to DOH config.
 */
 
 package main
@@ -85,8 +85,9 @@ type ServerConfig struct {
 	} `yaml:"ddr"`
 
 	DOH struct {
-		AllowedPaths []string `yaml:"allowed_paths"`
-		StrictPath   bool     `yaml:"strict_path"`
+		AllowedPaths     []string `yaml:"allowed_paths"`
+		StrictPath       bool     `yaml:"strict_path"`
+		MismatchBehavior string   `yaml:"mismatch_behavior"` // "404" (default) or "drop"
 	} `yaml:"doh"`
 	EDNS0 struct {
 		ECS struct {
@@ -131,7 +132,8 @@ type CacheConfig struct {
 	// options: "none", "round-robin", "sorted"
 	ResponseSorting string `yaml:"response_sorting"`
 
-	// HardenBelowNXDOMAIN: If true, stops queries for subdomains if parent is NXDOMAIN.
+	// HardenBelowNXDOMAIN: If true, stops queries for subdomains if parent is known
+	// to be NXDOMAIN in the cache. Matches functionality of Unbound's harden-below-nxdomain.
 	HardenBelowNXDOMAIN bool `yaml:"harden_below_nxdomain"`
 
 	Prefetch PrefetchConfig `yaml:"prefetch"`
@@ -388,6 +390,9 @@ func LoadConfig(path string) error {
 	// DoH Defaults
 	if len(cfg.Server.DOH.AllowedPaths) == 0 {
 		cfg.Server.DOH.AllowedPaths = []string{"/dns-query"}
+	}
+	if cfg.Server.DOH.MismatchBehavior == "" {
+		cfg.Server.DOH.MismatchBehavior = "404"
 	}
 
 	// EDNS0 Defaults

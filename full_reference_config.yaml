@@ -111,6 +111,9 @@ server:
       - "/dns-query"
     # If true, rejects requests to paths not in allowed_paths.
     strict_path: true
+    # Behavior when a path is not allowed or unknown (if strict_path is enabled)
+    # Options: "404" (return HTTP 404 Not Found - default), "drop" (close connection)
+    mismatch_behavior: "drop"
 
   # --- EDNS0 (Extension Mechanisms for DNS) ---
   # Controls how dproxy handles Client Subnet (ECS) and MAC address data options.
