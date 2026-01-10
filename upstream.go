@@ -1,12 +1,12 @@
 /*
 FILENAME:    upstream.go
-VERSION:     2.2.0
+VERSION:     2.4.0
 LAST UPDATE: 2026-01-10
 SUMMARY:     Defines the Upstream struct and handles downstream protocol exchange.
-CHANGES:     - FIXED: RFC 9250 Compliance for DoQ (Removed length prefixing).
-             - FIXED: Properly closing write-side of DoQ stream immediately after request.
-             - ADDED: Robustness check to strip 2-byte length prefix from upstream DoQ responses if present.
-             - REMOVED: Support for "RECURSIVE" protocol type.
+CHANGES:     - REFACTORED: Strict RFC 9250 Compliance.
+             - Added dedicated 'writeDoQMsg' and 'readDoQMsg' to avoid buffer abuse.
+             - Explicitly handles 2-byte length prefixing in separate I/O calls.
+             - Correctly closes stream (FIN) after writing query.
 */
 
 package main
@@ -15,7 +15,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -708,21 +707,9 @@ func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetAddr str
 	if err != nil {
 		return nil, err
 	}
-	// Important: We must close the stream at the end, whether successful or not.
-	// If successful, Close() sends the FIN. If error/cleanup, it's also good practice.
-	// However, we MUST call Close() *immediately* after writing the request to signal EOF to the server.
-	defer stream.Close()
-
-	// Use bufPool for packing
-	buf := bufPool.Get().([]byte)
 	
-	// RFC 9250: No length prefix for DoQ
-	// Pack directly into buffer
-	packed, err := req.PackBuffer(buf[:0])
-	if err != nil {
-		bufPool.Put(buf)
-		return nil, err
-	}
+	// Ensure we handle stream closure if anything goes wrong during write/read
+	defer stream.Close()
 
 	deadline, ok := ctx.Deadline()
 	if !ok {
@@ -730,72 +717,22 @@ func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetAddr str
 	}
 	stream.SetDeadline(deadline)
 
-	if _, err := stream.Write(packed); err != nil {
-		bufPool.Put(packed)
-		return nil, err
+	// WRITE REQUEST
+	if err := writeDoQMsg(stream, req); err != nil {
+		return nil, fmt.Errorf("failed to write DoQ request: %w", err)
 	}
 	
-	// Return the buffer to the pool immediately
-	bufPool.Put(packed)
-	
-	// CRITICAL: Close the write-side of the stream to signal end of request (FIN).
-	// Many servers wait for this before processing or sending response.
+	// CRITICAL RFC 9250: "The client MUST close the stream after sending the query."
 	if err := stream.Close(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to close stream write side: %w", err)
 	}
 
-	// Read response until EOF
-	
-	respBuf := bufPool.Get().([]byte)
-	// Reset capacity
-	respBuf = respBuf[:cap(respBuf)]
-	defer bufPool.Put(respBuf)
-	
-	totalBytes := 0
-	for {
-		if totalBytes >= 65535 {
-			return nil, fmt.Errorf("upstream response too large")
-		}
-		
-		n, err := stream.Read(respBuf[totalBytes:])
-		totalBytes += n
-		
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return nil, err
-		}
-		
-		// Grow if needed
-		if totalBytes == cap(respBuf) {
-			newBuf := make([]byte, len(respBuf)*2)
-			copy(newBuf, respBuf)
-			bufPool.Put(respBuf) // Return old
-			respBuf = newBuf     // Use new (defer will put newBuf, technically incorrect for pool without tracking, but GC handles safety)
-		}
+	// READ RESPONSE
+	resp, err := readDoQMsg(stream)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read DoQ response: %w", err)
 	}
 
-	if totalBytes == 0 {
-		return nil, fmt.Errorf("empty response from upstream")
-	}
-
-	// ROBUSTNESS: Check for draft compatibility (2-byte length prefix)
-	// Same logic as server.go to handle upstreams sending [Length][Message]
-	unpackBuf := respBuf[:totalBytes]
-	if totalBytes > 2 {
-		possibleLen := binary.BigEndian.Uint16(respBuf[:2])
-		if int(possibleLen) == totalBytes-2 {
-			unpackBuf = respBuf[2:totalBytes]
-			LogDebug("DoQ Upstream: Detected and stripped length prefix from %s", targetAddr)
-		}
-	}
-
-	resp := getMsg()
-	if err := resp.Unpack(unpackBuf); err != nil {
-		putMsg(resp)
-		return nil, err
-	}
 	return resp, nil
 }
 

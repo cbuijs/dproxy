@@ -1,12 +1,9 @@
 /*
 File: server.go
-Version: 1.6.0
+Version: 1.8.0
 Last Update: 2026-01-10
-Description: Implements the protocol listeners.
-             FIXED: DoQ (RFC 9250) compliance and robustness.
-             - Added detection for 2-byte length prefix (Draft compatibility) to handle clients like 'q' that might send it.
-             - Improved buffer handling.
-             UPDATED: Enhanced logging.
+Description: Implements the protocol listeners with strict RFC 9250 (DoQ) compliance.
+             REFACTORED: DoQ handling now uses explicit framing helpers to prevent malformed RDATA.
 */
 
 package main
@@ -284,6 +281,11 @@ func startServers(wg *sync.WaitGroup, tlsConfig *tls.Config) []ServerShutdowner 
 						defer close(doqDone)
 						
 						LogInfo("Starting Server [%s]", doqWrapper.String())
+						// Enable RFC 9250 ALPN "doq"
+						if len(tlsConfig.NextProtos) == 0 {
+							tlsConfig.NextProtos = []string{"doq"}
+						}
+						
 						listener, err := quic.ListenAddr(addr, tlsConfig, nil)
 						if err != nil {
 							LogError("Server [%s] listen error: %v", doqWrapper.String(), err)
@@ -315,10 +317,6 @@ func startServers(wg *sync.WaitGroup, tlsConfig *tls.Config) []ServerShutdowner 
 				}
 
 				// HTTPS Listeners
-				// "https" -> Enables both DoH (TCP) and DoH3 (UDP/QUIC)
-				// "doh"   -> DoH (TCP) only
-				// "doh3"  -> DoH3 (UDP/QUIC) only
-				
 				if protocol == "https" || protocol == "doh" {
 					wg.Add(1)
 					h1Server := &http.Server{Addr: addr, Handler: mux, TLSConfig: tlsConfig}
@@ -395,14 +393,10 @@ func handleDoTConnection(conn net.Conn) {
 	// Clear handshake deadline
 	conn.SetDeadline(time.Time{})
 
-	// Manually handle the DNS messages on this connection
 	dconn := new(dns.Conn)
 	dconn.Conn = iconn
 
-	// Mutex to serialize writes to the socket while allowing concurrent processing
 	var writeMu sync.Mutex
-	
-	// SECURITY: Limit concurrent pipelined requests per connection
 	sem := make(chan struct{}, MaxDoTPipelines)
 
 	for {
@@ -414,12 +408,10 @@ func handleDoTConnection(conn net.Conn) {
 			return
 		}
 
-		// Acquire semaphore (blocking if limit reached)
 		sem <- struct{}{}
 
-		// OPTIMIZATION: Launch request in goroutine to allow pipelining
 		go func(reqMsg *dns.Msg) {
-			defer func() { <-sem }() // Release semaphore
+			defer func() { <-sem }()
 
 			ctx, cancel := context.WithTimeout(context.Background(), getTimeout())
 			defer cancel()
@@ -427,11 +419,10 @@ func handleDoTConnection(conn net.Conn) {
 			reqCtx := &RequestContext{
 				ServerIP:       getLocalIP(conn.LocalAddr()),
 				ServerPort:     getLocalPort(conn.LocalAddr()),
-				ServerHostname: sni, // SNI captured here
+				ServerHostname: sni,
 				Protocol:       "DoT",
 			}
 
-			// Pass the write mutex to the writer
 			w := &dotResponseWriter{Conn: dconn, writeMu: &writeMu}
 			processDNSRequest(ctx, w, reqMsg, reqCtx)
 		}(req)
@@ -443,7 +434,6 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	remoteAddr := r.RemoteAddr
 
-	// --- PATH VALIDATION LOGIC ---
 	if config.Server.DOH.StrictPath {
 		allowed := false
 		for _, path := range config.Server.DOH.AllowedPaths {
@@ -459,7 +449,6 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// OPTIMIZATION: Use message pool
 	msg := getMsg()
 	defer putMsg(msg)
 
@@ -470,7 +459,6 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 		proto = "DoH3"
 	}
 
-	// SECURITY: Enforce max body size to prevent DoS via OOM
 	r.Body = http.MaxBytesReader(w, r.Body, MaxDNSBodySize)
 
 	switch r.Method {
@@ -537,73 +525,19 @@ func handleDoQSession(sess quic.Connection) {
 			return
 		}
 		go func(str quic.Stream) {
-			defer str.Close() // Ensures FIN is sent after we are done writing
+			// RFC 9250: "The stream MUST be closed by the server after sending the response."
+			defer str.Close()
 
 			ctx, cancel := context.WithTimeout(context.Background(), getTimeout())
 			defer cancel()
 
-			buf := bufPool.Get().([]byte)
-			defer bufPool.Put(buf)
-			
-			// Reset buffer length to cap to allow reading into it
-			buf = buf[:cap(buf)]
-			
-			// Read loop to handle fragmented frames or large packets
-			totalBytes := 0
-			for {
-				if totalBytes >= MaxDNSBodySize {
-					LogWarn("DoQ message too large from %v", remoteAddr)
-					return
-				}
-				
-				n, err := str.Read(buf[totalBytes:])
-				totalBytes += n
-				
-				if err != nil {
-					if err == io.EOF {
-						break // Normal end of message
-					}
+			// Use Strict helper to read DoQ message
+			msg, err := readDoQMsg(str)
+			if err != nil {
+				// Only log real errors, not EOF if connection closed cleanly
+				if err != io.EOF {
 					LogWarn("DoQ Read error from %v: %v", remoteAddr, err)
-					return
 				}
-				
-				// If buffer is full and we haven't hit EOF, we might need to grow
-				if totalBytes == cap(buf) {
-					if len(buf)*2 > MaxDNSBodySize {
-						LogWarn("DoQ message too large from %v", remoteAddr)
-						return
-					}
-					newBuf := make([]byte, len(buf)*2)
-					copy(newBuf, buf)
-					bufPool.Put(buf) // Return old buffer
-					buf = newBuf     // Reassign to new buffer
-				}
-			}
-
-			if totalBytes == 0 {
-				return
-			}
-			
-			// ROBUSTNESS: Check for draft compatibility (2-byte length prefix)
-			// Some tools/drafts send [Length(2)][Message...].
-			// RFC 9250 sends [Message...].
-			// Detection: If 1st 2 bytes = (TotalLen - 2), assume prefix and strip.
-			unpackBuf := buf[:totalBytes]
-			if totalBytes > 2 {
-				possibleLen := binary.BigEndian.Uint16(buf[:2])
-				if int(possibleLen) == totalBytes-2 {
-					// Likely a length prefix (Draft DoQ or client quirk)
-					unpackBuf = buf[2:totalBytes]
-					LogDebug("DoQ: Detected and stripped length prefix from %v", remoteAddr)
-				}
-			}
-
-			// OPTIMIZATION: Use message pool
-			msg := getMsg()
-			defer putMsg(msg)
-			
-			if err := msg.Unpack(unpackBuf); err != nil {
-				LogWarn("DoQ Unpack failed from %v: %v", remoteAddr, err)
 				return
 			}
 
@@ -620,10 +554,75 @@ func handleDoQSession(sess quic.Connection) {
 	}
 }
 
+// --- Strict RFC 9250 DoQ Helpers ---
+
+func readDoQMsg(r io.Reader) (*dns.Msg, error) {
+	// 1. Read Length (2 bytes, network byte order)
+	var lenBuf [2]byte
+	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
+		return nil, err
+	}
+	length := binary.BigEndian.Uint16(lenBuf[:])
+
+	if length == 0 {
+		return nil, fmt.Errorf("empty DoQ message")
+	}
+	if int(length) > MaxDNSBodySize {
+		return nil, fmt.Errorf("DoQ message too large: %d", length)
+	}
+
+	// 2. Read Payload
+	// Use pool but ensure we read exactly 'length' bytes
+	buf := bufPool.Get().([]byte)
+	defer bufPool.Put(buf)
+	
+	if cap(buf) < int(length) {
+		buf = make([]byte, length)
+	}
+	buf = buf[:length]
+
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, err
+	}
+
+	msg := getMsg()
+	if err := msg.Unpack(buf); err != nil {
+		putMsg(msg)
+		return nil, err
+	}
+	return msg, nil
+}
+
+func writeDoQMsg(w io.Writer, msg *dns.Msg) error {
+	// Get buffer for packing
+	buf := bufPool.Get().([]byte)
+	defer bufPool.Put(buf)
+
+	// Pack DNS message
+	packed, err := msg.PackBuffer(buf[:0])
+	if err != nil {
+		return err
+	}
+
+	// Prepare Header [Length: 2 bytes]
+	var lenBuf [2]byte
+	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(packed)))
+
+	// Write Header
+	if _, err := w.Write(lenBuf[:]); err != nil {
+		return err
+	}
+
+	// Write Body
+	if _, err := w.Write(packed); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // --- Response Writers ---
 
-// dotResponseWriter adapts dns.Conn to dns.ResponseWriter
-// UPDATED: Includes a mutex to prevent concurrent writes on the shared connection
 type dotResponseWriter struct {
 	*dns.Conn
 	writeMu *sync.Mutex
@@ -660,19 +659,8 @@ type doqResponseWriter struct {
 func (w *doqResponseWriter) LocalAddr() net.Addr  { return nil }
 func (w *doqResponseWriter) RemoteAddr() net.Addr { return w.remoteAddr }
 func (w *doqResponseWriter) WriteMsg(msg *dns.Msg) error {
-	buf := bufPool.Get().([]byte)
-	
-	// RFC 9250: No length prefix for DoQ
-	// Pack directly into buffer
-	packed, err := msg.PackBuffer(buf[:0])
-	if err != nil {
-		bufPool.Put(buf)
-		return err
-	}
-
-	_, err = w.stream.Write(packed)
-	bufPool.Put(packed)
-	return err
+	// Use Strict helper
+	return writeDoQMsg(w.stream, msg)
 }
 func (w *doqResponseWriter) Write(b []byte) (int, error) { return w.stream.Write(b) }
 func (w *doqResponseWriter) Close() error                { return w.stream.Close() }
