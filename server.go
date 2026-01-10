@@ -1,16 +1,12 @@
 /*
 File: server.go
-Version: 1.4.0
-Last Update: 2026-01-07
-Description: Implements the protocol listeners (UDP, TCP, DoT, DoQ, DoH/DoH3) and request handlers.
-             UPDATED: Enhanced logging for failed connection attempts and protocol errors.
-             UPDATED: Added String() method to ServerShutdowner for verbose shutdown logging.
-             UPDATED: Support for multiple listeners via configuration.
-             OPTIMIZED: DoT (DNS over TLS) now supports pipelining. Requests are processed concurrently
-                        instead of serially, preventing Head-of-Line blocking.
-             SECURITY: Added MaxBytesReader to DoH to prevent DoS via large bodies.
-             SECURITY: Added concurrency limits to DoT per-connection to prevent goroutine exhaustion.
-             FIXED: Correctly handle IPv6 address formatting (brackets) in listener addresses.
+Version: 1.6.0
+Last Update: 2026-01-10
+Description: Implements the protocol listeners.
+             FIXED: DoQ (RFC 9250) compliance and robustness.
+             - Added detection for 2-byte length prefix (Draft compatibility) to handle clients like 'q' that might send it.
+             - Improved buffer handling.
+             UPDATED: Enhanced logging.
 */
 
 package main
@@ -538,47 +534,75 @@ func handleDoQSession(sess quic.Connection) {
 	for {
 		stream, err := sess.AcceptStream(context.Background())
 		if err != nil {
-			// UPDATED: Log stream accept failures (could be connection teardown or protocol error)
-			LogWarn("DoQ AcceptStream error from %v: %v", remoteAddr, err)
 			return
 		}
 		go func(str quic.Stream) {
-			defer str.Close()
+			defer str.Close() // Ensures FIN is sent after we are done writing
 
 			ctx, cancel := context.WithTimeout(context.Background(), getTimeout())
 			defer cancel()
 
-			lBuf := make([]byte, 2)
-			if _, err := io.ReadFull(str, lBuf); err != nil {
-				// UPDATED: Log read failures
-				LogWarn("DoQ Read length failed from %v: %v", remoteAddr, err)
-				return
-			}
-			length := binary.BigEndian.Uint16(lBuf)
-
-			if length > MaxDNSBodySize {
-				LogWarn("DoQ message too large from %v: %d", remoteAddr, length)
-				return
-			}
-
 			buf := bufPool.Get().([]byte)
-			if cap(buf) < int(length) {
-				buf = make([]byte, length)
-			} else {
-				buf = buf[:length]
-			}
 			defer bufPool.Put(buf)
+			
+			// Reset buffer length to cap to allow reading into it
+			buf = buf[:cap(buf)]
+			
+			// Read loop to handle fragmented frames or large packets
+			totalBytes := 0
+			for {
+				if totalBytes >= MaxDNSBodySize {
+					LogWarn("DoQ message too large from %v", remoteAddr)
+					return
+				}
+				
+				n, err := str.Read(buf[totalBytes:])
+				totalBytes += n
+				
+				if err != nil {
+					if err == io.EOF {
+						break // Normal end of message
+					}
+					LogWarn("DoQ Read error from %v: %v", remoteAddr, err)
+					return
+				}
+				
+				// If buffer is full and we haven't hit EOF, we might need to grow
+				if totalBytes == cap(buf) {
+					if len(buf)*2 > MaxDNSBodySize {
+						LogWarn("DoQ message too large from %v", remoteAddr)
+						return
+					}
+					newBuf := make([]byte, len(buf)*2)
+					copy(newBuf, buf)
+					bufPool.Put(buf) // Return old buffer
+					buf = newBuf     // Reassign to new buffer
+				}
+			}
 
-			if _, err := io.ReadFull(str, buf); err != nil {
-				LogWarn("DoQ Read body failed from %v: %v", remoteAddr, err)
+			if totalBytes == 0 {
 				return
 			}
 			
+			// ROBUSTNESS: Check for draft compatibility (2-byte length prefix)
+			// Some tools/drafts send [Length(2)][Message...].
+			// RFC 9250 sends [Message...].
+			// Detection: If 1st 2 bytes = (TotalLen - 2), assume prefix and strip.
+			unpackBuf := buf[:totalBytes]
+			if totalBytes > 2 {
+				possibleLen := binary.BigEndian.Uint16(buf[:2])
+				if int(possibleLen) == totalBytes-2 {
+					// Likely a length prefix (Draft DoQ or client quirk)
+					unpackBuf = buf[2:totalBytes]
+					LogDebug("DoQ: Detected and stripped length prefix from %v", remoteAddr)
+				}
+			}
+
 			// OPTIMIZATION: Use message pool
 			msg := getMsg()
 			defer putMsg(msg)
 			
-			if err := msg.Unpack(buf); err != nil {
+			if err := msg.Unpack(unpackBuf); err != nil {
 				LogWarn("DoQ Unpack failed from %v: %v", remoteAddr, err)
 				return
 			}
@@ -638,22 +662,13 @@ func (w *doqResponseWriter) RemoteAddr() net.Addr { return w.remoteAddr }
 func (w *doqResponseWriter) WriteMsg(msg *dns.Msg) error {
 	buf := bufPool.Get().([]byte)
 	
-	// Reserve 2 bytes for length prefix
-	// Ensure capacity
-	if cap(buf) < 2 {
-		buf = make([]byte, 2, 4096)
-	}
-	out := buf[:2]
-	
-	packed, err := msg.PackBuffer(out)
+	// RFC 9250: No length prefix for DoQ
+	// Pack directly into buffer
+	packed, err := msg.PackBuffer(buf[:0])
 	if err != nil {
 		bufPool.Put(buf)
 		return err
 	}
-
-	// Calculate DNS message length (total length - 2 prefix bytes)
-	dnsLen := len(packed) - 2
-	binary.BigEndian.PutUint16(packed[:2], uint16(dnsLen))
 
 	_, err = w.stream.Write(packed)
 	bufPool.Put(packed)

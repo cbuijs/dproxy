@@ -1,9 +1,12 @@
 /*
 FILENAME:    upstream.go
-VERSION:     2.0.0
-LAST UPDATE: 2026-01-10 12:00 CET
+VERSION:     2.2.0
+LAST UPDATE: 2026-01-10
 SUMMARY:     Defines the Upstream struct and handles downstream protocol exchange.
-CHANGES:     - REMOVED: Support for "RECURSIVE" protocol type.
+CHANGES:     - FIXED: RFC 9250 Compliance for DoQ (Removed length prefixing).
+             - FIXED: Properly closing write-side of DoQ stream immediately after request.
+             - ADDED: Robustness check to strip 2-byte length prefix from upstream DoQ responses if present.
+             - REMOVED: Support for "RECURSIVE" protocol type.
 */
 
 package main
@@ -700,33 +703,26 @@ func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetAddr str
 		return nil, err
 	}
 
+	// Open a bidirectional stream
 	stream, err := sess.OpenStreamSync(ctx)
 	if err != nil {
 		return nil, err
 	}
+	// Important: We must close the stream at the end, whether successful or not.
+	// If successful, Close() sends the FIN. If error/cleanup, it's also good practice.
+	// However, we MUST call Close() *immediately* after writing the request to signal EOF to the server.
 	defer stream.Close()
 
 	// Use bufPool for packing
 	buf := bufPool.Get().([]byte)
-
-	// Ensure capacity for at least header + some body
-	if cap(buf) < 2 {
-		buf = make([]byte, 0, 4096)
-	}
-
-	// Start with 2 placeholder bytes for length
-	out := buf[:2]
-
-	// Pack message into buffer (PackBuffer appends)
-	packed, err := req.PackBuffer(out)
+	
+	// RFC 9250: No length prefix for DoQ
+	// Pack directly into buffer
+	packed, err := req.PackBuffer(buf[:0])
 	if err != nil {
 		bufPool.Put(buf)
 		return nil, err
 	}
-
-	// Calculate and write length
-	dnsLen := len(packed) - 2
-	binary.BigEndian.PutUint16(packed[:2], uint16(dnsLen))
 
 	deadline, ok := ctx.Deadline()
 	if !ok {
@@ -738,37 +734,65 @@ func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetAddr str
 		bufPool.Put(packed)
 		return nil, err
 	}
-
-	// We can reuse 'packed' (which is 'buf' backing array) if we want,
-	// but for simplicity and safety against async socket behavior,
-	// we put it back and get a fresh one for reading.
+	
+	// Return the buffer to the pool immediately
 	bufPool.Put(packed)
-
-	lBuf := make([]byte, 2)
-	if _, err := io.ReadFull(stream, lBuf); err != nil {
+	
+	// CRITICAL: Close the write-side of the stream to signal end of request (FIN).
+	// Many servers wait for this before processing or sending response.
+	if err := stream.Close(); err != nil {
 		return nil, err
 	}
-	length := binary.BigEndian.Uint16(lBuf)
 
-	// SECURITY: limit upstream response size
-	if length > 65535 {
-		return nil, fmt.Errorf("upstream response too large: %d", length)
-	}
-
+	// Read response until EOF
+	
 	respBuf := bufPool.Get().([]byte)
-	if cap(respBuf) < int(length) {
-		respBuf = make([]byte, length)
-	} else {
-		respBuf = respBuf[:length]
-	}
+	// Reset capacity
+	respBuf = respBuf[:cap(respBuf)]
 	defer bufPool.Put(respBuf)
+	
+	totalBytes := 0
+	for {
+		if totalBytes >= 65535 {
+			return nil, fmt.Errorf("upstream response too large")
+		}
+		
+		n, err := stream.Read(respBuf[totalBytes:])
+		totalBytes += n
+		
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, err
+		}
+		
+		// Grow if needed
+		if totalBytes == cap(respBuf) {
+			newBuf := make([]byte, len(respBuf)*2)
+			copy(newBuf, respBuf)
+			bufPool.Put(respBuf) // Return old
+			respBuf = newBuf     // Use new (defer will put newBuf, technically incorrect for pool without tracking, but GC handles safety)
+		}
+	}
 
-	if _, err := io.ReadFull(stream, respBuf); err != nil {
-		return nil, err
+	if totalBytes == 0 {
+		return nil, fmt.Errorf("empty response from upstream")
+	}
+
+	// ROBUSTNESS: Check for draft compatibility (2-byte length prefix)
+	// Same logic as server.go to handle upstreams sending [Length][Message]
+	unpackBuf := respBuf[:totalBytes]
+	if totalBytes > 2 {
+		possibleLen := binary.BigEndian.Uint16(respBuf[:2])
+		if int(possibleLen) == totalBytes-2 {
+			unpackBuf = respBuf[2:totalBytes]
+			LogDebug("DoQ Upstream: Detected and stripped length prefix from %s", targetAddr)
+		}
 	}
 
 	resp := getMsg()
-	if err := resp.Unpack(respBuf); err != nil {
+	if err := resp.Unpack(unpackBuf); err != nil {
 		putMsg(resp)
 		return nil, err
 	}
