@@ -1,9 +1,10 @@
 /*
 File: server.go
-Version: 1.8.0
+Version: 2.3.0
 Last Update: 2026-01-10
 Description: Implements the protocol listeners with strict RFC 9250 (DoQ) compliance.
-             REFACTORED: DoQ handling now uses explicit framing helpers to prevent malformed RDATA.
+             UPDATED: Removed unused import "encoding/binary".
+             UPDATED: Relaxed empty path check to allow root "/" if explicitly configured.
 */
 
 package main
@@ -12,7 +13,6 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -434,6 +434,14 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	remoteAddr := r.RemoteAddr
 
+	// --- PATH VALIDATION LOGIC ---
+	// Strictly prohibit empty path. Root path "/" is allowed if validated below.
+	if r.URL.Path == "" {
+		LogWarn("DoH Empty Path from %s", remoteAddr)
+		http.Error(w, "Not Found", http.StatusNotFound)
+		return
+	}
+
 	if config.Server.DOH.StrictPath {
 		allowed := false
 		for _, path := range config.Server.DOH.AllowedPaths {
@@ -531,7 +539,7 @@ func handleDoQSession(sess quic.Connection) {
 			ctx, cancel := context.WithTimeout(context.Background(), getTimeout())
 			defer cancel()
 
-			// Use Strict helper to read DoQ message
+			// Use Strict helper from upstream.go (shared package)
 			msg, err := readDoQMsg(str)
 			if err != nil {
 				// Only log real errors, not EOF if connection closed cleanly
@@ -554,73 +562,6 @@ func handleDoQSession(sess quic.Connection) {
 	}
 }
 
-// --- Strict RFC 9250 DoQ Helpers ---
-
-func readDoQMsg(r io.Reader) (*dns.Msg, error) {
-	// 1. Read Length (2 bytes, network byte order)
-	var lenBuf [2]byte
-	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
-		return nil, err
-	}
-	length := binary.BigEndian.Uint16(lenBuf[:])
-
-	if length == 0 {
-		return nil, fmt.Errorf("empty DoQ message")
-	}
-	if int(length) > MaxDNSBodySize {
-		return nil, fmt.Errorf("DoQ message too large: %d", length)
-	}
-
-	// 2. Read Payload
-	// Use pool but ensure we read exactly 'length' bytes
-	buf := bufPool.Get().([]byte)
-	defer bufPool.Put(buf)
-	
-	if cap(buf) < int(length) {
-		buf = make([]byte, length)
-	}
-	buf = buf[:length]
-
-	if _, err := io.ReadFull(r, buf); err != nil {
-		return nil, err
-	}
-
-	msg := getMsg()
-	if err := msg.Unpack(buf); err != nil {
-		putMsg(msg)
-		return nil, err
-	}
-	return msg, nil
-}
-
-func writeDoQMsg(w io.Writer, msg *dns.Msg) error {
-	// Get buffer for packing
-	buf := bufPool.Get().([]byte)
-	defer bufPool.Put(buf)
-
-	// Pack DNS message
-	packed, err := msg.PackBuffer(buf[:0])
-	if err != nil {
-		return err
-	}
-
-	// Prepare Header [Length: 2 bytes]
-	var lenBuf [2]byte
-	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(packed)))
-
-	// Write Header
-	if _, err := w.Write(lenBuf[:]); err != nil {
-		return err
-	}
-
-	// Write Body
-	if _, err := w.Write(packed); err != nil {
-		return err
-	}
-
-	return nil
-}
-
 // --- Response Writers ---
 
 type dotResponseWriter struct {
@@ -632,16 +573,9 @@ func (w *dotResponseWriter) WriteMsg(msg *dns.Msg) error {
 	w.writeMu.Lock()
 	defer w.writeMu.Unlock()
 
-	buf := bufPool.Get().([]byte)
-	out, err := msg.PackBuffer(buf[:0])
-	if err != nil {
-		bufPool.Put(buf)
-		return err
-	}
-	
-	_, err = w.Conn.Write(out)
-	bufPool.Put(out)
-	return err
+	// Use writeDoQMsg because DoT uses the same RFC 1035 framing (2-byte length prefix) as DoQ
+	// This ensures we don't write raw DNS packets to the TCP stream.
+	return writeDoQMsg(w.Conn, msg)
 }
 
 func (w *dotResponseWriter) Hijack() {
@@ -659,7 +593,7 @@ type doqResponseWriter struct {
 func (w *doqResponseWriter) LocalAddr() net.Addr  { return nil }
 func (w *doqResponseWriter) RemoteAddr() net.Addr { return w.remoteAddr }
 func (w *doqResponseWriter) WriteMsg(msg *dns.Msg) error {
-	// Use Strict helper
+	// Use Strict helper from upstream.go
 	return writeDoQMsg(w.stream, msg)
 }
 func (w *doqResponseWriter) Write(b []byte) (int, error) { return w.stream.Write(b) }

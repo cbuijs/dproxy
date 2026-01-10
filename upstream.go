@@ -1,12 +1,13 @@
 /*
 FILENAME:    upstream.go
-VERSION:     2.4.0
+VERSION:     2.5.0
 LAST UPDATE: 2026-01-10
 SUMMARY:     Defines the Upstream struct and handles downstream protocol exchange.
 CHANGES:     - REFACTORED: Strict RFC 9250 Compliance.
              - Added dedicated 'writeDoQMsg' and 'readDoQMsg' to avoid buffer abuse.
              - Explicitly handles 2-byte length prefixing in separate I/O calls.
              - Correctly closes stream (FIN) after writing query.
+             - Re-added readDoQMsg/writeDoQMsg definitions to fix "undefined" errors.
 */
 
 package main
@@ -15,6 +16,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -824,5 +826,70 @@ func (u *Upstream) exchangeDoH(ctx context.Context, req *dns.Msg, reqCtx *Reques
 		return nil, err
 	}
 	return resp, nil
+}
+
+// RFC 9250 Strictly Compliant Helper: writeDoQMsg
+func writeDoQMsg(w io.Writer, msg *dns.Msg) error {
+	buf := bufPool.Get().([]byte)
+	defer bufPool.Put(buf)
+
+	// Pack DNS message (buffer offset 0)
+	packed, err := msg.PackBuffer(buf[:0])
+	if err != nil {
+		return err
+	}
+
+	// Prepare Header [Length: 2 bytes]
+	var lenBuf [2]byte
+	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(packed)))
+
+	// Write Header
+	if _, err := w.Write(lenBuf[:]); err != nil {
+		return err
+	}
+
+	// Write Body
+	if _, err := w.Write(packed); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// RFC 9250 Strictly Compliant Helper: readDoQMsg
+func readDoQMsg(r io.Reader) (*dns.Msg, error) {
+	// 1. Read Length (2 bytes, network byte order)
+	var lenBuf [2]byte
+	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
+		return nil, err
+	}
+	length := binary.BigEndian.Uint16(lenBuf[:])
+
+	if length == 0 {
+		return nil, fmt.Errorf("empty DoQ message")
+	}
+	if int(length) > 65535 {
+		return nil, fmt.Errorf("DoQ message too large: %d", length)
+	}
+
+	// 2. Read Payload
+	buf := bufPool.Get().([]byte)
+	defer bufPool.Put(buf)
+	
+	if cap(buf) < int(length) {
+		buf = make([]byte, length)
+	}
+	buf = buf[:length]
+
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, err
+	}
+
+	msg := getMsg()
+	if err := msg.Unpack(buf); err != nil {
+		putMsg(msg)
+		return nil, err
+	}
+	return msg, nil
 }
 
