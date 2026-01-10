@@ -1,13 +1,12 @@
 /*
 FILENAME:    upstream.go
-VERSION:     2.5.0
+VERSION:     2.6.0
 LAST UPDATE: 2026-01-10
 SUMMARY:     Defines the Upstream struct and handles downstream protocol exchange.
-CHANGES:     - REFACTORED: Strict RFC 9250 Compliance.
-             - Added dedicated 'writeDoQMsg' and 'readDoQMsg' to avoid buffer abuse.
-             - Explicitly handles 2-byte length prefixing in separate I/O calls.
-             - Correctly closes stream (FIN) after writing query.
-             - Re-added readDoQMsg/writeDoQMsg definitions to fix "undefined" errors.
+CHANGES:     - REFACTORED: Separated DoT and DoQ framing logic to avoid confusion and regression.
+             - ADDED: writeDoTMsg for atomic TCP framing (DoT).
+             - UPDATED: writeDoQMsg strict RFC 9250 compliance (DoQ).
+             - UPDATED: exchangeTCPPool now explicitly uses writeDoTMsg.
 */
 
 package main
@@ -622,7 +621,8 @@ func (u *Upstream) exchangeTCPPool(ctx context.Context, req *dns.Msg, addr strin
 		}
 
 		c.SetDeadline(deadline)
-		if err := c.WriteMsg(req); err != nil {
+		// USE: Atomic DoT writer
+		if err := writeDoTMsg(c.Conn, req); err != nil {
 			return nil, err
 		}
 		return c.ReadMsg()
@@ -719,7 +719,7 @@ func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetAddr str
 	}
 	stream.SetDeadline(deadline)
 
-	// WRITE REQUEST
+	// WRITE REQUEST (Strict RFC 9250)
 	if err := writeDoQMsg(stream, req); err != nil {
 		return nil, fmt.Errorf("failed to write DoQ request: %w", err)
 	}
@@ -828,22 +828,64 @@ func (u *Upstream) exchangeDoH(ctx context.Context, req *dns.Msg, reqCtx *Reques
 	return resp, nil
 }
 
-// RFC 9250 Strictly Compliant Helper: writeDoQMsg
+// --- Protocol Writers ---
+
+// writeDoTMsg handles framing for TCP/DoT.
+// It packs the message and writes [Length][Body] as a single atomic Write operation.
+// This is critical to prevent fragmentation (split writes) which can cause TLS failures with strict middleboxes.
+func writeDoTMsg(w io.Writer, msg *dns.Msg) error {
+	buf := bufPool.Get().([]byte)
+	defer bufPool.Put(buf)
+
+	// Reserve 2 bytes at the beginning for the length prefix
+	if cap(buf) < 2 {
+		return fmt.Errorf("buffer too small")
+	}
+	buf = buf[:2] 
+
+	// Appending to buf[:2] puts the DNS payload starting at index 2
+	packed, err := msg.PackBuffer(buf)
+	if err != nil {
+		return err
+	}
+
+	// Calculate payload length
+	msgLen := len(packed) - 2
+	if msgLen > 65535 {
+		return fmt.Errorf("message too large: %d", msgLen)
+	}
+
+	// Fill in the reserved length bytes
+	binary.BigEndian.PutUint16(packed[:2], uint16(msgLen))
+
+	// Single atomic write
+	if _, err := w.Write(packed); err != nil {
+		return err
+	}
+	return nil
+}
+
+// writeDoQMsg handles framing for QUIC/DoQ.
+// Strict RFC 9250 compliance: 2-byte length followed by message.
+// Uses explicit separate writes to guarantee correct framing semantics over the stream.
 func writeDoQMsg(w io.Writer, msg *dns.Msg) error {
 	buf := bufPool.Get().([]byte)
 	defer bufPool.Put(buf)
 
-	// Pack DNS message (buffer offset 0)
+	// Pack standard DNS message (no offset)
 	packed, err := msg.PackBuffer(buf[:0])
 	if err != nil {
 		return err
 	}
 
-	// Prepare Header [Length: 2 bytes]
-	var lenBuf [2]byte
-	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(packed)))
+	msgLen := len(packed)
+	if msgLen > 65535 {
+		return fmt.Errorf("message too large: %d", msgLen)
+	}
 
-	// Write Header
+	// Write 2-byte Length
+	var lenBuf [2]byte
+	binary.BigEndian.PutUint16(lenBuf[:], uint16(msgLen))
 	if _, err := w.Write(lenBuf[:]); err != nil {
 		return err
 	}
@@ -852,11 +894,10 @@ func writeDoQMsg(w io.Writer, msg *dns.Msg) error {
 	if _, err := w.Write(packed); err != nil {
 		return err
 	}
-
 	return nil
 }
 
-// RFC 9250 Strictly Compliant Helper: readDoQMsg
+// readDoQMsg handles reading framed messages for DoQ (and compatible streams).
 func readDoQMsg(r io.Reader) (*dns.Msg, error) {
 	// 1. Read Length (2 bytes, network byte order)
 	var lenBuf [2]byte

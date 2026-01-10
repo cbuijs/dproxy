@@ -1,11 +1,9 @@
 /*
 File: server.go
-Version: 2.4.0
+Version: 2.5.0
 Last Update: 2026-01-10
-Description: Implements the protocol listeners with strict RFC 9250 (DoQ) compliance.
-             UPDATED: Removed unused import "encoding/binary".
-             UPDATED: Relaxed empty path check to allow root "/" if explicitly configured.
-             UPDATED: Added mismatch_behavior support for DoH (404 or drop).
+Description: Implements the protocol listeners.
+             FIXED: Clear separation between DoT (native WriteMsg) and DoQ (strict RFC 9250 writeDoQMsg).
 */
 
 package main
@@ -598,9 +596,12 @@ func (w *dotResponseWriter) WriteMsg(msg *dns.Msg) error {
 	w.writeMu.Lock()
 	defer w.writeMu.Unlock()
 
-	// Use writeDoQMsg because DoT uses the same RFC 1035 framing (2-byte length prefix) as DoQ
-	// This ensures we don't write raw DNS packets to the TCP stream.
-	return writeDoQMsg(w.Conn, msg)
+	// DoT (TCP/TLS) uses standard framing.
+	// We use the library's native WriteMsg which is robust for TCP.
+	// (Note: To ensure atomic writing to avoid fragmentation, we could use writeDoTMsg from upstream.go here too,
+	// but standard library usage is preferred unless fragmentation is proven issue with listeners).
+	// Current decision: Use native implementation for standard compliance.
+	return w.Conn.WriteMsg(msg)
 }
 
 func (w *dotResponseWriter) Hijack() {
@@ -618,7 +619,8 @@ type doqResponseWriter struct {
 func (w *doqResponseWriter) LocalAddr() net.Addr  { return nil }
 func (w *doqResponseWriter) RemoteAddr() net.Addr { return w.remoteAddr }
 func (w *doqResponseWriter) WriteMsg(msg *dns.Msg) error {
-	// Use Strict helper from upstream.go
+	// DoQ (QUIC) requires strict RFC 9250 framing (2-byte length).
+	// We use the specialized helper from upstream.go to guarantee this.
 	return writeDoQMsg(w.stream, msg)
 }
 func (w *doqResponseWriter) Write(b []byte) (int, error) { return w.stream.Write(b) }

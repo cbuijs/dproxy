@@ -1,9 +1,9 @@
 /*
 File: process.go
-Version: 3.8.0
+Version: 3.8.2
 Last Update: 2026-01-10
 Description: Handles the core processing logic for DNS requests.
-             OPTIMIZED: Removed Recursive Resolver call path.
+             FIXED: Removed double-logging of query info string.
 */
 
 package main
@@ -82,7 +82,10 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 
 	// Only build log string if necessary
 	if IsInfoEnabled() {
-		sb.WriteString(qInfo)
+		// FIX: buildQueryInfo already returns the basic info string.
+		// appendEDNSInfoToLog takes the builder, writes qInfo + extras to it, and returns the full string.
+		// Previously, we did sb.WriteString(qInfo) THEN called append..., which caused duplication.
+		sb.Reset()
 		qInfo = appendEDNSInfoToLog(&sb, reqCtx, qInfo, r)
 		sb.Reset()
 	}

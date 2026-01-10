@@ -1,8 +1,8 @@
 /*
 File: main.go
-Version: 1.5.0
+Version: 1.5.1
 Description: Entry point for the dproxy application. Initializes globals, parses flags, and starts the system.
-             OPTIMIZED: Removed Recursive Resolver initialization.
+             OPTIMIZED: Increased bufPool size to 65535 to support full DNS-over-TCP/TLS messages.
 */
 
 package main
@@ -26,9 +26,11 @@ import (
 
 // --- Globals & Pools ---
 
+// OPTIMIZATION: Buffer pool resized to 65535 (Max DNS size over TCP) to prevent
+// truncation or packing errors for large responses (DNSSEC, TXT, etc).
 var bufPool = sync.Pool{
 	New: func() any {
-		return make([]byte, 4096)
+		return make([]byte, 65535)
 	},
 }
 
