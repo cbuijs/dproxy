@@ -1,6 +1,6 @@
 /*
 File: response.go
-Version: 1.0.0
+Version: 1.1.0
 Description: Handles DNS response manipulation: CNAME flattening, minimization, TTL clamping, sorting,
              and DDR (svc) response generation.
              Extracted from process.go for modularity.
@@ -10,6 +10,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"math/rand/v2"
 	"net"
 	"sort"
@@ -235,11 +236,21 @@ func applyTTLClamping(msg *dns.Msg) {
 	clampTTLs(msg.Ns)
 	clampTTLs(msg.Extra)
 
-	respType := "NOERROR"
-	if isNegative {
-		respType = "NEGATIVE"
+	if IsDebugEnabled() {
+		respType := "NOERROR"
+		if isNegative {
+			respType = "NEGATIVE"
+		}
+		
+		var qInfo string
+		if len(msg.Question) > 0 {
+			qInfo = fmt.Sprintf("%s (%s)", msg.Question[0].Name, dns.TypeToString[msg.Question[0].Qtype])
+		} else {
+			qInfo = "unknown"
+		}
+
+		LogDebug("[TTL-CLAMP] Processed (%s) | Query: %s | Answers: %d | Clamped: %d", respType, qInfo, len(msg.Answer), clampedCount)
 	}
-	LogDebug("[TTL-CLAMP] Processed (%s), Clamped: %d", respType, clampedCount)
 }
 
 func applyTTLStrategy(msg *dns.Msg) {

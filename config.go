@@ -1,8 +1,8 @@
 /*
 File: config.go
-Version: 2.10.0
+Version: 2.11.0
 Description: Defines configuration structures and handles YAML parsing and validation.
-             UPDATED: Added HardenBelowNXDOMAIN to CacheConfig.
+             OPTIMIZED: Removed RecursionConfig and related fields.
 */
 
 package main
@@ -26,16 +26,7 @@ type Config struct {
 	Bootstrap BootstrapConfig `yaml:"bootstrap"`
 	Cache     CacheConfig     `yaml:"cache"`
 	Routing   RoutingConfig   `yaml:"routing"`
-	Recursion RecursionConfig `yaml:"recursion"`
 	ARP       ARPConfig       `yaml:"arp"`
-}
-
-type RecursionConfig struct {
-	Enabled           bool   `yaml:"enabled"`
-	RootHintsFile     string `yaml:"root_hints_file"`
-	IPVersion         string `yaml:"ip_version"` // ipv4, ipv6, both
-	QNameMinimization bool   `yaml:"qname_minimization"`
-	MaxDepth          int    `yaml:"max_depth"`
 }
 
 type ARPConfig struct {
@@ -392,14 +383,6 @@ func LoadConfig(path string) error {
 	// Initialize logger
 	if err := InitLogger(cfg.Logging); err != nil {
 		return fmt.Errorf("failed to initialize logger: %w", err)
-	}
-
-	// Recursion Defaults
-	if cfg.Recursion.MaxDepth == 0 {
-		cfg.Recursion.MaxDepth = 20
-	}
-	if cfg.Recursion.IPVersion == "" {
-		cfg.Recursion.IPVersion = "both"
 	}
 
 	// DoH Defaults

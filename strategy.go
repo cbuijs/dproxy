@@ -1,12 +1,10 @@
 /*
 File: strategy.go
-Version: 1.5.1
-Last Update: 2026-01-08
+Version: 1.6.0
+Last Update: 2026-01-10
 Description: Implements upstream selection strategies (Round-Robin, Random, Failover, Fastest, Race)
              and the main forwarder logic.
-             UPDATED: Added support for RECURSIVE upstreams in forwardToUpstreams to support cross-fetch/stale-refresh.
-             UPDATED: Strategies now check upstream.Allow() (QPS limit) and skip busy upstreams.
-             UPDATED: Strategies now capture and format the specific Upstream IP address used for logging.
+             OPTIMIZED: Removed Recursive Resolver call path.
 */
 
 package main
@@ -32,18 +30,6 @@ var (
 func forwardToUpstreams(ctx context.Context, req *dns.Msg, upstreams []*Upstream, strategy string, ruleName string, reqCtx *RequestContext) (*dns.Msg, string, time.Duration, error) {
 	if len(upstreams) == 0 {
 		return nil, "", 0, errors.New("no upstreams available")
-	}
-
-	// Handle Recursive Resolver (Cross-Fetch / Stale Refresh / General Forwarding)
-	// This ensures that prefetch.go logic works even if the rule uses "RECURSIVE"
-	if len(upstreams) == 1 && upstreams[0].Proto == "recursive" {
-		if recursiveResolver == nil {
-			return nil, "RECURSIVE", 0, errors.New("recursive resolver not initialized")
-		}
-		start := time.Now()
-		// Use the provided context (which includes timeouts from the caller)
-		resp, err := recursiveResolver.Resolve(ctx, req, reqCtx)
-		return resp, "RECURSIVE", time.Since(start), err
 	}
 
 	if len(upstreams) == 1 {

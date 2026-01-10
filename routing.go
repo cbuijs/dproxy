@@ -1,9 +1,8 @@
 /*
 File: routing.go
-Version: 1.5.0
+Version: 1.6.0
 Description: High-performance routing logic using Domain Trie (Radix-style) for rapid lookups.
-             OPTIMIZED: Trie Search now walks the string from TLD backwards without string splitting or slice allocations.
-             UPDATED: Added resolveUpstreams to handle config parsing and "RECURSIVE" keyword.
+             OPTIMIZED: Removed "RECURSIVE" upstream resolution handling.
 */
 
 package main
@@ -180,11 +179,6 @@ func hasNonDomainConditions(m *MatchConditions) bool {
 func resolveUpstreams(upstreams interface{}, groups map[string][]string) ([]string, error) {
 	switch v := upstreams.(type) {
 	case string:
-		// Special keyword for Recursive resolution
-		if strings.ToUpper(v) == "RECURSIVE" {
-			return []string{"RECURSIVE"}, nil
-		}
-
 		group, exists := groups[v]
 		if !exists {
 			return nil, fmt.Errorf("upstream group '%s' not found", v)

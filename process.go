@@ -1,10 +1,9 @@
 /*
 File: process.go
-Version: 3.7.0
-Last Update: 2026-01-09
+Version: 3.8.0
+Last Update: 2026-01-10
 Description: Handles the core processing logic for DNS requests.
-             UPDATED: Added Panic Recovery middleware to prevent server crashes on malformed requests.
-             UPDATED: Added QType to HardenNX debug logging.
+             OPTIMIZED: Removed Recursive Resolver call path.
 */
 
 package main
@@ -224,14 +223,8 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		}
 	}
 
-	// --- UPSTREAM FORWARDING / RECURSION ---
+	// --- UPSTREAM FORWARDING ---
 	// This block executes ONLY on a CACHE MISS (or expiration).
-
-	// Check if this is a recursive lookup
-	isRecursive := false
-	if len(selectedUpstreams) == 1 && selectedUpstreams[0].Proto == "recursive" {
-		isRecursive = true
-	}
 
 	msg := r.Copy()
 	addEDNS0Options(msg, ip, mac)
@@ -253,34 +246,6 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 
 	// Use cacheKey as the suppression key
 	ch := requestGroup.DoChan(cacheKey, func() (interface{}, error) {
-		// RECURSIVE RESOLUTION BRANCH
-		if isRecursive {
-			if !config.Recursion.Enabled {
-				return nil, fmt.Errorf("recursion selected for %s but disabled in config", safeReqCtx.QueryName)
-			}
-			if recursiveResolver == nil {
-				return nil, fmt.Errorf("recursive resolver not initialized")
-			}
-
-			// Apply a definitive timeout to the recursive process
-			// Recursion can be complex, so we give it slightly more time than a standard upstream forward
-			recTimeout := getTimeout()
-			if recTimeout == 0 {
-				recTimeout = 10 * time.Second
-			}
-			recCtx, cancel := context.WithTimeout(context.Background(), recTimeout)
-			defer cancel()
-
-			recStart := time.Now()
-			resp, err := recursiveResolver.Resolve(recCtx, msg, safeReqCtx)
-			recDuration := time.Since(recStart)
-
-			if err != nil {
-				return nil, err
-			}
-			return queryResult{msg: resp, upstreamStr: "RECURSIVE", rtt: recDuration}, nil
-		}
-
 		// STANDARD UPSTREAM FORWARDING
 		upstreamTimeout := getTimeout()
 		if upstreamTimeout == 0 {

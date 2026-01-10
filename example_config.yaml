@@ -29,10 +29,6 @@ server:
   ddr:
     enabled: true
 
-recursion:
-  enabled: true
-  qname_minimization: true
-
 # Use ARP to identify devices on the LAN by MAC address
 arp:
   mode: "both"

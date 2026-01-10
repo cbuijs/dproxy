@@ -1,8 +1,8 @@
 /*
 File: main.go
-Version: 1.4.0
+Version: 1.5.0
 Description: Entry point for the dproxy application. Initializes globals, parses flags, and starts the system.
-             UPDATED: Initializes Recursive Resolver if enabled.
+             OPTIMIZED: Removed Recursive Resolver initialization.
 */
 
 package main
@@ -119,13 +119,6 @@ Usage: %s -config <config.yaml>
 
 	// Start background maintenance routines
 	startBackgroundTasks()
-
-	// --- INITIALIZE RECURSIVE RESOLVER ---
-	if config.Recursion.Enabled {
-		recursiveResolver = NewRecursiveResolver(config.Recursion)
-		LogInfo("[RECURSION] Recursive resolver initialized (QNameMin: %v, IP: %s)",
-			config.Recursion.QNameMinimization, config.Recursion.IPVersion)
-	}
 
 	// --- START HOSTS FILE REFRESHERS ---
 

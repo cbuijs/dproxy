@@ -1,9 +1,9 @@
 /*
 FILENAME:    upstream.go
-VERSION:     1.9.0
-LAST UPDATE: 2026-01-08 13:20 CET
+VERSION:     2.0.0
+LAST UPDATE: 2026-01-10 12:00 CET
 SUMMARY:     Defines the Upstream struct and handles downstream protocol exchange.
-CHANGES:     - UPDATED: Added handling for "RECURSIVE" protocol type in parseUpstream.
+CHANGES:     - REMOVED: Support for "RECURSIVE" protocol type.
 */
 
 package main
@@ -76,9 +76,6 @@ type Upstream struct {
 }
 
 func (u *Upstream) String() string {
-	if u.Proto == "recursive" {
-		return "RECURSIVE"
-	}
 	s := fmt.Sprintf("%s://%s:%s%s", u.Proto, u.Host, u.Port, u.Path)
 	if u.BootstrapIP != "" {
 		s += fmt.Sprintf("#%s", u.BootstrapIP)
@@ -88,9 +85,6 @@ func (u *Upstream) String() string {
 
 // DynamicString returns the upstream URL with variables replaced.
 func (u *Upstream) DynamicString(rc *RequestContext) string {
-	if u.Proto == "recursive" {
-		return "RECURSIVE"
-	}
 	host, path := u.getDynamicConfig(rc)
 	s := fmt.Sprintf("%s://%s:%s%s", u.Proto, host, u.Port, path)
 	if u.BootstrapIP != "" {
@@ -142,10 +136,6 @@ func (u *Upstream) getDynamicConfig(rc *RequestContext) (string, string) {
 // --- Circuit Breaker Logic ---
 
 func (u *Upstream) IsHealthy() bool {
-	if u.Proto == "recursive" {
-		return true
-	}
-
 	// If circuit is closed, it's healthy
 	if !u.cbOpen.Load() {
 		return true
@@ -287,10 +277,6 @@ func (u *Upstream) setIPs(ips []net.IP) {
 
 // startBootstrapRefresher starts the background loop
 func (u *Upstream) startBootstrapRefresher() {
-	if u.Proto == "recursive" {
-		return
-	}
-
 	// Initial resolution
 	go u.refreshIPs()
 
@@ -311,14 +297,6 @@ func (u *Upstream) startBootstrapRefresher() {
 // --- Upstream Parsing ---
 
 func parseUpstream(raw string, ipVersion string, insecure bool, timeout string) (*Upstream, error) {
-	// Handle special recursive keyword
-	if strings.ToUpper(raw) == "RECURSIVE" {
-		return &Upstream{
-			Proto: "recursive",
-			Host:  "internal",
-		}, nil
-	}
-
 	parts := strings.Split(raw, "#")
 	uString := parts[0]
 	bootstrap := ""
@@ -556,11 +534,6 @@ func resolveHostnameWithBootstrap(ctx context.Context, hostname string, preferre
 // --- Exchange ---
 
 func (u *Upstream) executeExchange(ctx context.Context, req *dns.Msg, reqCtx *RequestContext) (*dns.Msg, string, time.Duration, error) {
-	// Recursive Bypass
-	if u.Proto == "recursive" {
-		return nil, "RECURSIVE", 0, errors.New("upstream is recursive holder")
-	}
-
 	// Check QPS Limit
 	if !u.Allow() {
 		return nil, "", 0, fmt.Errorf("QPS limit exceeded for %s", u.String())

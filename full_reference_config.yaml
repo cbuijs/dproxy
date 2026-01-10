@@ -146,24 +146,6 @@ server:
     # Default: false
     cname_flattening: false
 
-# --- Recursion Configuration ---
-# Configures the built-in iterative resolver.
-# To use this, set 'upstreams: RECURSIVE' in any routing rule.
-recursion:
-  enabled: false
-  # Path to a standard Bind-style root hints file.
-  # If empty, built-in IANA root hints are used.
-  root_hints_file: "/var/lib/dproxy/root.hints"
-
-  # IP Version preference for recursion steps: "ipv4", "ipv6", "both"
-  ip_version: "both"
-
-  # Enable QNAME Minimization (RFC 7816) for privacy
-  qname_minimization: true
-
-  # Max recursion depth to prevent loops
-  max_depth: 20
-
 # --- ARP/NDP Configuration ---
 # Used to map IP addresses to MAC addresses for logging and rule matching.
 arp:
