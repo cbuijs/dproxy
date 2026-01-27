@@ -1,0 +1,38 @@
+routing:
+  # Define reusable groups of upstream servers
+  upstream_groups:
+    kids:
+      # DNS4EU
+      - "tls://child-noads.joindns4.eu#86.54.11.11,86.54.11.211"
+
+      # CloudFlare
+      - "h3://family.cloudflare-dns.com/dns-query#1.1.1.3,1.0.0.3"
+
+      # ControlD
+      - "doq://family.freedns.controld.com#76.76.2.11,76.76.10.11"
+
+      # CleanBrowsing
+      - "tls://family-filter-dns.cleanbrowsing.org#185.228.168.168"
+
+      # CIRA
+      - "tls://family.canadianshield.cira.ca#149.112.121.30,149.112.122.30"
+
+    secure:
+      # DNS4EU
+      - "tls://protective.joindns4.eu#86.54.11.1,86.54.11.201"
+
+      # CloudFlare
+      - "h3://security.cloudflare-dns.com/dns-query#1.1.1.2,1.0.0.2"
+
+      # Quad9
+      - "tls://dns.quad9.net#9.9.9.9,149.112.112.112"
+
+      # ControlD
+      - "doq://p1.freedns.controld.com#76.76.2.11,76.76.10.11"
+
+      # CleanBrowsing
+      - "tls://security-filter-dns.cleanbrowsing.org#185.228.168.9"
+
+      # CIRA
+      - "tls://protected.canadianshield.cira.ca#149.112.121.20,149.112.122.20"
+

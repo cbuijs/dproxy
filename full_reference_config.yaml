@@ -1,0 +1,544 @@
+# ------------------------------------------------------------------------------
+# dproxy Full Reference Configuration
+# Generated based on source code version analysis (v4.x+)
+# ------------------------------------------------------------------------------
+# This configuration file documents all available options for dproxy, including
+# protocol settings, routing logic, AI/ML protection, and caching strategies.
+# ------------------------------------------------------------------------------
+
+# --- Logging Configuration ---
+logging:
+  # Log Level: DEBUG, INFO, WARN, ERROR
+  # "INFO" is recommended for production.
+  # "DEBUG" generates verbose output for troubleshooting routing/ML logic.
+  level: "INFO"
+  
+  # Log Mode: "full" (default) or "compact"
+  # "full"   : Logs a detailed one-line summary per request at INFO level,
+  #            plus detailed query/forwarding/ingress info at DEBUG level.
+  # "compact": Logs a minimal one-line summary per request at INFO level.
+  mode: "full"
+
+  # Format: "text" (human readable) or "json" (structured for parsing)
+  format: "text"
+  
+  # If true, attempts to resolve the client IP to a hostname in logs
+  # using the active Hosts cache or system resolver.
+  log_client_name: true
+  
+  # Output destinations. Multiple outputs can be enabled simultaneously.
+  # Options: "console", "file", "syslog"
+  outputs:
+    - "console"
+    # - "file"
+    # - "syslog"
+
+  # File logging configuration (if "file" is in outputs)
+  file:
+    path: "/var/log/dproxy.log"
+    permissions: 0644 # Octal file permissions
+
+  # Syslog configuration (if "syslog" is in outputs)
+  syslog:
+    # Network type: "unix", "unixgram" (local), "udp", "tcp" (remote)
+    network: "unixgram"
+
+    # Address: "/dev/log" for local Linux, or "host:port" for remote
+    address: "/dev/log"
+
+    # Tag to identify logs in syslog
+    tag: "dproxy"
+
+    # Syslog Facility (integer). 16 = local0, 17 = local1, etc.
+    facility: 16
+
+# --- Server Configuration ---
+server:
+  # Default bind address for listeners if not explicitly specified
+  listen_addr: "0.0.0.0"
+  
+  # Default ports for protocol aliases if not specified in listeners
+  ports:
+    udp: 53
+    tls: 853  # DoT
+    https: 443 # DoH
+
+  # Listener definitions. You can define multiple listeners for the same protocol.
+  listeners:
+    # Standard DNS (UDP)
+    - address: "0.0.0.0" # Can be a single string or list of strings ["0.0.0.0", "::"]
+      port: 53           # Can be a single int or list of ints [53, 5353]
+      protocol: "udp"
+    
+    # Standard DNS (TCP)
+    - address: "0.0.0.0"
+      port: 53
+      protocol: "tcp"
+
+    # DNS over TLS (DoT) - RFC 7858
+    - address: "0.0.0.0"
+      port: 853
+      protocol: "dot"
+
+    # DNS over QUIC (DoQ) - RFC 9250
+    - address: "0.0.0.0"
+      port: 853
+      protocol: "doq"
+
+    # DNS over HTTPS (DoH) - RFC 8484 (HTTP/2) & RFC 9293 (HTTP/3)
+    # The 'https' protocol enables both H2 and H3 listeners.
+    - address: "0.0.0.0"
+      port: 443
+      protocol: "https"
+
+  # TLS Certificates (Required for DoT, DoQ, DoH)
+  # If left empty, dproxy generates a self-signed certificate on startup using
+  # the listener IPs and 'localhost' as SANs.
+  tls:
+    cert_file: "/etc/dproxy/certs/fullchain.pem"
+    key_file: "/etc/dproxy/certs/privkey.pem"
+
+  # Global timeout for all upstream queries
+  timeout: "5s"
+
+  # Discovery of Designated Resolvers (DDR) - RFC 9462
+  # Allows clients to automatically upgrade from unencrypted DNS (UDP/TCP)
+  # to encrypted DNS (DoT/DoH/DoQ) provided by this server.
+  ddr:
+    enabled: true
+
+    # The hostname found in the TLS certificate (e.g., "dns.example.com").
+    # If empty, dproxy attempts to auto-detect it from the loaded cert.
+    host_name: "dns.secure-home.lan"
+
+    # If true, dproxy intercepts queries for A/AAAA records of 'host_name'
+    # and responds with the listener's IP addresses, bypassing upstream resolution.
+    spoof_hostname: true
+
+  # DNS over HTTPS (DoH) Specific Settings
+  doh:
+    # Paths to accept queries on. Default is usually "/dns-query".
+    allowed_paths: 
+      - "/dns-query"
+
+    # If true, rejects requests to paths not in allowed_paths.
+    strict_path: true
+
+    # Behavior when path mismatches: 
+    # "404"  - Return HTTP 404 (Default)
+    # "400"  - Return HTTP 400 Bad Request
+    # "403"  - Return HTTP 403 Forbidden
+    # "405"  - Return HTTP 405 Method Not Allowed
+    # "drop" - Hijack/Close connection immediately (or panic handler for H2/H3)
+    mismatch_behavior: "404"
+
+    # Custom text body for mismatch response (default: empty/standard http text)
+    # Example: "Only DNS Allowed!"
+    mismatch_text: ""
+
+    # Delay before executing the mismatch behavior (Tarpit). Default is 0.
+    # Useful for slowing down scanners probing for endpoints.
+    mismatch_backoff: "3s"
+
+    # If true, serves a standardized robots.txt at /robots.txt disallowing all crawlers.
+    # Content: "User-agent: *\nDisallow: /"
+    robots_txt: false
+
+  # EDNS0 Client Subnet (ECS) & MAC Handling
+  edns0:
+    ecs:
+      # mode: 
+      # "add"     - Add client IP as ECS if missing (default)
+      # "remove"  - Strip ECS data from client
+      # "preserve"- Pass through whatever the client sent
+      # "replace" - Overwrite client ECS with their actual IP
+      mode: "add"
+      source_mask: 0 # Default mask if ipv4/ipv6 masks not set
+      ipv4_mask: 32  # Prefix length for IPv4
+      ipv6_mask: 128 # Prefix length for IPv6
+
+    mac:
+      # mode:
+      # "add"         - Add MAC (Option 65001) if missing
+      # "replace"     - Overwrite MAC option
+      # "preserve"    - Keep client's MAC option
+      # "remove"      - Strip MAC option
+      # "prefer-arp"  - Use ARP-resolved MAC if available, else EDNS0
+      # "prefer-edns0"- Use client-provided EDNS0 MAC if available, else ARP
+      mode: "prefer-arp"
+      # source: "arp" (use local ARP table), "edns0" (trust client), "both"
+      source: "arp"
+
+  # Security & Resilience
+  insecure_upstream: false # If true, disables TLS verification for upstreams (DANGEROUS)
+  drop_on_failure: false   # If true, silently drops failed queries instead of sending SERVFAIL
+
+  # Response Manipulation
+  response:
+    minimization: true     # Strips unnecessary Authority/Additional records (bandwidth saver)
+    cname_flattening: true # Resolves CNAME chains and returns the final A/AAAA record at the top
+    
+    # Strict PTR Handling:
+    # "off" (default)   - Process all PTR queries normally.
+    # "strict"          - Validates that PTR queries are for valid IPv4 (in-addr.arpa) 
+    #                     or IPv6 (ip6.arpa) addresses. Discards malformed or non-IP queries
+    #                     (e.g., mDNS unicast queries like 'lb._dns-sd._udp.home.') by returning NXDOMAIN.
+    ptr_mode: "off"
+
+# --- Bootstrap DNS ---
+# Used to resolve hostnames of upstreams defined in routing rules.
+bootstrap:
+  servers:
+    - "1.1.1.1:53"
+    - "8.8.8.8:53"
+
+  # Preference for bootstrap resolution: "ipv4", "ipv6", or "both"
+  ip_version: "both"
+
+# --- ML Guard (AI Suspicious Domain Detection) ---
+# Analyzes domain patterns (entropy, length, n-grams) to detect DGA/phishing/malware domains.
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# !!! NOTE/CAUTION: This is HIGHLY experimental and will generate a lot of false-positives !!!
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+ml_guard:
+  enabled: true
+  
+  # Threshold (0.0 - 1.0):
+  # Probability required to flag a domain.
+  # Higher (e.g., 0.95) = Fewer False Positives, but might miss subtle threats.
+  # Lower (e.g., 0.75) = More aggressive / paranoid.
+  # If auto_threshold is enabled, this value acts as the starting point.
+  threshold: 0.90
+
+  # Auto Threshold Mode:
+  # "off"     : Disable auto-tuning (Use manual threshold).
+  # "startup" : Calculate optimal threshold only once during startup training.
+  # "on"      : Continuously adjust threshold based on live traffic patterns (Dynamic).
+  #             The system learns what "normal" traffic looks like and sets the
+  #             blocking threshold just above the 99th percentile of allowed queries.
+  auto_threshold: "off"
+
+  # State File (Persistence):
+  # Path to a JSON file where the dynamic threshold state and history are saved.
+  # This allows the AI to "remember" traffic baselines across restarts, preventing
+  # the need to re-learn behavior from scratch.
+  # Required if 'auto_threshold' is 'on' for continuity.
+  state_file: "/var/lib/dproxy/ml_guard_state.json"
+
+  # Save Interval (for dynamic state persistence):
+  # How often to write the state file to disk. Default is "30m".
+  save_interval: "30m"
+
+  # Tranco / Top 1M List Integration (False Positive Reduction):
+  # Path to a CSV file (Rank,Domain format like Tranco or Majestic) to train the model
+  # on "Good" vocabulary. This teaches the AI what normal internet traffic looks like
+  # (e.g., "cdn", "cloud", "app") to prevent false positives on benign domains.
+  # Note: These domains are NOT whitelisted, they are only used for training patterns.
+  tranco_file: "/var/lib/dproxy/top-1m.csv"
+
+  # Limit the number of domains processed from the Tranco file.
+  # Processing 1M domains can be memory/CPU intensive on startup.
+  # A value of 10000-50000 is usually sufficient for vocabulary coverage.
+  # Set to 0 to process all lines.
+  tranco_top_n: 20000
+
+  # Minimum domain length to analyze. Short domains are usually safe or hard to classify.
+  # Recommended: Increase to 8 or 10 to reduce false positives on short dictionary words.
+  min_length: 8
+
+# --- ARP/NDP Configuration ---
+# Used to resolve IP addresses to MAC addresses for client identification/logging.
+arp:
+  # "v4" (ARP), "v6" (NDP), "both", or "none"
+  mode: "both"
+
+  # Timeout for system ARP command execution
+  timeout: "2s"
+
+# --- Rate Limiting ---
+# Protects the server and upstreams from abuse and overload.
+rate_limit:
+  enabled: true
+  
+  # Per-Client Token Bucket Limits
+  client_qps: 100
+  client_burst: 200
+  
+  # System Load Protection (Global)
+  # Controls internal concurrency to prevent OOM/CPU saturation.
+  max_goroutines: 5000       # Soft limit: Introduces artificial delay (BaseDelay -> MaxDelay)
+  hard_max_goroutines: 8000  # Hard limit: Drops requests immediately
+  
+  # Delay parameters for Soft Limit
+  base_delay: "50ms"
+  max_delay: "1s"
+  
+  # Maintenance settings
+  cleanup_interval: "1m"
+  client_expiration: "5m" # Remove client limiters after 5m of inactivity
+
+# --- Caching & Prefetching ---
+cache:
+  enabled: true
+  # Maximum number of items in the in-memory cache
+  size: 100000
+
+  # Directory to store persistent Hosts file caches (speeds up restart)
+  hosts_cache_dir: "/var/cache/dproxy/hosts"
+  
+  # TTL (Time-To-Live) Management (in seconds), use "0" to not modify.
+  min_ttl: 300
+  max_ttl: 86400
+  min_neg_ttl: 60  # Minimum TTL for NXDOMAIN (Negative Cache)
+  max_neg_ttl: 600
+  hosts_ttl: 3600  # Default TTL for records generated from local Hosts files
+  
+  # TTL Strategy for Upstream Responses:
+  # "none", "first", "last", "lowest", "highest", "average"
+  ttl_strategy: "lowest"
+
+  # Response Sorting Strategy (for multiple A/AAAA records):
+  # "none", "round-robin" (randomize order), "sorted" (lexicographical IP sort)
+  response_sorting: "round-robin"
+  
+  # Harden Below NXDOMAIN:
+  # If a parent domain (e.g., "example.com") is known to be NXDOMAIN in cache,
+  # prevent queries for subdomains ("foo.example.com") and return NXDOMAIN immediately.
+  harden_below_nxdomain: true
+
+  # Advanced Prefetching Features
+  prefetch:
+    # Predictive Prefetching (Markov Chain):
+    # Learns query sequences (e.g., user queries "google.com" -> then "gstatic.com")
+    # and proactively fetches the next likely domain.
+    predictive:
+      enabled: true
+      threshold: 0.70      # Probability threshold to trigger prefetch
+      max_memory: 50000    # Max transitions to store
+      learning_window: "5s"# Time window to associate sequential queries
+      max_concurrent: 50   # Max concurrent prefetch goroutines
+      timeout: "3s"        # Timeout for prefetch queries
+
+    # Stale Refresh:
+    # Proactively refreshes popular cached items before they expire.
+    stale_refresh:
+      enabled: true
+      threshold_percent: 10 # Refresh when <10% of TTL remains
+      min_hits: 5           # Only refresh items queried >5 times
+      check_interval: "30s"
+      max_concurrent: 20
+
+    # Load Shedding for Prefetcher:
+    # Prevents background tasks from overwhelming the server.
+    load_shedding:
+      enabled: true
+      max_goroutines: 8000
+      max_queue_usage_pct: 90
+
+# --- Routing Logic ---
+routing:
+  # 1. Define Upstream Groups (Aliases)
+  # Supported protocols: udp, tcp, dot (tls), doq (quic), doh (https), doh3 (h3)
+  #
+  # Dynamic Client Variables (for encrypted protocols like DoH/DoQ):
+  # ----------------------------------------------------------------------------
+  # {client-id}   : Automatically selects the best available identifier.
+  #                 Prefers MAC address (from ARP or EDNS0 Option 65001).
+  #                 Falls back to Client IP if no MAC is available.
+  #                 Format is sanitized (e.g., "AA-BB-CC-11-22-33" or "192-168-1-50").
+  #
+  # {client-mac}  : Forces use of MAC address.
+  #                 Checks local ARP table first, then EDNS0 Option 65001.
+  #                 Returns "00-00-00-00-00-00" if unknown.
+  #
+  # {client-ip}   : Forces use of Client IP address.
+  #                 Format: "192-168-1-50" or "2001-db8--1".
+  #
+  # {client-name} : Forces use of Client (resolved) hostname.
+  #                 Format: "hostname" or "{client-ip}" when none resolved.
+  # ----------------------------------------------------------------------------
+  #
+  # dproxy Configuration Options (Query Params):
+  #   qps=N        - Rate limit (Queries Per Second) [Default: Unlimited]
+  #   retries=N    - Number of retries on network failure [Default: 0]
+  #   cb_min=N     - Circuit breaker failure threshold [Default: 3]
+  #   method=GET   - (DoH only) HTTP Method [Default: POST]
+  #   max_conns=N  - Max concurrent connections/requests per upstream [Default: 50]
+  #                  This acts as a "Bulkhead" to prevent a single slow upstream
+  #                  from exhausting local resources. Requests exceeding this limit
+  #                  are dropped locally without tripping the Circuit Breaker.
+  #
+  # Defaults for Optional URL Parts (if not specified):
+  #   Port         - 53 (UDP/TCP), 853 (DoT/DoQ), 443 (DoH/DoH3)
+  #   Path         - /dns-query (DoH/DoH3 only)
+  #
+  # Note: Any other query parameters (e.g., ?name=value) will be preserved and passed 
+  # to the upstream server (useful for DoH identification).
+  #
+  # Forced IPs (Bootstrap):
+  #   Append #ip1,ip2 to skip DNS resolution of the hostname.
+  #   Example: "doh://dns.google/dns-query#8.8.8.8,8.8.4.4"
+  #
+  # Note: Make sure that URL's are quoted when using Forced IPs.
+  #
+  upstream_groups:
+    cloud_dns:
+      - "doh://1.1.1.1/dns-query?max_conns=100"
+      - "doh://8.8.8.8/dns-query?max_conns=100"
+    
+    clean_browsing:
+      - "doh://doh.cleanbrowsing.org/doh/family-filter?max_conns=50"
+      
+    internal_dns:
+      - "udp://10.0.0.53:53?max_conns=200"
+
+    # Example: Dynamic ID for NextDNS
+    nextdns_dynamic:
+      - "doh://dns.nextdns.io/YOUR_PROFILE_ID/{client-id}?max_conns=50"
+
+    # Example: Dynamic ID for ControlD
+    controld_dynamic:
+      - "doq://p1.freedns.controld.com/{client-id}"
+
+  # 2. Routing Rules (Processed in order)
+  # The first matching rule applies.
+  #
+  # Available Match Rules:
+  # ----------------------------------------------------------------------------
+  # client_ip         : Match specific client IP addresses (single or list).
+  #                     Example: ["192.168.1.50", "10.0.0.5"]
+  #
+  # client_cidr       : Match client IPs within a CIDR range.
+  #                     Example: ["192.168.10.0/24", "10.0.0.0/8"]
+  #
+  # client_mac        : Match Client MAC addresses (requires local ARP/NDP).
+  #                     Supports exact matches and wildcards (*, ?).
+  #                     Example: ["00:11:22:33:44:55", "aa:bb:cc:*", "00:1?:*:*:*:*"]
+  #
+  # client_ecs        : Match based on EDNS0 Client Subnet (ECS) provided by downstream.
+  #                     Example: ["203.0.113.0/24"]
+  #
+  # client_edns_mac   : Match based on MAC address embedded in EDNS0 Option 65001.
+  #                     Supports exact matches and wildcards.
+  #                     Example: ["00:11:22:33:44:55"]
+  #
+  # server_ip         : Match the destination IP (listener IP) the query was sent to.
+  #                     Useful if dproxy listens on multiple interfaces/aliases.
+  #                     Example: ["192.168.1.1", "10.0.0.1"]
+  #
+  # server_port       : Match the destination port the query was received on.
+  #                     Example: [53, 853]
+  #
+  # server_hostname   : Match the server name (SNI for DoT/DoQ, Host Header for DoH/DoH3).
+  #                     Example: ["dns.example.com:443", "dns.example.com"]
+  #                     NOTE: The port-number is sometimes part of the hostname.
+  #
+  # server_path       : Match the HTTP Request Path (DoH only).
+  #                     Example: ["/dns-query", "/kids-shield"]
+  #
+  # query_domain      : Match the domain name being queried.
+  #                     Supports exact matches, suffix wildcards (*.example.com),
+  #                     and full wildcards (*).
+  #                     Example: ["example.com", "*.google.com", "ads.*"]
+  # ----------------------------------------------------------------------------
+  #
+  # Upstream Actions (Action-Based Routing):
+  # ----------------------------------------------------------------------------
+  # Instead of forwarding to a server, you can specify a direct action:
+  # "BLOCK" - Respond immediately with NXDOMAIN (Block)
+  # "DROP"  - Drop the packet silently (No response)
+  # 
+  # Example:
+  #   upstreams: BLOCK
+  #   upstreams: DROP
+  # ----------------------------------------------------------------------------
+  
+  routing_rules:
+    # Scenario A: Child Protection (Safe Search + ML Guard + Blocklists)
+    - name: "Kids Protection"
+      match:
+        # Match by Client IP/CIDR
+        client_cidr: ["192.168.10.0/24"]
+
+        # Match by MAC Address (Exact or Wildcard, ? and * supported)
+        # client_mac: ["00:11:22:33:44:55", "aa:bb:*"]
+
+      upstreams: clean_browsing
+      # Strategy: "round-robin", "random", "failover", "fastest", "race"
+      strategy: "fastest"
+      
+      # Safe Search Enforcement:
+      # "none"     : No enforcement
+      # "moderate" : YouTube Restricted Mode, etc.
+      # "full"     : Strict Google/Bing/DDG SafeSearch
+      safe_search: "full"
+      
+      # ML Guard Action for this rule:
+      # "disable"       : Don't scan
+      # "log"           : Log all suspicious queries and responses (Default)
+      # "block"         : Block all suspicious queries and responses
+      # "log-query"     : Log only suspicious incoming queries
+      # "block-query"   : Block only suspicious incoming queries (allow suspicious responses)
+      # "log-response"  : Log only suspicious upstream responses
+      # "block-response": Block only suspicious upstream responses (allow suspicious queries)
+      ml_guard_mode: "block"
+      
+      # Ad/Malware Blocking Lists (Hosts format or Domain lists)
+      # Supports local files or remote URLs
+      hosts_urls:
+        - "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/fakenews-gambling-porn/hosts"
+
+    # Scenario B: IoT Isolation (Split Horizon)
+    - name: "IoT Isolation"
+      match:
+        client_cidr: ["192.168.20.0/24"]
+      upstreams: internal_dns
+      # No hosts_urls implies no external blocking specific to this rule,
+      # but routing to internal_dns might block internet access if that DNS server is restricted.
+
+    # Scenario C: Internal Domain Routing
+    - name: "Internal Domains"
+      match:
+        # Match specific domains (supports wildcards)
+        query_domain: ["*.corp", "*.lan", "internal.example.com"]
+      upstreams: internal_dns
+      strategy: "failover"
+
+    # Scenario D: Explicit Block of Bad Clients
+    - name: "Block Bad Client"
+      match:
+        client_ip: ["192.168.1.100"]
+      upstreams: BLOCK # Returns NXDOMAIN immediately
+
+    # Scenario E: Ad-Blocking for General Network
+    - name: "General AdBlock"
+      match:
+        query_domain: ["*"] # Matches everything not matched above
+      upstreams: cloud_dns
+      
+      # Blocklist Sources
+      hosts_urls:
+        - "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
+      hosts_files:
+        - "/etc/hosts" # Include local system hosts
+      
+      # Hosts Processing Options
+      hosts_wildcard: true    # Enable wildcard matching for hosts entries
+      hosts_optimize: true    # Optimize memory usage (deduplication)
+      hosts_optimize_tld: false # Advanced: Optimize TLD storage (defaults to false usually)
+      hosts_responses: true   # Filter upstream responses (IP blocking) based on loaded lists
+      refresh_interval: "24h" # How often to reload remote URLs
+      
+      safe_search: "moderate"
+      ml_guard_mode: "log"    # Log suspicious domains but don't block them
+
+  # 3. Default Fallback Rule
+  # Applied if no Routing Rules match the query.
+  default:
+    upstreams: cloud_dns
+    strategy: "race" # "race" sends to all upstreams and takes the first response
+    hosts_files: 
+      - "/etc/hosts"
+    safe_search: "none"
+    ml_guard_mode: "log"
+
