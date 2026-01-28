@@ -1,10 +1,11 @@
 /*
 File: limiter.go
-Version: 1.1.0
+Version: 1.3.0
 Description: Implements smart dynamic rate limiting logic using Token Buckets for client QPS
              and Proportional Delay / Load Shedding for system health.
              Includes thread-safe sharded map for managing client state.
-             UPDATED: Added detailed decision logging.
+             UPDATED: Implemented Traffic Shaping (Pacing) for Client QPS instead of immediate Drop.
+             UPDATED: Added IsUnderLoad() to signal load shedding state to other modules.
 */
 
 package main
@@ -45,6 +46,9 @@ func (a LimitAction) String() string {
 
 const (
 	limitShardCount = 256
+	// maxPacingDelay defines the maximum time we are willing to delay a request
+	// to smooth out traffic. If the required delay exceeds this, we drop.
+	maxPacingDelay = 1 * time.Second
 )
 
 // Global Limiter Instance
@@ -81,6 +85,22 @@ func InitLimiter(cfg RateLimitConfig) {
 			clients: make(map[string]*ClientState),
 		}
 	}
+}
+
+// IsUnderLoad returns true if the system is under significant stress.
+// Used by the Cache to decide whether to serve stale data.
+func (lm *LimiterManager) IsUnderLoad() bool {
+	if !lm.enabled {
+		return false
+	}
+	// Trigger load mode at 80% of the Soft Limit (MaxGoroutines).
+	// This allows us to start shedding load (serving stale) BEFORE we start
+	// imposing artificial delays or drops.
+	threshold := int(float64(lm.config.MaxGoroutines) * 0.8)
+	if threshold < 10 {
+		threshold = 10
+	}
+	return runtime.NumGoroutine() > threshold
 }
 
 // StartCleanupRoutine starts the background worker to remove old client limiters
@@ -179,7 +199,7 @@ func (lm *LimiterManager) Check(clientIP net.IP) (LimitAction, time.Duration, st
 		return ActionDelay, delay, reason
 	}
 
-	// 2. CLIENT QPS CHECK (Per-IP)
+	// 2. CLIENT QPS CHECK (Per-IP) with SMART PACING
 	if clientIP == nil {
 		return ActionAllow, 0, ""
 	}
@@ -196,23 +216,44 @@ func (lm *LimiterManager) Check(clientIP net.IP) (LimitAction, time.Duration, st
 		shard.clients[ipStr] = state
 	}
 	state.lastSeen = time.Now()
-	// Allow evaluates tokens.
-	allowed := state.limiter.Allow()
 	
-	// Get stats for logging before unlocking if rejected
-	var tokens float64
-	if !allowed && IsDebugEnabled() {
-		tokens = state.limiter.Tokens()
-	}
+	// Use Reserve() to determine traffic shaping requirements
+	reservation := state.limiter.Reserve()
 	shard.Unlock()
 
-	if !allowed {
-		// QPS exceeded. We default to drop for QPS limits as clients should back off.
-		reason := fmt.Sprintf("Client QPS Exceeded (IP: %s, Limit: %d, Burst: %d, Tokens: %.2f)", 
-			ipStr, lm.config.ClientQPS, lm.config.ClientBurst, tokens)
-		return ActionDrop, 0, reason
+	if !reservation.OK() {
+		// Burst limit exceeded significantly? Should rarely happen with Reserve unless burst is 0
+		return ActionDrop, 0, "Client Rate Limit Exceeded (Internal Error)"
 	}
 
-	return ActionAllow, 0, ""
+	delay := reservation.Delay()
+	
+	if delay == 0 {
+		return ActionAllow, 0, ""
+	}
+
+	// Smart Pacing:
+	// If the required delay to conform to the rate limit is within our pacing threshold (e.g. 1s),
+	// we tell the server to DELAY the request instead of dropping it.
+	// This smooths out micro-bursts and makes the limiter behave like a traffic shaper.
+	if delay <= maxPacingDelay {
+		reason := fmt.Sprintf("Client QPS Pacing (IP: %s, Delay: %v)", ipStr, delay)
+		return ActionDelay, delay, reason
+	}
+
+	// If the delay is massive (client is flooding way beyond 100 QPS), cancel the reservation and drop.
+	reservation.Cancel()
+	
+	// Get token count for logging
+	var tokens float64
+	if IsDebugEnabled() {
+		// We need to re-acquire lock or just accept approximate value. 
+		// Since we already made a decision, approximate is fine, but limiter is thread-safe.
+		tokens = state.limiter.Tokens()
+	}
+
+	reason := fmt.Sprintf("Client QPS Exceeded (IP: %s, Required Delay: %v > Limit: %v, Tokens: %.2f)", 
+		ipStr, delay, maxPacingDelay, tokens)
+	return ActionDrop, 0, reason
 }
 

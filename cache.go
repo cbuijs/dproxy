@@ -2,8 +2,7 @@
 File: cache.go
 Version: 2.6.0
 Description: Thread-safe in-memory DNS cache using Sharded LRU eviction with Adaptive Maintenance.
-             UPDATED: Implemented adaptive maintenance cycles that scale frequency based on eviction rates.
-             UPDATED: Pruning now inspects a batch of items rather than stopping at the first non-expired entry.
+             UPDATED: Implemented "Serve Stale on Load" mechanism to reduce drops/servfails.
 */
 
 package main
@@ -19,7 +18,11 @@ import (
 	"github.com/miekg/dns"
 )
 
-const shardCount = 256
+const (
+	shardCount       = 256
+	staleGracePeriod = 1 * time.Hour // How long to keep expired items for emergency use
+	staleServeTTL    = 5             // TTL to serve for stale records (seconds)
+)
 
 // Global seed for maphash to ensure consistent hashing per process run
 var hasherSeed = maphash.MakeSeed()
@@ -191,6 +194,7 @@ func getFromCache(key string, reqID uint16) *dns.Msg {
 
 // getFromCacheWithTTL retrieves a cached response and returns both the message and
 // the actual remaining TTL in seconds.
+// UPDATED: Now supports serving stale data if system is under load.
 func getFromCacheWithTTL(key string, reqID uint16) (*dns.Msg, uint32) {
 	if !dnsCache.enabled {
 		return nil, 0
@@ -211,7 +215,43 @@ func getFromCacheWithTTL(key string, reqID uint16) (*dns.Msg, uint32) {
 
 	// Check TTL
 	if now.After(entry.Expiration) {
-		// Lazy eviction
+		// --- Serve Stale Logic ---
+		// If we are under load AND the item is within the grace period, serve it!
+		isUnderLoad := false
+		if GlobalLimiter != nil {
+			isUnderLoad = GlobalLimiter.IsUnderLoad()
+		}
+
+		if isUnderLoad && now.Before(entry.Expiration.Add(staleGracePeriod)) {
+			// Move to front to prevent LRU eviction of this helpful stale item
+			shard.lruList.MoveToFront(elem)
+			
+			msgBytes := entry.MsgBytes
+			shard.Unlock()
+
+			// Unpack
+			msg := getMsg()
+			if err := msg.Unpack(msgBytes); err != nil {
+				putMsg(msg)
+				return nil, 0
+			}
+			msg.Id = reqID
+
+			// Force short TTL for stale response
+			updateTTL := func(rrs []dns.RR) {
+				for _, rr := range rrs {
+					rr.Header().Ttl = staleServeTTL
+				}
+			}
+			updateTTL(msg.Answer)
+			updateTTL(msg.Ns)
+			updateTTL(msg.Extra)
+
+			LogDebug("[CACHE] Served Stale for %s (Load Shedding)", key)
+			return msg, staleServeTTL
+		}
+
+		// Standard Eviction (Not under load OR too old)
 		shard.lruList.Remove(elem)
 		delete(shard.items, key)
 		resetCacheHitCount(key)
@@ -450,10 +490,6 @@ func pruneExpired() (int, int) {
 	cleaned := 0
 	cleanedNX := 0
 	
-	// Inspection depth: How many LRU items to inspect from the tail.
-	// Since LRU is ordered by usage, not expiration, an old item might be followed by a newer item.
-	// We don't want to scan the whole list (O(N)), but checking just one (O(1)) is weak.
-	// 20 is a safe constant that catches most dead weight without locking too long.
 	const batchSize = 20
 
 	// Prune Standard Cache
@@ -468,26 +504,16 @@ func pruneExpired() (int, int) {
 			}
 			entry := elem.Value.(*CacheItem)
 			
-			if now.After(entry.Expiration) {
-				// Expired: Remove
+			// UPDATED: Only prune if fully expired AND past the grace period.
+			// This keeps stale items in memory for potential load-shedding use.
+			if now.After(entry.Expiration.Add(staleGracePeriod)) {
 				shard.lruList.Remove(elem)
 				delete(shard.items, entry.Key)
 				resetCacheHitCount(entry.Key)
 				cleaned++
 			} else {
-				// Not expired, but it IS the least recently used. 
-				// We don't remove it, but we continue checking just in case
-				// a slightly more recently used item IS expired.
-				// However, `list` doesn't allow iterating backward easily while mutating head/tail?
-				// Actually, `list.Back()` gives the element. We can get `.Prev()`.
-				// But we are only removing `elem` if expired.
-				// To check the "next oldest", we would need to manually iterate `Prev()` if we didn't remove.
-				// But the standard list doesn't support easy "remove current" if we are iterating manually without care.
-				// The safe way with simple standard `list`:
-				// If we don't remove the back, we can't easily see the "next back" without iterating.
-				// Optimization: If the absolute LRU item is NOT expired, chances are high that
-				// most items are fine (or validly cached hot items).
-				// We won't iterate deeper if the tail is valid, to save CPU.
+				// Optimization: If the LRU item isn't past grace period, newer items
+				// likely aren't either. Stop scanning this shard.
 				break
 			}
 		}
@@ -495,8 +521,7 @@ func pruneExpired() (int, int) {
 	}
 
 	// Prune NX Cache (Simple Map Iteration)
-	// NX Shards are usually smaller/lightweight.
-	// We do a full scan here because maps have no order.
+	// NX cache entries are small and don't need stale serving (NX is NX).
 	for _, shard := range dnsCache.nxShards {
 		shard.Lock()
 		for k, expires := range shard.items {
