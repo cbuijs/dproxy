@@ -1,11 +1,17 @@
 /*
 File: limiter.go
-Version: 1.3.0
+Version: 1.12.0
 Description: Implements smart dynamic rate limiting logic using Token Buckets for client QPS
              and Proportional Delay / Load Shedding for system health.
              Includes thread-safe sharded map for managing client state.
              UPDATED: Implemented Traffic Shaping (Pacing) for Client QPS instead of immediate Drop.
              UPDATED: Added IsUnderLoad() to signal load shedding state to other modules.
+             UPDATED: Added dynamic QPS scaling based on system load (Adaptive Throttling).
+             UPDATED: Added comprehensive DEBUG logging for limiter decisions, including Goroutine stats.
+             FIXED: Ensure logging happens immediately during load changes to avoid perceived lag.
+             DEBUG: Added verbose logging for system load state to diagnose threshold issues.
+             ADJUSTED: Made adaptive scaling more aggressive (bigger steps) by increasing reduction factor to 0.95.
+             UPDATED: Round up calculated QPS and Burst values to nearest integer using math.Ceil.
 */
 
 package main
@@ -14,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"hash/maphash"
+	"math"
 	"net"
 	"runtime"
 	"sync"
@@ -176,32 +183,92 @@ func (lm *LimiterManager) Check(clientIP net.IP) (LimitAction, time.Duration, st
 	// Hard Limit: Immediate Drop (Load Shedding) to prevent crash
 	if numGoroutines >= lm.config.HardMaxGoroutines {
 		reason := fmt.Sprintf("System Overload (Hard Limit: %d/%d Goroutines)", numGoroutines, lm.config.HardMaxGoroutines)
+		if IsDebugEnabled() {
+			LogDebug("[LIMITER] Hard limit hit! Dropping request. Goroutines: %d (Limit: %d)", numGoroutines, lm.config.HardMaxGoroutines)
+		}
 		return ActionDrop, 0, reason
 	}
 
-	// Soft Limit: Proportional Delay
-	if numGoroutines > lm.config.MaxGoroutines {
-		// Calculate overage ratio (0.0 to 1.0 between soft and hard limit)
-		spread := float64(lm.config.HardMaxGoroutines - lm.config.MaxGoroutines)
-		overage := float64(numGoroutines - lm.config.MaxGoroutines)
-		ratio := overage / spread
-		if ratio > 1.0 {
-			ratio = 1.0
-		}
+	// Adaptive Logic Vars
+	var loadRatio float64
+	systemDelay := time.Duration(0)
+	systemReason := ""
 
+	// Calculate ratio regardless of threshold for visibility (clamped at 0)
+	if lm.config.HardMaxGoroutines > lm.config.MaxGoroutines {
+		overage := float64(numGoroutines - lm.config.MaxGoroutines)
+		spread := float64(lm.config.HardMaxGoroutines - lm.config.MaxGoroutines)
+		loadRatio = overage / spread
+	}
+	
+	if loadRatio < 0 {
+		loadRatio = 0
+	} else if loadRatio > 1.0 {
+		loadRatio = 1.0
+	}
+
+	// Soft Limit Logic: Apply Delay
+	if numGoroutines > lm.config.MaxGoroutines {
 		// Calculate delay: BaseDelay + (MaxDelay - BaseDelay) * ratio
 		base := float64(lm.config.parsedBaseDelay.Nanoseconds())
 		max := float64(lm.config.parsedMaxDelay.Nanoseconds())
-		delayNs := base + (max-base)*ratio
-		delay := time.Duration(delayNs)
+		delayNs := base + (max-base)*loadRatio
+		systemDelay = time.Duration(delayNs)
 		
-		reason := fmt.Sprintf("System Load (Soft Limit: %d/%d Goroutines, Ratio: %.2f)", numGoroutines, lm.config.MaxGoroutines, ratio)
-		return ActionDelay, delay, reason
+		systemReason = fmt.Sprintf("System Load (Soft Limit: %d/%d Goroutines, Ratio: %.2f)", numGoroutines, lm.config.MaxGoroutines, loadRatio)
+		
+		if IsDebugEnabled() {
+			// LOG IMMEDIATELY when system load is detected
+			LogDebug("[LIMITER] System under load. Goroutines: %d (Soft: %d, Hard: %d), LoadRatio: %.2f, SystemDelay: %v", 
+				numGoroutines, lm.config.MaxGoroutines, lm.config.HardMaxGoroutines, loadRatio, systemDelay)
+		}
+	} else if IsDebugEnabled() {
+		// DEBUG: Periodic log or verbose log to prove we are checking
+		// We use a simple check to avoid spamming 1000s of lines. 
+		// Only log if we are somewhat close (e.g. > 50% of soft limit)
+		if numGoroutines > lm.config.MaxGoroutines/2 {
+			// LogDebug("[LIMITER] System normal. Goroutines: %d (Soft: %d)", numGoroutines, lm.config.MaxGoroutines)
+		}
 	}
 
-	// 2. CLIENT QPS CHECK (Per-IP) with SMART PACING
+	// 2. CLIENT QPS CHECK (Per-IP) with ADAPTIVE LIMITS
 	if clientIP == nil {
+		// If no client IP, we can only enforce system limits
+		if systemDelay > 0 {
+			return ActionDelay, systemDelay, systemReason
+		}
 		return ActionAllow, 0, ""
+	}
+
+	// Calculate Effective Client Limit
+	// If under load, scale down the limit.
+	targetLimit := rate.Limit(lm.config.ClientQPS)
+	targetBurst := lm.config.ClientBurst
+
+	if loadRatio > 0 {
+		// Increased aggression: Scale down to 5% at max load (0.95 factor)
+		scaleFactor := 1.0 - (loadRatio * 0.95) 
+		scaledQPS := float64(lm.config.ClientQPS) * scaleFactor
+		
+		minQPS := float64(lm.config.ClientQPS) * 0.05 // Floor at 5%
+		if minQPS < 5.0 { minQPS = 5.0 } // Absolute floor 5 QPS
+		
+		if scaledQPS < minQPS { scaledQPS = minQPS }
+		
+		// ROUND UP to nearest whole number
+		targetLimit = rate.Limit(math.Ceil(scaledQPS))
+		
+		// Scale burst similarly
+		scaledBurst := float64(lm.config.ClientBurst) * scaleFactor
+		if scaledBurst < 1 { scaledBurst = 1 }
+		// ROUND UP burst
+		targetBurst = int(math.Ceil(scaledBurst))
+
+		if IsDebugEnabled() {
+			// LOG IMMEDIATELY when adaptive scaling is active
+			LogDebug("[LIMITER] Adaptive Scaling Active: LoadRatio=%.2f -> Limit: %.2f QPS, Burst: %d (Factor: %.2f)", 
+				loadRatio, float64(targetLimit), targetBurst, scaleFactor)
+		}
 	}
 
 	ipStr := clientIP.String()
@@ -211,49 +278,64 @@ func (lm *LimiterManager) Check(clientIP net.IP) (LimitAction, time.Duration, st
 	state, exists := shard.clients[ipStr]
 	if !exists {
 		state = &ClientState{
-			limiter: rate.NewLimiter(rate.Limit(lm.config.ClientQPS), lm.config.ClientBurst),
+			limiter: rate.NewLimiter(targetLimit, targetBurst),
 		}
 		shard.clients[ipStr] = state
 	}
 	state.lastSeen = time.Now()
+
+	// Dynamic Adjustment: If the limit has changed significantly, update the limiter.
+	currentLimit := state.limiter.Limit()
+	if currentLimit != targetLimit {
+		if IsDebugEnabled() {
+			LogDebug("[LIMITER] Adjusting limiter for %s -> Old: %.2f, New: %.2f, Burst: %d (Active QPS)", ipStr, float64(currentLimit), float64(targetLimit), targetBurst)
+		}
+		state.limiter.SetLimit(targetLimit)
+		state.limiter.SetBurst(targetBurst)
+	}
 	
 	// Use Reserve() to determine traffic shaping requirements
 	reservation := state.limiter.Reserve()
 	shard.Unlock()
 
 	if !reservation.OK() {
-		// Burst limit exceeded significantly? Should rarely happen with Reserve unless burst is 0
 		return ActionDrop, 0, "Client Rate Limit Exceeded (Internal Error)"
 	}
 
-	delay := reservation.Delay()
+	clientDelay := reservation.Delay()
 	
-	if delay == 0 {
-		return ActionAllow, 0, ""
+	// Combine Delays: Take the maximum of System Delay or Client Pacing Delay
+	finalDelay := clientDelay
+	finalReason := ""
+
+	if systemDelay > clientDelay {
+		finalDelay = systemDelay
+		finalReason = systemReason
+	} else if clientDelay > 0 {
+		// Smart Pacing Check
+		if clientDelay <= maxPacingDelay {
+			finalReason = fmt.Sprintf("Client QPS Pacing (IP: %s, Delay: %v, Limit: %.2f)", ipStr, clientDelay, float64(targetLimit))
+			if IsDebugEnabled() {
+				// LOG IMMEDIATELY when pacing is applied
+				LogDebug("[LIMITER] Pacing client %s. Delay: %v (Active QPS: %.2f)", ipStr, clientDelay, float64(targetLimit))
+			}
+		} else {
+			reservation.Cancel()
+			reason := fmt.Sprintf("Client QPS Exceeded (IP: %s, Required Delay: %v > Limit: %v, TargetRate: %.2f)", 
+				ipStr, clientDelay, maxPacingDelay, float64(targetLimit))
+			if IsDebugEnabled() {
+				// LOG IMMEDIATELY when dropping due to excessive rate
+				LogDebug("[LIMITER] Dropping client %s. Excessive delay required: %v (Active QPS: %.2f)", ipStr, clientDelay, float64(targetLimit))
+			}
+			return ActionDrop, 0, reason
+		}
 	}
 
-	// Smart Pacing:
-	// If the required delay to conform to the rate limit is within our pacing threshold (e.g. 1s),
-	// we tell the server to DELAY the request instead of dropping it.
-	// This smooths out micro-bursts and makes the limiter behave like a traffic shaper.
-	if delay <= maxPacingDelay {
-		reason := fmt.Sprintf("Client QPS Pacing (IP: %s, Delay: %v)", ipStr, delay)
-		return ActionDelay, delay, reason
+	if finalDelay > 0 {
+		if finalReason == "" { finalReason = "Rate Limiting" } // Fallback
+		return ActionDelay, finalDelay, finalReason
 	}
 
-	// If the delay is massive (client is flooding way beyond 100 QPS), cancel the reservation and drop.
-	reservation.Cancel()
-	
-	// Get token count for logging
-	var tokens float64
-	if IsDebugEnabled() {
-		// We need to re-acquire lock or just accept approximate value. 
-		// Since we already made a decision, approximate is fine, but limiter is thread-safe.
-		tokens = state.limiter.Tokens()
-	}
-
-	reason := fmt.Sprintf("Client QPS Exceeded (IP: %s, Required Delay: %v > Limit: %v, Tokens: %.2f)", 
-		ipStr, delay, maxPacingDelay, tokens)
-	return ActionDrop, 0, reason
+	return ActionAllow, 0, ""
 }
 
