@@ -10,6 +10,7 @@ replace github.com/quic-go/qpack => github.com/quic-go/qpack v0.4.0
 require (
 	github.com/miekg/dns v1.1.72
 	github.com/quic-go/quic-go v0.59.0
+	github.com/vishvananda/netlink v1.3.1
 	github.com/yl2chen/cidranger v1.0.2
 	golang.org/x/net v0.49.0
 	golang.org/x/sync v0.19.0
@@ -23,6 +24,7 @@ require (
 	github.com/google/pprof v0.0.0-20260115054156-294ebfa9ad83 // indirect
 	github.com/onsi/ginkgo/v2 v2.27.5 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
+	github.com/vishvananda/netns v0.0.5 // indirect
 	go.uber.org/mock v0.6.0 // indirect
 	golang.org/x/crypto v0.47.0 // indirect
 	golang.org/x/exp v0.0.0-20260112195511-716be5621a96 // indirect
