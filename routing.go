@@ -1,9 +1,10 @@
 /*
 File: routing.go
-Version: 1.9.0 (Generic Trie Implementation)
-Description: High-performance routing logic using the shared generic Domain Trie.
+Version: 1.9.0 (Generic Trie & IP Optimization)
+Description: High-performance routing logic using the shared generic Domain Trie and CIDR Ranger.
              OPTIMIZED: Removed duplicate Trie definitions. Now uses trie.go's DomainTrie[RoutingRule].
-             UPDATED: SelectUpstreams adapted for generic Trie return values.
+             OPTIMIZED: Added IPRouter using cidranger for O(1) IP matching instead of linear scan.
+             FIXED: Removed duplicate resolveUpstreams (handled in config.go).
 */
 
 package main
@@ -13,14 +14,70 @@ import (
 	"log"
 	"net"
 	"strings"
+
+	"github.com/yl2chen/cidranger"
 )
+
+// --- IP Router Implementation (cidranger) ---
+
+type ipRuleEntry struct {
+	network net.IPNet
+	rule    *RoutingRule
+}
+
+func (e *ipRuleEntry) Network() net.IPNet {
+	return e.network
+}
+
+type IPRouter struct {
+	ranger cidranger.Ranger
+}
+
+func NewIPRouter() *IPRouter {
+	return &IPRouter{
+		ranger: cidranger.NewPCTrieRanger(),
+	}
+}
+
+func (r *IPRouter) Insert(ipNet net.IPNet, rule *RoutingRule) error {
+	return r.ranger.Insert(&ipRuleEntry{network: ipNet, rule: rule})
+}
+
+func (r *IPRouter) Search(ip net.IP) *RoutingRule {
+	if ip == nil {
+		return nil
+	}
+	
+	entries, err := r.ranger.ContainingNetworks(ip)
+	if err != nil || len(entries) == 0 {
+		return nil
+	}
+
+	var bestMatch *RoutingRule
+	maxOnes := -1
+
+	// Find the most specific match (longest prefix)
+	for _, e := range entries {
+		entry, ok := e.(*ipRuleEntry)
+		if !ok { continue }
+		
+		ones, _ := entry.network.Mask.Size()
+		if ones > maxOnes {
+			maxOnes = ones
+			bestMatch = entry.rule
+		}
+	}
+	
+	return bestMatch
+}
 
 // --- Globals ---
 
 var (
-	// Use the generic DomainTrie with RoutingRule as the value type
+	// Use the generic DomainTrie from trie.go with RoutingRule as the value type
 	domainRouter *DomainTrie[RoutingRule]
-	genericRules []RoutingRule // Generic rules (IP, MAC, etc.) linear scan
+	ipRouter     *IPRouter
+	genericRules []RoutingRule // Generic rules (MAC, ECS, etc.) linear scan
 )
 
 // --- Initialization called from Config Load ---
@@ -28,37 +85,76 @@ var (
 func BuildRoutingTable(rules []RoutingRule) {
 	// Instantiate the generic Trie
 	trie := NewDomainTrie[RoutingRule]()
+	ipRanger := NewIPRouter()
 	var generic []RoutingRule
 
 	for i := range rules {
 		// We copy the rule by value into the trie/slice to avoid pointer issues with loop vars
+		// However, trie stores T, so we store RoutingRule (struct) directly.
 		rule := rules[i]
+		
+		// Flag to track if this rule was handled by optimized lookups
+		// If a rule has complex conditions (MAC, Port, etc), it MUST go to generic fallback
+		// even if it is also indexed in Trie/Ranger, to ensure ALL conditions are met.
+		isComplex := hasComplexConditions(&rule.Match)
 
+		// 1. Build Domain Trie
 		if len(rule.Match.QueryDomain) > 0 {
 			for _, domain := range rule.Match.QueryDomain {
 				// Insert into Trie. keys are lowercased.
 				trie.Insert(strings.ToLower(domain), rule)
 			}
+		}
 
-			// If the rule ONLY has domains, we don't need it in the generic linear scan list.
-			// If it has IP/MAC/etc, we ALSO add it to generic so it can match even if the domain doesn't.
-			if !hasNonDomainConditions(&rule.Match) {
-				continue
+		// 2. Build IP Ranger
+		// Handle CIDRs
+		for _, cidr := range rule.Match.parsedClientCIDRs {
+			if cidr != nil {
+				// We store a pointer to the rule in the IP entry to avoid copying huge structs
+				_ = ipRanger.Insert(*cidr, &rule)
+			}
+		}
+		// Handle Single IPs (convert to /32 or /128)
+		for _, ip := range rule.Match.parsedClientIPs {
+			if ip != nil {
+				var mask net.IPMask
+				if ip.To4() != nil {
+					mask = net.CIDRMask(32, 32)
+				} else {
+					mask = net.CIDRMask(128, 128)
+				}
+				_ = ipRanger.Insert(net.IPNet{IP: ip, Mask: mask}, &rule)
 			}
 		}
 
-		generic = append(generic, rule)
+		// 3. Fallback / Complex Rules
+		// If a rule has ANY condition that isn't just "Client IP" or "Query Domain",
+		// it must be processed by the linear scanner to check those extra conditions.
+		// Also, if it has NO specific IP/Domain triggers (e.g. match-all *), it might end up here.
+		if isComplex {
+			generic = append(generic, rule)
+		} else {
+			// If it wasn't complex, did we index it?
+			hasDomain := len(rule.Match.QueryDomain) > 0
+			hasIP := len(rule.Match.parsedClientIPs) > 0 || len(rule.Match.parsedClientCIDRs) > 0
+			
+			if !hasDomain && !hasIP {
+				// Catch-all rules or empty matches go to generic
+				generic = append(generic, rule)
+			}
+		}
 	}
 
 	domainRouter = trie
+	ipRouter = ipRanger
 	genericRules = generic
-	LogInfo("[ROUTING] Built routing table: Domain Trie built, %d generic rules", len(genericRules))
+	LogInfo("[ROUTING] Built routing table: Domain Trie, IP Ranger, %d generic rules", len(genericRules))
 }
 
-func hasNonDomainConditions(m *MatchConditions) bool {
-	return len(m.ClientIP) > 0 ||
-		len(m.ClientCIDR) > 0 ||
-		len(m.ClientMAC) > 0 ||
+func hasComplexConditions(m *MatchConditions) bool {
+	// If any of these are present, the rule cannot be satisfied purely by looking up
+	// Domain or ClientIP. It requires context inspection.
+	return len(m.ClientMAC) > 0 ||
 		len(m.rawClientMACs) > 0 ||
 		len(m.ClientECS) > 0 ||
 		len(m.ClientEDNSMAC) > 0 ||
@@ -70,7 +166,6 @@ func hasNonDomainConditions(m *MatchConditions) bool {
 }
 
 // SelectUpstreams optimized with generic Trie lookup.
-// UPDATED: Now returns MLGuardMode as the last argument
 func SelectUpstreams(ctx *RequestContext) ([]*Upstream, string, string, *HostsCache, bool, string) {
 	if config == nil {
 		log.Fatal("Config not loaded")
@@ -87,7 +182,15 @@ func SelectUpstreams(ctx *RequestContext) ([]*Upstream, string, string, *HostsCa
 		}
 	}
 
-	// 2. Slow Path: Linear scan of generic rules
+	// 2. Fast Path: IP Ranger Lookup (Client IP)
+	if ipRouter != nil && ctx.ClientIP != nil {
+		if rule := ipRouter.Search(ctx.ClientIP); rule != nil {
+			LogDebug("[ROUTING] HIT IP Rule: '%s' | ClientIP: %s", rule.Name, ctx.ClientIP)
+			return rule.parsedUpstreams, rule.Strategy, rule.Name, rule.parsedHosts, rule.HostsWildcard, rule.MLGuardMode
+		}
+	}
+
+	// 3. Slow Path: Linear scan of generic rules
 	for _, rule := range genericRules {
 		matched, reason := matchRule(&rule.Match, ctx)
 		if matched {
@@ -117,7 +220,8 @@ func matchRule(m *MatchConditions, ctx *RequestContext) (bool, string) {
 
 	conditionsChecked := 0
 
-	// Check Client IPs
+	// Fallback IP Check (for ECS or complex rules not caught by Ranger)
+	// We check this if present in generic rules.
 	if len(m.parsedClientIPs) > 0 {
 		conditionsChecked++
 		for _, ip := range m.parsedClientIPs {
@@ -127,7 +231,6 @@ func matchRule(m *MatchConditions, ctx *RequestContext) (bool, string) {
 		}
 	}
 
-	// Check Client CIDRs
 	if len(m.parsedClientCIDRs) > 0 {
 		conditionsChecked++
 		for _, cidr := range m.parsedClientCIDRs {
@@ -158,7 +261,7 @@ func matchRule(m *MatchConditions, ctx *RequestContext) (bool, string) {
 		}
 	}
 
-	// Check Client ECS
+	// Check Client ECS (Explicit range check)
 	if len(m.parsedClientECSs) > 0 {
 		conditionsChecked++
 		for _, ecs := range m.parsedClientECSs {
@@ -229,9 +332,8 @@ func matchRule(m *MatchConditions, ctx *RequestContext) (bool, string) {
 		}
 	}
 
-	// Check Query Domain (Linear Scan fallback for regex-like or legacy non-trie wildcard needs)
-	// Note: Most domain matching is handled by Trie now, but this remains for regex-style wildcards if implemented,
-	// or simple list matching if not using Trie for everything.
+	// Fallback Query Domain check 
+	// (Only if somehow we are in generic loop but have a domain rule, e.g. complex regex not supported by Trie)
 	if len(m.QueryDomain) > 0 {
 		conditionsChecked++
 		for _, domain := range m.QueryDomain {
@@ -280,7 +382,6 @@ func macEqual(a, b net.HardwareAddr) bool {
 	return true
 }
 
-// Simple wildcard matcher for strings (supports * and ?)
 func matchWildcard(s, pattern string) bool {
 	if s == pattern {
 		return true

@@ -1,30 +1,30 @@
 /*
 File: upstream_pool.go
-Version: 1.7.0
+Version: 1.8.0 (Lock Contention Fix)
 Description: Manages TCP and DoQ connection pools for upstream exchanges.
-             OPTIMIZED: Cleaned up race-condition logic and added safety checks.
-             UPDATED: Added Report0RTTFailure to allow consumers to feedback protocol errors.
+             OPTIMIZED: DoQ dialing is now performed outside the shard lock to prevent 
+             head-of-line blocking for other consumers of the same shard.
 */
 
 package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"hash/maphash"
 	"strings"
 	"sync"
 	"time"
-	"crypto/tls"
 
 	"github.com/miekg/dns"
 	"github.com/quic-go/quic-go"
 )
 
 const (
-	maxDoQSessions  = 8   
-	tcpIdlePoolSize = 512 
-	poolShardCount  = 256 
+	maxDoQSessions  = 8
+	tcpIdlePoolSize = 512
+	poolShardCount  = 256
 )
 
 var poolHasherSeed = maphash.MakeSeed()
@@ -149,98 +149,115 @@ func (p *DoQPool) Get(ctx context.Context, addr string, tlsConf *tls.Config) (qu
 	shard := p.getShard(poolKey)
 
 	shard.Lock()
-	// Clean up closed sessions first
-	sessions := shard.sessions[poolKey]
-	validSessions := make([]*doqSession, 0, len(sessions))
-	for _, s := range sessions {
-		select {
-		case <-s.conn.Context().Done():
-		default:
-			validSessions = append(validSessions, s)
-		}
-	}
-	shard.sessions[poolKey] = validSessions
 	
-	currentCount := len(validSessions)
+	// 1. Clean up closed sessions first
+	sessions := shard.sessions[poolKey]
+	if len(sessions) > 0 {
+		validSessions := make([]*doqSession, 0, len(sessions))
+		for _, s := range sessions {
+			select {
+			case <-s.conn.Context().Done():
+				// Connection is dead
+			default:
+				validSessions = append(validSessions, s)
+			}
+		}
+		shard.sessions[poolKey] = validSessions
+		sessions = validSessions
+	}
+
+	// 2. Fast Path: Return existing session if available
+	if len(sessions) > 0 {
+		idx := shard.nextIdx[poolKey] % len(sessions)
+		shard.nextIdx[poolKey]++
+		s := sessions[idx]
+		s.lastUsed = time.Now()
+		shard.Unlock()
+		return s.conn, nil
+	}
+
+	// 3. Check Limits & Reserve
+	currentCount := len(sessions)
 	pendingDials := shard.dialing[poolKey]
 	
-	// Check if 0-RTT is known to fail for this upstream
-	skip0RTT := shard.failed0RTT[poolKey]
-
-	// RACE FIX: Check count AND pending dials. If under limit, reserve a slot.
-	// This prevents multiple goroutines from seeing "0 sessions" and all dialing at once.
-	if currentCount+pendingDials < maxDoQSessions {
-		shard.dialing[poolKey]++
-		shard.Unlock()
-
-		var conn quic.Connection
-		var err error
-
-		quicConf := &quic.Config{
-			KeepAlivePeriod:    30 * time.Second,
-			MaxIdleTimeout:     60 * time.Second,
-			MaxIncomingStreams: 1000,
-		}
-
-		if !skip0RTT {
-			// Try 0-RTT
-			conn, err = quic.DialAddrEarly(ctx, addr, tlsConf, quicConf)
-			
-			// Check for 0-RTT specific rejection or failure at dial time
-			if err != nil {
-				errMsg := err.Error()
-				if strings.Contains(errMsg, "0-RTT rejected") || strings.Contains(errMsg, "0-RTT") {
-					LogWarn("[DoQ] 0-RTT dial rejected for %s, switching to standard handshake. Error: %v", poolKey, err)
-					
-					// Mark as failed for future attempts
-					shard.Lock()
-					shard.failed0RTT[poolKey] = true
-					shard.Unlock()
-
-					// Fallback to standard DialAddr immediately
-					conn, err = quic.DialAddr(ctx, addr, tlsConf, quicConf)
-				}
-			}
-		} else {
-			// Skip 0-RTT explicitly because it failed before
-			conn, err = quic.DialAddr(ctx, addr, tlsConf, quicConf)
-		}
-
-		shard.Lock()
-		shard.dialing[poolKey]-- // Release reservation
-
-		if err != nil {
-			// If dial failed, check if we have any existing sessions to fallback to
-			if len(shard.sessions[poolKey]) > 0 {
-				idx := shard.nextIdx[poolKey] % len(shard.sessions[poolKey])
-				shard.nextIdx[poolKey]++
-				s := shard.sessions[poolKey][idx]
-				s.lastUsed = time.Now()
-				shard.Unlock()
-				return s.conn, nil
-			}
-			shard.Unlock()
-			return nil, err
-		}
-
-		newSess := &doqSession{conn: conn, lastUsed: time.Now()}
-		shard.sessions[poolKey] = append(shard.sessions[poolKey], newSess)
-		shard.Unlock()
-		return conn, nil
-	}
-
-	if len(validSessions) == 0 {
+	if currentCount+pendingDials >= maxDoQSessions {
 		shard.Unlock()
 		return nil, fmt.Errorf("no DoQ sessions available and max limit %d reached (pending: %d)", maxDoQSessions, pendingDials)
 	}
 
-	idx := shard.nextIdx[poolKey] % len(validSessions)
-	shard.nextIdx[poolKey]++
-	sess := validSessions[idx]
-	sess.lastUsed = time.Now()
-	shard.Unlock()
+	// Reserve a dialing slot
+	shard.dialing[poolKey]++
+	
+	// Snapshot 0-RTT state inside lock
+	skip0RTT := shard.failed0RTT[poolKey]
+	
+	// CRITICAL OPTIMIZATION: Unlock before network IO
+	shard.Unlock() 
 
-	return sess.conn, nil
+	// 4. Perform Network Dialing (Slow Path - Unlocked)
+	var conn quic.Connection
+	var err error
+	var mark0RTTFailed bool
+
+	quicConf := &quic.Config{
+		KeepAlivePeriod:    30 * time.Second,
+		MaxIdleTimeout:     60 * time.Second,
+		MaxIncomingStreams: 1000,
+	}
+
+	if !skip0RTT {
+		// Try 0-RTT
+		conn, err = quic.DialAddrEarly(ctx, addr, tlsConf, quicConf)
+		
+		// Check for 0-RTT specific rejection or failure at dial time
+		if err != nil {
+			errMsg := err.Error()
+			if strings.Contains(errMsg, "0-RTT rejected") || strings.Contains(errMsg, "0-RTT") {
+				LogWarn("[DoQ] 0-RTT dial rejected for %s, switching to standard handshake. Error: %v", poolKey, err)
+				
+				// Mark locally to update state later
+				mark0RTTFailed = true
+
+				// Fallback to standard DialAddr immediately
+				conn, err = quic.DialAddr(ctx, addr, tlsConf, quicConf)
+			}
+		}
+	} else {
+		// Skip 0-RTT explicitly because it failed before
+		conn, err = quic.DialAddr(ctx, addr, tlsConf, quicConf)
+	}
+
+	// 5. Re-acquire Lock to Update State
+	shard.Lock()
+	shard.dialing[poolKey]-- // Release reservation
+
+	// Update 0-RTT failure state if needed
+	if mark0RTTFailed {
+		shard.failed0RTT[poolKey] = true
+	}
+
+	if err != nil {
+		// If dial failed, check if another goroutine succeeded in the meantime
+		// This is a "race to connect" optimization
+		if len(shard.sessions[poolKey]) > 0 {
+			idx := shard.nextIdx[poolKey] % len(shard.sessions[poolKey])
+			shard.nextIdx[poolKey]++
+			s := shard.sessions[poolKey][idx]
+			s.lastUsed = time.Now()
+			shard.Unlock()
+			return s.conn, nil
+		}
+		
+		shard.Unlock()
+		return nil, err
+	}
+
+	// Dial successful - Add to pool
+	newSess := &doqSession{conn: conn, lastUsed: time.Now()}
+	shard.sessions[poolKey] = append(shard.sessions[poolKey], newSess)
+	shard.Unlock()
+	
+	return conn, nil
 }
 
 func (p *DoQPool) cleanup(ctx context.Context) {
@@ -285,8 +302,7 @@ func (p *DoQPool) cleanup(ctx context.Context) {
 					if len(active) == 0 {
 						delete(shard.sessions, addr)
 						delete(shard.nextIdx, addr)
-						delete(shard.dialing, addr) 
-						// Keep failed0RTT state
+						// Keep failed0RTT state for knowledge retention
 					} else {
 						shard.sessions[addr] = active
 					}
