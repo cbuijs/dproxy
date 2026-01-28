@@ -1,5 +1,7 @@
 # dproxy
 
+NOTE: Use at own risk! Under constant development, testing and screwing it up all together ;-).
+
 dproxy is a high-performance, programmable DNS forwarder and proxy implemented in Go. It integrates advanced protocol support (DoH3, DoQ), machine learning-based threat detection, and predictive caching strategies into a single binary.
 
 It is designed for network administrators and privacy-conscious users requiring granular control over DNS traffic, robust security, and compliance with next-generation standards.
