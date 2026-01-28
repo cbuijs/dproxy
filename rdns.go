@@ -1,8 +1,9 @@
 /*
 File: rdns.go
-Version: 1.0.0
+Version: 1.1.6 (Clean)
 Description: Thread-safe, sharded LRU cache for Reverse DNS (PTR) lookups.
              Prevents logging subsystem from blocking on repetitive system resolver calls.
+             UPDATED: Reverted debug logging to standard levels.
 */
 
 package main
@@ -78,20 +79,39 @@ func (c *RDNSCache) GetHostname(ip net.IP) string {
 		if time.Now().Before(entry.expiresAt) {
 			name := entry.hostname
 			shard.RUnlock()
+			if IsDebugEnabled() {
+				displayName := name
+				if displayName == "" {
+					displayName = "<NO_PTR>"
+				}
+				LogDebug("[RDNS] Cache Hit: %s -> %s", ipStr, displayName)
+			}
 			return name
 		}
 	}
 	shard.RUnlock()
 
 	// 2. Slow Path: Resolve (Network I/O)
-	// We do this outside the lock to avoid blocking other readers
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	// We do this outside the lock to avoid blocking other readers.
+	// Reduced timeout to 100ms to minimize latency impact on first request.
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
 	var hostname string
 	names, err := net.DefaultResolver.LookupAddr(ctx, ipStr)
 	if err == nil && len(names) > 0 {
 		hostname = strings.TrimSuffix(names[0], ".")
+	}
+
+	if IsDebugEnabled() {
+		if err != nil {
+			LogDebug("[RDNS] Lookup Failed for %s: %v (Time: %v)", ipStr, err, time.Since(start))
+		} else if hostname == "" {
+			LogDebug("[RDNS] Lookup Empty for %s (Time: %v)", ipStr, time.Since(start))
+		} else {
+			LogDebug("[RDNS] Resolved: %s -> %s (Time: %v)", ipStr, hostname, time.Since(start))
+		}
 	}
 
 	// 3. Write Lock: Update Cache

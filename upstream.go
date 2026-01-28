@@ -1,9 +1,8 @@
 /*
 File: upstream.go
-Version: 2.19.0 (Client Name Fixes)
+Version: 2.20.0 (RDNS Integration)
 Description: Defines the Upstream struct and handles downstream protocol exchange.
-             FIXED: {client-name} now defaults to client-ip if resolution fails (instead of "null").
-             FIXED: {client-name} only uses the hostname part (strips domain suffix).
+             UPDATED: resolveClientName now utilizes globalRDNS for caching reverse lookups.
 */
 
 package main
@@ -38,7 +37,6 @@ const (
 )
 
 // Global TLS Session Cache to enable Session Resumption (Fast Handshakes)
-// This needs to be exported or available to upstream_transport.go
 var globalSessionCache = tls.NewLRUClientSessionCache(2048)
 
 // Upstream Actions
@@ -182,9 +180,9 @@ func sanitizeClientName(s string) string {
 	return b.String()
 }
 
-// resolveClientName attempts to resolve the client IP to a hostname
-// using local hosts cache first, then system resolver (non-blocking/timeout).
-// Returns ONLY the hostname part (up to the first dot).
+// resolveClientName attempts to resolve the client IP to a hostname.
+// Uses local hosts cache first, then falls back to the global RDNS cache.
+// UPDATED: Now uses globalRDNS for system lookups to enable caching.
 func resolveClientName(clientIP net.IP) string {
 	if clientIP == nil {
 		return ""
@@ -200,15 +198,9 @@ func resolveClientName(clientIP net.IP) string {
 		}
 	}
 
-	// 2. Fallback to system resolver with strict timeout if local lookup failed
+	// 2. Fallback to global RDNS cache (System Resolver + Caching)
 	if fqdn == "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-		defer cancel()
-		
-		names, err := net.DefaultResolver.LookupAddr(ctx, clientIP.String())
-		if err == nil && len(names) > 0 {
-			fqdn = names[0]
-		}
+		fqdn = globalRDNS.GetHostname(clientIP)
 	}
 
 	if fqdn == "" {
@@ -735,7 +727,6 @@ func (u *Upstream) executeExchange(ctx context.Context, req *dns.Msg, reqCtx *Re
 	var successfulRTT time.Duration
 
 	// Calculate Dynamic Hostname ONCE here.
-	// This reduces allocations and repeated regex/replace calls in doExchange and transport layers.
 	dynHost, dynPath := u.getDynamicConfig(reqCtx)
 
 	for i := 0; i < attempts; i++ {

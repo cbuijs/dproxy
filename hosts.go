@@ -1,8 +1,8 @@
 /*
 File: hosts.go
-Version: 3.0.0 (Unified netip.Addr)
+Version: 3.0.1 (Debug Logging)
 Description: Main entry point for Hosts Cache. Handles runtime lookups, auto-refresh, and Safe Search injection.
-             OPTIMIZED: Unified internal storage to use netip.Addr, reducing memory overhead and GC pressure.
+             UPDATED: Added debug logging to GetHostnames for visibility into internal resolution.
 */
 
 package main
@@ -412,7 +412,12 @@ func (hc *HostsCache) checkURLChanged(url string) bool {
 func (hc *HostsCache) GetHostnames(ip net.IP) []string {
 	hc.RLock()
 	defer hc.RUnlock()
-	return hc.reverse[ip.String()]
+	
+	names := hc.reverse[ip.String()]
+	if len(names) > 0 && IsDebugEnabled() {
+		LogDebug("[HOSTS] Internal Resolve: %s -> %v", ip.String(), names)
+	}
+	return names
 }
 
 func (hc *HostsCache) Lookup(qName string, qType uint16, wildcard bool, clientInfo, ruleName string) ([]dns.RR, bool, bool) {
