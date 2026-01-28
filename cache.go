@@ -1,8 +1,8 @@
 /*
 File: cache.go
-Version: 2.6.0
+Version: 2.6.1 (Dead Code Removed)
 Description: Thread-safe in-memory DNS cache using Sharded LRU eviction with Adaptive Maintenance.
-             UPDATED: Implemented "Serve Stale on Load" mechanism to reduce drops/servfails.
+             UPDATED: Removed unused getCacheStats function.
 */
 
 package main
@@ -138,10 +138,6 @@ func maintainDNSCache(ctx context.Context) {
 	}
 
 	// --- Adaptive Maintenance Loop ---
-	// Start with a standard interval.
-	// If we find expired items, we speed up (halve interval) to clean up faster.
-	// If we find nothing, we slow down (double interval) to save CPU.
-	
 	const (
 		minInterval = 5 * time.Second
 		maxInterval = 5 * time.Minute
@@ -573,15 +569,5 @@ func ScanCacheForStale(thresholdPct, minHits int, callback func(entry *CacheItem
 		}
 		shard.RUnlock()
 	}
-}
-
-func getCacheStats() (size int, capacity int) {
-	size = 0
-	for _, shard := range dnsCache.shards {
-		shard.RLock()
-		size += shard.lruList.Len()
-		shard.RUnlock()
-	}
-	return size, dnsCache.capacity
 }
 

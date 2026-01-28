@@ -1,6 +1,6 @@
 /*
 File: routing.go
-Version: 1.9.0 (Generic Trie & IP Optimization)
+Version: 1.9.1 (Dead Code Removed)
 Description: High-performance routing logic using the shared generic Domain Trie and CIDR Ranger.
              OPTIMIZED: Removed duplicate Trie definitions. Now uses trie.go's DomainTrie[RoutingRule].
              OPTIMIZED: Added IPRouter using cidranger for O(1) IP matching instead of linear scan.
